@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+IP_BIN="${IP_BIN:-ip}"
+IPTABLES_BIN="${IPTABLES_BIN:-iptables}"
+
+flush_pref_rule() {
+  pref="$1"
+  while ${IP_BIN} rule del pref "${pref}" >/dev/null 2>&1; do
+    :
+  done
+}
+
+TABLE_ID="{{ host_security_fabric_transit_table_id | int }}"
+WG_IFACE="{{ host_security_fabric_transit_interface }}"
+NAT_CHAIN="RTR_FABRIC_TRANSIT_NAT"
+
+${IP_BIN} route flush table "${TABLE_ID}" >/dev/null 2>&1 || true
+${IP_BIN} route replace default dev "${WG_IFACE}" table "${TABLE_ID}" metric 10
+
+{% for subnet in (host_security_fabric_transit_source_subnets | default([])) %}
+flush_pref_rule {{ (host_security_fabric_transit_rule_priority_base | int) + loop.index0 }}
+${IP_BIN} rule add pref {{ (host_security_fabric_transit_rule_priority_base | int) + loop.index0 }} iif "{{ host_security_fabric_transit_interface }}" from {{ subnet }} lookup "${TABLE_ID}"
+{% endfor %}
+
+{% if host_security_fabric_transit_snat_enabled | default(false) | bool %}
+${IPTABLES_BIN} -t nat -N "${NAT_CHAIN}" >/dev/null 2>&1 || true
+if ! ${IPTABLES_BIN} -t nat -C POSTROUTING -j "${NAT_CHAIN}" >/dev/null 2>&1; then
+  ${IPTABLES_BIN} -t nat -A POSTROUTING -j "${NAT_CHAIN}"
+fi
+${IPTABLES_BIN} -t nat -F "${NAT_CHAIN}"
+{%   for subnet in (host_security_fabric_transit_source_subnets | default([])) %}
+${IPTABLES_BIN} -t nat -A "${NAT_CHAIN}" -s {{ subnet }} -o "${WG_IFACE}" -j MASQUERADE
+{%   endfor %}
+{% endif %}

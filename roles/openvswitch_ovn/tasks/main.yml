@@ -1,0 +1,63 @@
+---
+- name: Gather service facts
+  ansible.builtin.service_facts:
+
+- name: Detect whether host is a K3s node
+  ansible.builtin.set_fact:
+    openvswitch_ovn_is_k3s_node: >-
+      {{
+        inventory_hostname in (groups['k3s_server'] | default([]))
+        or inventory_hostname in (groups['k3s_agent'] | default([]))
+        or ansible_facts.services['k3s.service'] is defined
+        or ansible_facts.services['k3s-agent.service'] is defined
+      }}
+  changed_when: false
+
+- name: Stop conflicting host OVS services on K3s nodes when active
+  ansible.builtin.service:
+    name: "{{ item }}"
+    state: stopped
+  loop: "{{ openvswitch_ovn_conflicting_services }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - openvswitch_ovn_is_k3s_node
+    - ansible_facts.services[item] is defined
+    - ansible_facts.services[item].state | default('stopped') != 'stopped'
+
+- name: Disable conflicting host OVS services on K3s nodes when the unit is disableable
+  ansible.builtin.service:
+    name: "{{ item }}"
+    enabled: false
+  loop: "{{ openvswitch_ovn_conflicting_services }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - openvswitch_ovn_is_k3s_node
+    - ansible_facts.services[item] is defined
+    - ansible_facts.services[item].status | default('') not in ['static', 'indirect']
+
+- name: Refresh service facts after OVS/OVN convergence
+  ansible.builtin.service_facts:
+
+- name: Ensure OVN host service is enabled on K3s nodes when present
+  ansible.builtin.service:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: "{{ openvswitch_ovn_ensure_services }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - openvswitch_ovn_is_k3s_node
+    - ansible_facts.services[item] is defined
+
+- name: Show OVS/OVN host service summary
+  ansible.builtin.debug:
+    msg:
+      is_k3s_node: "{{ openvswitch_ovn_is_k3s_node }}"
+      openvswitch_switch: "{{ ansible_facts.services['openvswitch-switch.service'].state | default('absent') }}"
+      ovsdb_server: "{{ ansible_facts.services['ovsdb-server.service'].state | default('absent') }}"
+      ovs_vswitchd: "{{ ansible_facts.services['ovs-vswitchd.service'].state | default('absent') }}"
+      ovn_host: "{{ ansible_facts.services['ovn-host.service'].state | default('absent') }}"
+  changed_when: false

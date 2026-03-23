@@ -1,0 +1,20 @@
+ovn_ssh_tunnel_enabled: false
+ovn_ssh_tunnel_unit_name: ovn-db-tunnel.service
+ovn_ssh_tunnel_systemd_path: "/etc/systemd/system/{{ ovn_ssh_tunnel_unit_name }}"
+ovn_ssh_tunnel_user: admin
+ovn_ssh_tunnel_group: admin
+ovn_ssh_tunnel_ssh_bin: /usr/bin/ssh
+ovn_ssh_tunnel_ssh_key_path: "/home/{{ ovn_ssh_tunnel_user }}/.ssh/id_ed25519_ovn_db"
+ovn_ssh_tunnel_remote_user: admin
+ovn_ssh_tunnel_remote_host: >-
+  {{
+    hostvars[k3s_server_host].node_public_ip
+    | default(hostvars[k3s_server_host].ansible_host | default(k3s_server_host))
+  }}
+ovn_ssh_tunnel_local_host: 127.0.0.1
+ovn_ssh_tunnel_remote_bind_host: 127.0.0.1
+ovn_ssh_tunnel_ports:
+  - 6641
+  - 6642
+ovn_ssh_tunnel_server_alive_interval: 20
+ovn_ssh_tunnel_server_alive_count_max: 3

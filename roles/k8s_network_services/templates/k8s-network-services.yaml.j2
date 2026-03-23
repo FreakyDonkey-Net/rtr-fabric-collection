@@ -1,0 +1,689 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/part-of: net-services
+    pod-security.kubernetes.io/enforce: {{ k8s_network_services_namespace_pod_security_enforce }}
+    pod-security.kubernetes.io/warn: {{ k8s_network_services_namespace_pod_security_warn }}
+    pod-security.kubernetes.io/audit: {{ k8s_network_services_namespace_pod_security_audit }}
+{% if k8s_network_services_cert_manager_enabled | bool and k8s_network_services_radius_enabled | bool and k8s_network_services_radius_cert_manager_enabled | bool %}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudflare-dns-api-token
+  namespace: cert-manager
+  labels:
+    app.kubernetes.io/part-of: net-services
+stringData:
+  api-token: {{ (k8s_network_services_cert_manager_cloudflare_api_token | string | trim) | to_json }}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ k8s_network_services_cert_manager_clusterissuer_name }}
+  labels:
+    app.kubernetes.io/part-of: net-services
+spec:
+  acme:
+    email: {{ (k8s_network_services_cert_manager_acme_email | string | trim) | to_json }}
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-cloudflare-account-key
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-dns-api-token
+              key: api-token
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ k8s_network_services_radius_cert_manager_certificate_name }}
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-radius
+    app.kubernetes.io/part-of: net-services
+spec:
+  commonName: {{ (k8s_network_services_radius_cert_manager_dns_names | first) | to_json }}
+  dnsNames:
+{% for dns_name in k8s_network_services_radius_cert_manager_dns_names %}
+    - {{ dns_name | to_json }}
+{% endfor %}
+  duration: {{ k8s_network_services_radius_cert_manager_duration }}
+  renewBefore: {{ k8s_network_services_radius_cert_manager_renew_before }}
+  secretName: {{ k8s_network_services_radius_cert_manager_secret_name }}
+  issuerRef:
+    kind: ClusterIssuer
+    name: {{ k8s_network_services_cert_manager_clusterissuer_name }}
+  privateKey:
+    algorithm: RSA
+    size: 2048
+{% endif %}
+{% if k8s_network_services_dns_enabled | bool %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infra-dns-config
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-dns
+    app.kubernetes.io/part-of: net-services
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health :8080
+        ready :8181
+        prometheus :9153
+        hosts /etc/coredns/hosts.internal {{ k8s_network_services_dns_internal_domain }} {
+{% if k8s_network_services_dns_internal_fallthrough | bool %}
+            fallthrough
+{% endif %}
+        }
+        cache 300
+        forward . {% for forwarder in k8s_network_services_dns_forwarders %}{{ forwarder }} {% endfor %}{
+            max_fails 2
+            health_check 5s
+        }
+        loop
+        reload
+        loadbalance
+    }
+  hosts.internal: |
+{% for record in k8s_network_services_dns_records_effective %}
+    {{ record.address }} {{ record.name }}
+{% endfor %}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: infra-dns
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-dns
+    app.kubernetes.io/part-of: net-services
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infra-dns
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-dns
+    app.kubernetes.io/part-of: net-services
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: infra-dns
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: 53
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: 53
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: infra-dns
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-dns
+    app.kubernetes.io/part-of: net-services
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infra-dns
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infra-dns
+        app.kubernetes.io/part-of: net-services
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: infra-dns
+      automountServiceAccountToken: false
+      nodeSelector:
+{{ k8s_network_services_dns_node_selector | to_nice_yaml(indent=8) | indent(8, true) }}
+      containers:
+        - name: coredns
+          image: {{ k8s_network_services_dns_image }}
+          imagePullPolicy: IfNotPresent
+          args: ["-conf", "/etc/coredns/Corefile"]
+          securityContext:
+            allowPrivilegeEscalation: {{ k8s_network_services_dns_allow_privilege_escalation | bool }}
+            readOnlyRootFilesystem: {{ k8s_network_services_dns_read_only_root_filesystem | bool }}
+            runAsNonRoot: {{ k8s_network_services_dns_run_as_non_root | bool }}
+            runAsUser: {{ k8s_network_services_dns_run_as_user | int }}
+            runAsGroup: {{ k8s_network_services_dns_run_as_group | int }}
+            seccompProfile:
+              type: {{ k8s_network_services_dns_seccomp_type | to_json }}
+            appArmorProfile:
+              type: {{ k8s_network_services_dns_apparmor_type | to_json }}
+            capabilities:
+              drop: {{ k8s_network_services_dns_capabilities_drop | to_json }}
+              add: {{ k8s_network_services_dns_capabilities_add | to_json }}
+          ports:
+            - {name: dns-udp, containerPort: 53, protocol: UDP}
+            - {name: dns-tcp, containerPort: 53, protocol: TCP}
+            - {name: health, containerPort: 8080, protocol: TCP}
+            - {name: ready, containerPort: 8181, protocol: TCP}
+            - {name: metrics, containerPort: 9153, protocol: TCP}
+          readinessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/coredns
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: infra-dns-config
+{% endif %}
+{% if k8s_network_services_radius_enabled | bool %}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: infra-radius-config
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-radius
+    app.kubernetes.io/part-of: net-services
+stringData:
+  clients.conf: |
+{{ k8s_network_services_radius_clients_conf | indent(4, true) }}
+  authorize: |
+{{ k8s_network_services_radius_authorize | indent(4, true) }}
+  eap: |
+{{ k8s_network_services_radius_eap_conf | indent(4, true) }}
+  check-eap-tls: |
+{{ k8s_network_services_radius_check_eap_tls_conf | indent(4, true) }}
+  wifi-ca.pem: |
+{{ k8s_network_services_radius_eap_tls_client_ca_pem | indent(4, true) }}
+{% if k8s_network_services_radius_custom_tls_assets_enabled | bool %}
+  server.pem: |
+{{ k8s_network_services_radius_tls_server_pem | indent(4, true) }}
+  ca.pem: |
+{{ k8s_network_services_radius_tls_ca_pem | indent(4, true) }}
+{% endif %}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: infra-radius
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-radius
+    app.kubernetes.io/part-of: net-services
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infra-radius
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-radius
+    app.kubernetes.io/part-of: net-services
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: infra-radius
+  ports:
+    - name: radius-auth-udp
+      port: 1812
+      protocol: UDP
+      targetPort: 1812
+    - name: radius-acct-udp
+      port: 1813
+      protocol: UDP
+      targetPort: 1813
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: infra-radius
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-radius
+    app.kubernetes.io/part-of: net-services
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infra-radius
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infra-radius
+        app.kubernetes.io/part-of: net-services
+      annotations:
+        freakydonkey.net/radius-config-checksum: "{{ (
+          (k8s_network_services_radius_clients_conf | default(''))
+          ~ '\n---\n' ~ (k8s_network_services_radius_authorize | default(''))
+          ~ '\n---\n' ~ (k8s_network_services_radius_eap_conf | default(''))
+          ~ '\n---\n' ~ (k8s_network_services_radius_check_eap_tls_conf | default(''))
+          ~ '\n---\n' ~ (k8s_network_services_radius_eap_tls_client_ca_pem | default(''))
+          ~ '\n---\n' ~ (k8s_network_services_radius_tls_server_pem | default(''))
+          ~ '\n---\n' ~ (k8s_network_services_radius_tls_ca_pem | default(''))
+        ) | hash('sha256') }}"
+    spec:
+      hostNetwork: true
+      shareProcessNamespace: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: infra-radius
+      automountServiceAccountToken: false
+      nodeSelector:
+{{ k8s_network_services_radius_node_selector | to_nice_yaml(indent=8) | indent(8, true) }}
+      initContainers:
+{% if k8s_network_services_radius_cert_manager_enabled | bool %}
+        - name: radius-cert-bootstrap
+          image: docker.io/library/busybox:1.36.1
+          securityContext:
+            allowPrivilegeEscalation: {{ k8s_network_services_radius_helper_allow_privilege_escalation | bool }}
+            readOnlyRootFilesystem: {{ k8s_network_services_radius_helper_read_only_root_filesystem | bool }}
+            seccompProfile:
+              type: {{ k8s_network_services_radius_helper_seccomp_type | to_json }}
+            appArmorProfile:
+              type: {{ k8s_network_services_radius_helper_apparmor_type | to_json }}
+            capabilities:
+              drop: {{ k8s_network_services_radius_helper_capabilities_drop | to_json }}
+              add: {{ k8s_network_services_radius_helper_capabilities_add | to_json }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              umask 022
+              cat /certmgr/tls.key /certmgr/tls.crt > /radius-certs/server.pem
+              if [ -s /certmgr/ca.crt ]; then
+                cp /certmgr/ca.crt /radius-certs/ca.pem
+              else
+                cp /certmgr/tls.crt /radius-certs/ca.pem
+              fi
+              chmod 0644 /radius-certs/server.pem /radius-certs/ca.pem
+          volumeMounts:
+            - {name: radius-cert-manager-tls, mountPath: /certmgr, readOnly: true}
+            - {name: radius-runtime-certs, mountPath: /radius-certs}
+{% endif %}
+      containers:
+        - name: freeradius
+          image: {{ k8s_network_services_radius_image }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: {{ k8s_network_services_radius_allow_privilege_escalation | bool }}
+            readOnlyRootFilesystem: {{ k8s_network_services_radius_read_only_root_filesystem | bool }}
+            seccompProfile:
+              type: {{ k8s_network_services_radius_seccomp_type | to_json }}
+            appArmorProfile:
+              type: {{ k8s_network_services_radius_apparmor_type | to_json }}
+            capabilities:
+              drop: {{ k8s_network_services_radius_capabilities_drop | to_json }}
+              add: {{ k8s_network_services_radius_capabilities_add | to_json }}
+          ports:
+            - {name: radius-auth, containerPort: 1812, protocol: UDP}
+            - {name: radius-acct, containerPort: 1813, protocol: UDP}
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pidof freeradius >/dev/null || pidof radiusd >/dev/null"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pidof freeradius >/dev/null || pidof radiusd >/dev/null"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - {name: radius-config, mountPath: /etc/freeradius/clients.conf, subPath: clients.conf, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/mods-config/files/authorize, subPath: authorize, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/mods-available/eap, subPath: eap, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/sites-enabled/check-eap-tls, subPath: check-eap-tls, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/sites-available/check-eap-tls, subPath: check-eap-tls, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/3.0/clients.conf, subPath: clients.conf, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/3.0/mods-config/files/authorize, subPath: authorize, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/3.0/mods-available/eap, subPath: eap, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/3.0/sites-enabled/check-eap-tls, subPath: check-eap-tls, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/3.0/sites-available/check-eap-tls, subPath: check-eap-tls, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/certs/wifi-ca.pem, subPath: wifi-ca.pem, readOnly: true}
+{% if k8s_network_services_radius_cert_manager_enabled | bool %}
+            - {name: radius-runtime-certs, mountPath: /etc/freeradius/certs/server.pem, subPath: server.pem, readOnly: true}
+            - {name: radius-runtime-certs, mountPath: /etc/freeradius/certs/ca.pem, subPath: ca.pem, readOnly: true}
+{% elif k8s_network_services_radius_custom_tls_assets_enabled | bool %}
+            - {name: radius-config, mountPath: /etc/freeradius/certs/server.pem, subPath: server.pem, readOnly: true}
+            - {name: radius-config, mountPath: /etc/freeradius/certs/ca.pem, subPath: ca.pem, readOnly: true}
+{% endif %}
+{% if k8s_network_services_radius_cert_manager_enabled | bool %}
+        - name: radius-cert-reloader
+          image: docker.io/library/busybox:1.36.1
+          securityContext:
+            allowPrivilegeEscalation: {{ k8s_network_services_radius_helper_allow_privilege_escalation | bool }}
+            readOnlyRootFilesystem: {{ k8s_network_services_radius_helper_read_only_root_filesystem | bool }}
+            seccompProfile:
+              type: {{ k8s_network_services_radius_helper_seccomp_type | to_json }}
+            appArmorProfile:
+              type: {{ k8s_network_services_radius_helper_apparmor_type | to_json }}
+            capabilities:
+              drop: {{ k8s_network_services_radius_helper_capabilities_drop | to_json }}
+              add: {{ k8s_network_services_radius_helper_capabilities_add | to_json }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              prev=""
+              while true; do
+                cur="$(sha256sum /certmgr/tls.crt /certmgr/tls.key 2>/dev/null | sha256sum | awk '{print $1}')"
+                if [ -n "$cur" ] && [ "$prev" != "" ] && [ "$cur" != "$prev" ]; then
+                  umask 022
+                  cat /certmgr/tls.key /certmgr/tls.crt > /radius-certs/server.pem
+                  if [ -s /certmgr/ca.crt ]; then
+                    cp /certmgr/ca.crt /radius-certs/ca.pem
+                  else
+                    cp /certmgr/tls.crt /radius-certs/ca.pem
+                  fi
+                  chmod 0644 /radius-certs/server.pem /radius-certs/ca.pem
+                  pid="$(pidof freeradius || pidof radiusd || true)"
+                  if [ -n "$pid" ]; then
+                    kill -HUP $pid || kill -TERM $pid || true
+                  fi
+                fi
+                prev="$cur"
+                sleep 60
+              done
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - {name: radius-cert-manager-tls, mountPath: /certmgr, readOnly: true}
+            - {name: radius-runtime-certs, mountPath: /radius-certs}
+{% endif %}
+      volumes:
+        - name: radius-config
+          secret:
+            secretName: infra-radius-config
+{% if k8s_network_services_radius_cert_manager_enabled | bool %}
+        - name: radius-cert-manager-tls
+          secret:
+            secretName: {{ k8s_network_services_radius_cert_manager_secret_name }}
+        - name: radius-runtime-certs
+          emptyDir: {}
+{% endif %}
+{% endif %}
+{% if k8s_network_services_ca_enabled | bool %}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: infra-ca-config
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-ca
+    app.kubernetes.io/part-of: net-services
+stringData:
+  ca.json: |
+{{ k8s_network_services_ca_config_json | indent(4, true) }}
+  defaults.json: |
+{{ k8s_network_services_ca_defaults_json | indent(4, true) }}
+  root_ca.crt: |
+{{ k8s_network_services_ca_root_crt_pem | indent(4, true) }}
+  intermediate_ca.crt: |
+{{ k8s_network_services_ca_intermediate_crt_pem | indent(4, true) }}
+  intermediate_ca_key: |
+{{ k8s_network_services_ca_intermediate_key_pem | indent(4, true) }}
+  password: {{ k8s_network_services_ca_password | to_json }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: infra-ca
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-ca
+    app.kubernetes.io/part-of: net-services
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infra-ca
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-ca
+    app.kubernetes.io/part-of: net-services
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: infra-ca
+  ports:
+    - name: ca
+      port: {{ k8s_network_services_ca_service_port }}
+      protocol: TCP
+      targetPort: 9000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infra-ca
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-ca
+    app.kubernetes.io/part-of: net-services
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infra-ca
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infra-ca
+        app.kubernetes.io/part-of: net-services
+    spec:
+{% if k8s_network_services_ca_host_network | bool %}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+{% endif %}
+{% if k8s_network_services_ca_node_name | default('') | string | trim | length > 0 %}
+      nodeSelector:
+        kubernetes.io/hostname: {{ k8s_network_services_ca_node_name | quote }}
+{% endif %}
+      serviceAccountName: infra-ca
+      automountServiceAccountToken: false
+      containers:
+        - name: step-ca
+          image: {{ k8s_network_services_ca_image }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: {{ k8s_network_services_ca_allow_privilege_escalation | bool }}
+            readOnlyRootFilesystem: {{ k8s_network_services_ca_read_only_root_filesystem | bool }}
+            seccompProfile:
+              type: {{ k8s_network_services_ca_seccomp_type | to_json }}
+            appArmorProfile:
+              type: {{ k8s_network_services_ca_apparmor_type | to_json }}
+            capabilities:
+              drop: {{ k8s_network_services_ca_capabilities_drop | to_json }}
+              add: {{ k8s_network_services_ca_capabilities_add | to_json }}
+          args:
+            - step-ca
+            - /home/step/config/ca.json
+            - --password-file
+            - /home/step/secrets/password
+          ports:
+            - {name: ca, containerPort: 9000, protocol: TCP}
+          readinessProbe:
+            tcpSocket: {port: 9000}
+            initialDelaySeconds: 6
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: {port: 9000}
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - {name: ca-config, mountPath: /home/step/config/ca.json, subPath: ca.json, readOnly: true}
+            - {name: ca-config, mountPath: /home/step/config/defaults.json, subPath: defaults.json, readOnly: true}
+            - {name: ca-config, mountPath: /home/step/certs/root_ca.crt, subPath: root_ca.crt, readOnly: true}
+            - {name: ca-config, mountPath: /home/step/certs/intermediate_ca.crt, subPath: intermediate_ca.crt, readOnly: true}
+            - {name: ca-config, mountPath: /home/step/secrets/intermediate_ca_key, subPath: intermediate_ca_key, readOnly: true}
+            - {name: ca-config, mountPath: /home/step/secrets/password, subPath: password, readOnly: true}
+            - {name: ca-db, mountPath: /home/step/db}
+      volumes:
+        - name: ca-config
+          secret:
+            secretName: infra-ca-config
+        - name: ca-db
+          emptyDir: {}
+{% endif %}
+{% if k8s_network_services_ldap_enabled | bool %}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: infra-ldap-config
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-ldap
+    app.kubernetes.io/part-of: net-services
+stringData:
+  LDAP_ADMIN_PASSWORD: {{ k8s_network_services_ldap_admin_password | to_json }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: infra-ldap
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-ldap
+    app.kubernetes.io/part-of: net-services
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infra-ldap
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-ldap
+    app.kubernetes.io/part-of: net-services
+spec:
+  strategy:
+    type: Recreate
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infra-ldap
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infra-ldap
+        app.kubernetes.io/part-of: net-services
+    spec:
+{% if k8s_network_services_ldap_host_network | bool %}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+{% endif %}
+{% if k8s_network_services_ldap_node_name | default('') | string | trim | length > 0 %}
+      nodeSelector:
+        kubernetes.io/hostname: {{ k8s_network_services_ldap_node_name | to_json }}
+{% endif %}
+      serviceAccountName: infra-ldap
+      automountServiceAccountToken: false
+      containers:
+        - name: ldap
+          image: {{ k8s_network_services_ldap_image }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: {{ k8s_network_services_ldap_allow_privilege_escalation | bool }}
+            readOnlyRootFilesystem: {{ k8s_network_services_ldap_read_only_root_filesystem | bool }}
+            seccompProfile:
+              type: {{ k8s_network_services_ldap_seccomp_type | to_json }}
+            appArmorProfile:
+              type: {{ k8s_network_services_ldap_apparmor_type | to_json }}
+            capabilities:
+              drop: {{ k8s_network_services_ldap_capabilities_drop | to_json }}
+              add: {{ k8s_network_services_ldap_capabilities_add | to_json }}
+          env:
+            - {name: LDAP_ORGANISATION, value: "FreakyDonkey"}
+            - {name: LDAP_DOMAIN, value: "freakydonkey.net"}
+            - {name: LDAP_ADMIN_PASSWORD, valueFrom: {secretKeyRef: {name: infra-ldap-config, key: LDAP_ADMIN_PASSWORD}}}
+            - {name: LDAP_REMOVE_CONFIG_AFTER_SETUP, value: "false"}
+            - {name: LDAP_TLS, value: {{ (k8s_network_services_ldap_tls_enabled | bool) | ternary('\"true\"', '\"false\"') }}}
+            - {name: LDAP_TLS_ENFORCE, value: {{ (k8s_network_services_ldap_tls_enforce | bool) | ternary('\"true\"', '\"false\"') }}}
+            - {name: LDAP_TLS_VERIFY_CLIENT, value: {{ k8s_network_services_ldap_tls_verify_client | default('never') | string | to_json }}}
+            - {name: LDAP_PORT_NUMBER, value: {{ k8s_network_services_ldap_bind_port | string | to_json }}}
+          ports:
+            - {name: ldap, containerPort: {{ k8s_network_services_ldap_bind_port }}, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infra-ldap
+  namespace: {{ k8s_network_services_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-ldap
+    app.kubernetes.io/part-of: net-services
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: infra-ldap
+  ports:
+    - name: ldap
+      port: {{ k8s_network_services_ldap_service_port }}
+      protocol: TCP
+      targetPort: {{ k8s_network_services_ldap_bind_port }}
+{% endif %}

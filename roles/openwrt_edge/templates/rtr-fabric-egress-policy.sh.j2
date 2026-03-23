@@ -1,0 +1,115 @@
+#!/bin/sh
+set -eu
+
+IP_BIN="${IP_BIN:-ip}"
+PING_BIN="${PING_BIN:-ping}"
+NFT_BIN="${NFT_BIN:-nft}"
+
+flush_pref_rule() {
+  pref="$1"
+  while ${IP_BIN} rule del pref "${pref}" >/dev/null 2>&1; do
+    :
+  done
+}
+
+gateway_reachable() {
+  transport="$1"
+  gateway="$2"
+  if [ -z "${transport}" ] || [ -z "${gateway}" ]; then
+    return 1
+  fi
+  ${PING_BIN} -4 -c {{ openwrt_edge_egress_probe_count | int }} -W {{ openwrt_edge_egress_probe_timeout_seconds | int }} -I "${transport}" "${gateway}" >/dev/null 2>&1
+}
+
+first_ipv4_for_iface() {
+  iface="$1"
+  ${IP_BIN} -4 -o addr show dev "${iface}" 2>/dev/null \
+    | awk 'NR==1 { print $4 }' \
+    | cut -d/ -f1
+}
+
+{% set bypass_prefixes = (
+     (openwrt_edge_egress_local_bypass_prefixes | default([]))
+     + (openwrt_edge_egress_bypass_destination_prefixes | default([]))
+   ) | map('string') | map('trim') | reject('equalto', '') | unique | list %}
+{% for prefix in bypass_prefixes %}
+flush_pref_rule {{ 40 + loop.index0 }}
+${IP_BIN} rule add pref {{ 40 + loop.index0 }} to {{ prefix }} lookup main
+{% endfor %}
+{% set snat_script_policies = (
+     openwrt_edge_egress_policies_effective | default([])
+     | selectattr('apply_mode', 'equalto', 'script')
+     | selectattr('snat_enabled', 'equalto', true)
+     | list
+   ) %}
+{% if (snat_script_policies | length) > 0 %}
+${NFT_BIN} list table ip {{ openwrt_edge_egress_snat_table_name | default('rtr_fabric_egress') }} >/dev/null 2>&1 || \
+  ${NFT_BIN} add table ip {{ openwrt_edge_egress_snat_table_name | default('rtr_fabric_egress') }}
+${NFT_BIN} list chain ip {{ openwrt_edge_egress_snat_table_name | default('rtr_fabric_egress') }} {{ openwrt_edge_egress_snat_chain_name | default('postrouting') }} >/dev/null 2>&1 || \
+  ${NFT_BIN} add chain ip {{ openwrt_edge_egress_snat_table_name | default('rtr_fabric_egress') }} {{ openwrt_edge_egress_snat_chain_name | default('postrouting') }} "{ type nat hook postrouting priority srcnat; policy accept; }"
+${NFT_BIN} flush chain ip {{ openwrt_edge_egress_snat_table_name | default('rtr_fabric_egress') }} {{ openwrt_edge_egress_snat_chain_name | default('postrouting') }}
+{% endif %}
+
+{% for item in (openwrt_edge_egress_policies_effective | default([])) if item.apply_mode == 'script' %}
+# {{ item.name | default(item.policy_id) }}
+${IP_BIN} route flush table {{ item.table_id }} >/dev/null 2>&1 || true
+{% if (item.primary_recursive_via | default('') | string | trim | length) > 0 %}
+${IP_BIN} route replace {{ item.primary_gateway_loopback }}/32 via {{ item.primary_recursive_via }} dev {{ item.primary_transport_interface }} table {{ item.table_id }}
+{% endif %}
+{% if (item.secondary_recursive_via | default('') | string | trim | length) > 0 %}
+${IP_BIN} route replace {{ item.secondary_gateway_loopback }}/32 via {{ item.secondary_recursive_via }} dev {{ item.secondary_transport_interface }} table {{ item.table_id }}
+{% endif %}
+primary_ok=1
+secondary_ok=1
+{% if item.probe_gateways | bool %}
+if ! gateway_reachable "{{ item.primary_transport_interface }}" "{{ item.primary_gateway_loopback }}"; then
+  primary_ok=0
+fi
+if ! gateway_reachable "{{ item.secondary_transport_interface }}" "{{ item.secondary_gateway_loopback }}"; then
+  secondary_ok=0
+fi
+{% endif %}
+if [ "${primary_ok}" -eq 1 ]; then
+{% if item.use_onlink_defaults | bool %}
+  ${IP_BIN} route replace default via {{ item.primary_gateway_loopback }} dev {{ item.primary_transport_interface }} onlink table {{ item.table_id }} metric 10
+{% else %}
+  ${IP_BIN} route replace default via {{ item.primary_gateway_loopback }} dev {{ item.primary_transport_interface }} table {{ item.table_id }} metric 10
+{% endif %}
+fi
+if [ "${secondary_ok}" -eq 1 ]; then
+{% if item.use_onlink_defaults | bool %}
+  ${IP_BIN} route replace default via {{ item.secondary_gateway_loopback }} dev {{ item.secondary_transport_interface }} onlink table {{ item.table_id }} metric 20
+{% else %}
+  ${IP_BIN} route replace default via {{ item.secondary_gateway_loopback }} dev {{ item.secondary_transport_interface }} table {{ item.table_id }} metric 20
+{% endif %}
+fi
+{% if item.fallback_to_local_wan | bool %}
+wan_gateway="$(${IP_BIN} -4 route show default dev {{ openwrt_edge_egress_wan_interface_name | default('wan') }} 2>/dev/null | awk 'NR==1 {for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}')"
+{% if (openwrt_edge_egress_wan_gateway_effective | default('') | string | trim | length) > 0 %}
+if [ -z "${wan_gateway}" ]; then
+  wan_gateway="{{ openwrt_edge_egress_wan_gateway_effective }}"
+fi
+{% endif %}
+if [ -n "${wan_gateway}" ]; then
+  ${IP_BIN} route replace default via "${wan_gateway}" dev {{ openwrt_edge_egress_wan_interface_name | default('wan') }} table {{ item.table_id }} metric 100
+fi
+{% endif %}
+{% if item.snat_enabled | default(false) | bool %}
+primary_snat_ip="$(first_ipv4_for_iface '{{ item.primary_transport_interface }}')"
+secondary_snat_ip="$(first_ipv4_for_iface '{{ item.secondary_transport_interface }}')"
+{% for subnet in (item.source_subnets | default([])) %}
+{% for prefix in (item.snat_destination_prefixes | default([])) %}
+if [ -n "${primary_snat_ip}" ]; then
+  ${NFT_BIN} add rule ip {{ openwrt_edge_egress_snat_table_name | default('rtr_fabric_egress') }} {{ openwrt_edge_egress_snat_chain_name | default('postrouting') }} ip saddr {{ subnet }} ip daddr {{ prefix }} oifname "{{ item.primary_transport_interface }}" snat to "${primary_snat_ip}"
+fi
+if [ -n "${secondary_snat_ip}" ]; then
+  ${NFT_BIN} add rule ip {{ openwrt_edge_egress_snat_table_name | default('rtr_fabric_egress') }} {{ openwrt_edge_egress_snat_chain_name | default('postrouting') }} ip saddr {{ subnet }} ip daddr {{ prefix }} oifname "{{ item.secondary_transport_interface }}" snat to "${secondary_snat_ip}"
+fi
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% for subnet in (item.source_subnets | default([])) %}
+flush_pref_rule {{ item.priority + loop.index0 }}
+${IP_BIN} rule add pref {{ item.priority + loop.index0 }} iif {{ item.incoming_interface }} from {{ subnet }} lookup {{ item.table_id }}
+{% endfor %}
+{% endfor %}

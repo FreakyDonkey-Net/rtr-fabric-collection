@@ -1,0 +1,12 @@
+[Unit]
+Description=RTR Fabric selective transit routing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{ host_security_fabric_transit_script_path }}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

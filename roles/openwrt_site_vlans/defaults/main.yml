@@ -1,0 +1,26 @@
+---
+openwrt_site_vlans_enabled: true
+openwrt_site_vlans_dry_run: true
+openwrt_site_vlans_force_apply: false
+openwrt_site_vlans_trunk_device: ""
+
+openwrt_site_vlans_bridge_vlan_enabled: false
+openwrt_site_vlans_bridge_vlan_bridge_device: "{{ openwrt_site_vlans_trunk_device }}"
+openwrt_site_vlans_bridge_vlan_trunk_port: ""
+openwrt_site_vlans_bridge_vlan_additional_trunk_ports: []
+openwrt_site_vlans_bridge_vlan_native_vlan_id: 1
+openwrt_site_vlans_bridge_vlan_native_extra_untagged_ports: []
+
+openwrt_site_vlans_preserve_interface_device_overrides: true
+openwrt_site_vlans_preserve_interface_device_pattern: '^brw[a-z0-9]+'
+openwrt_site_vlans_interface_device_overrides: {}
+
+openwrt_site_vlans_firewall_enabled: false
+openwrt_site_vlans_firewall_zone_skip_vlan_names: []
+openwrt_site_vlans_firewall_allow_dns_to_router: true
+openwrt_site_vlans_firewall_allow_dhcp_to_router: true
+openwrt_site_vlans_firewall_allow_ntp_to_router: true
+openwrt_site_vlans_firewall_forwardings_enabled: false
+openwrt_site_vlans_firewall_forwardings: []
+openwrt_site_vlans_firewall_custom_rules_enabled: false
+openwrt_site_vlans_firewall_custom_rules: []

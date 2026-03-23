@@ -1,0 +1,83 @@
+---
+- name: Normalize wireguard agent action
+  ansible.builtin.set_fact:
+    wireguard_agent_action_effective: "{{ wireguard_agent_action | default('show_status') }}"
+
+- name: Validate wireguard agent action and inputs
+  ansible.builtin.assert:
+    that:
+      - wireguard_agent_action_effective in wireguard_agent_supported_actions
+      - wireguard_agent_interface | string | trim | length > 0
+      - wireguard_agent_interface is match('^[A-Za-z0-9_.-]+$')
+      - >-
+        not (
+          wireguard_agent_action_effective
+          in ['create_interface', 'configure_interface', 'update_config']
+        )
+        or ('external_edges' not in group_names)
+    fail_msg: >-
+      Invalid wireguard agent parameters. Check wireguard_agent_action and
+      wireguard_agent_interface (host interface actions are not valid on OpenWrt).
+
+- name: Ensure wg binary is available for status actions
+  ansible.builtin.command: wg --version
+  register: wireguard_agent_wg_binary
+  changed_when: false
+  failed_when: wireguard_agent_wg_binary.rc != 0
+  when: >-
+    wireguard_agent_action_effective
+    in [
+      'create_interface',
+      'configure_interface',
+      'update_config',
+      'list_peers',
+      'show_status',
+      'debug_tunnel',
+      'test_connection'
+    ]
+
+- name: Ensure ip binary is available for interface listing actions
+  ansible.builtin.command: ip -V
+  register: wireguard_agent_ip_binary
+  changed_when: false
+  failed_when: wireguard_agent_ip_binary.rc != 0
+  when: >-
+    wireguard_agent_action_effective
+    in [
+      'create_interface',
+      'configure_interface',
+      'update_config',
+      'list_interfaces',
+      'show_status'
+    ]
+
+- name: Reconcile host WireGuard configuration through wireguard_agent
+  ansible.builtin.include_role:
+    name: wireguard
+  vars:
+    wireguard_disable_host_interface: false
+  when: wireguard_agent_action_effective in ['create_interface', 'configure_interface', 'update_config']
+
+- name: Show WireGuard interface inventory
+  ansible.builtin.command: ip -brief link show type wireguard
+  register: wireguard_agent_interfaces
+  changed_when: false
+  failed_when: false
+  when: wireguard_agent_action_effective in ['list_interfaces', 'show_status']
+
+- name: Show WireGuard peers and status
+  ansible.builtin.command: wg show
+  register: wireguard_agent_show
+  changed_when: false
+  failed_when: false
+  when: wireguard_agent_action_effective in ['list_peers', 'show_status', 'debug_tunnel', 'test_connection']
+
+- name: Show wireguard agent output
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        wireguard_agent_show.stdout
+        | default(wireguard_agent_interfaces.stdout | default('No WireGuard output captured'))
+      }}
+  changed_when: false
+  when: wireguard_agent_action_effective in ['list_interfaces', 'list_peers', 'show_status', 'debug_tunnel', 'test_connection']

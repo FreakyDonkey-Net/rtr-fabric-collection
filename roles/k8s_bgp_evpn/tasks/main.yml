@@ -1,0 +1,370 @@
+---
+- name: Skip k8s_bgp_evpn when disabled
+  ansible.builtin.meta: end_host
+  when: not (k8s_bgp_evpn_enabled | default(true) | bool)
+
+- name: Build effective EVPN router and RR sets
+  ansible.builtin.set_fact:
+    k8s_bgp_evpn_router_nodes: "{{ groups[bgp_evpn_router_group | default('rtr_fabric')] | default([]) }}"
+    k8s_bgp_evpn_rr_nodes: "{{ groups[bgp_evpn_rr_group | default('vps_public')] | default([]) }}"
+  changed_when: false
+
+- name: Assert EVPN router inventory is valid
+  ansible.builtin.assert:
+    that:
+      - (k8s_bgp_evpn_router_nodes | length) > 0
+      - (k8s_bgp_evpn_rr_nodes | length) > 0
+    fail_msg: >-
+      k8s_bgp_evpn requires non-empty router and RR groups.
+
+- name: Assert EVPN router hostvars expose WireGuard and loopback facts
+  ansible.builtin.assert:
+    that:
+      - (hostvars[item].wireguard_public_key | default('') | string | length) > 0
+      - (hostvars[item].wireguard_private_key_effective | default('') | string | length) > 0
+      - (hostvars[item].wireguard_address | default('') | string | length) > 0
+      - (hostvars[item].bgp_evpn_loopback_ip | default('') | string | length) > 0
+    fail_msg: >-
+      Missing WireGuard/BGP EVPN runtime facts for {{ item }}. Run playbooks/cluster/15-wireguard.yml first.
+    quiet: true
+  loop: "{{ k8s_bgp_evpn_router_nodes }}"
+  loop_control:
+    label: "{{ item }}"
+  no_log: true
+
+- name: Normalize external EVPN peers
+  ansible.builtin.set_fact:
+    k8s_bgp_evpn_external_peers_effective: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for peer in (k8s_bgp_evpn_external_peers | default([])) -%}
+      {%-   set _ = ns.items.append({
+              'name': peer.name,
+              'node': peer.node,
+              'peer_ip': peer.peer_ip,
+              'peer_asn': peer.peer_asn,
+              'peer_public_key': peer.peer_public_key,
+              'peer_allowed_ips': (peer.peer_allowed_ips | default([]) | unique | list),
+              'endpoint_host': (peer.endpoint_host | default('')),
+              'endpoint_port': (peer.endpoint_port | default(bgp_evpn_wireguard_listen_port)),
+              'persistent_keepalive': (peer.persistent_keepalive | default(bgp_evpn_wireguard_persistent_keepalive)),
+              'keepalive': (peer.keepalive | default(10)),
+              'holdtime': (peer.holdtime | default(30)),
+              'ebgp_multihop': (peer.ebgp_multihop | default(2)),
+              'bfd': (peer.bfd | default(bgp_evpn_bfd_enabled | default(false)) | bool),
+              'ospf': (peer.ospf | default(k8s_bgp_evpn_ospf_external_enabled | default(false)) | bool),
+              'ospf_neighbor_ip': (peer.ospf_neighbor_ip | default('') | string | trim),
+              'password_enabled': (peer.password_enabled | default(true) | bool),
+              'password': (peer.password | default('', true) | string | trim)
+            }) -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  no_log: true
+  changed_when: false
+
+- name: Assert external OSPF peers declare unicast neighbor IP
+  ansible.builtin.assert:
+    that:
+      - not (item.ospf | default(false) | bool) or (item.ospf_neighbor_ip | default('') | string | trim | length) > 0
+    fail_msg: >-
+      External peer {{ item.name | default('unnamed') }} enables OSPF but does not declare
+      ospf_neighbor_ip. Set a unicast neighbor address reachable over the WireGuard link.
+  loop: "{{ k8s_bgp_evpn_external_peers_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.name | default('unnamed') }}"
+  changed_when: false
+
+- name: Build internal neighbor map
+  ansible.builtin.set_fact:
+    k8s_bgp_evpn_internal_neighbors: >-
+      {%- set ns = namespace(items={}) -%}
+      {%- for node in (k8s_bgp_evpn_router_nodes | default([])) -%}
+      {%-   set peers = k8s_bgp_evpn_router_nodes | difference([node]) | list | sort -%}
+      {%-   set _ = ns.items.update({node: peers}) -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  changed_when: false
+
+- name: Build internal WireGuard allowed-ips map
+  ansible.builtin.set_fact:
+    k8s_bgp_evpn_internal_wg_allowed_ips: >-
+      {%- set ns = namespace(items={}) -%}
+      {%- for node in (k8s_bgp_evpn_router_nodes | default([])) -%}
+      {%-   set peer_map = {} -%}
+      {%-   for peer_node in (k8s_bgp_evpn_internal_neighbors[node] | default([])) -%}
+      {%-     set peer_extra = (
+                hostvars[node].k8s_bgp_evpn_internal_peer_extra_prefixes | default({})
+              ).get(peer_node, []) -%}
+      {%-     set allowed = [
+                (hostvars[peer_node].wireguard_address | regex_replace('/.*$', '') ~ '/32'),
+                (hostvars[peer_node].bgp_evpn_loopback_ip ~ '/32')
+              ] -%}
+      {%-     set allowed = (allowed + (hostvars[peer_node].fabric_advertise_ipv4_networks | default([]))) | unique -%}
+      {%-     set allowed = (allowed + peer_extra) | unique -%}
+      {%-     if (hostvars[node].fabric_egress_transit_gateway_node | default('')) == peer_node -%}
+      {%-       set allowed = (allowed + ['0.0.0.0/0']) | unique -%}
+      {%-     endif -%}
+      {%-     for ext in (k8s_bgp_evpn_external_peers_effective | default([])) -%}
+      {%-       if ext.node == peer_node -%}
+      {%-         set allowed = (allowed + (ext.peer_allowed_ips | default([]))) | unique -%}
+      {%-       endif -%}
+      {%-     endfor -%}
+      {%-     set _ = peer_map.update({peer_node: allowed}) -%}
+      {%-   endfor -%}
+      {%-   set _ = ns.items.update({node: peer_map}) -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  no_log: true
+  changed_when: false
+
+- name: Build internal WireGuard host-route map for explicit peer prefixes
+  ansible.builtin.set_fact:
+    k8s_bgp_evpn_internal_wg_host_routes: >-
+      {%- set ns = namespace(items={}) -%}
+      {%- for node in (k8s_bgp_evpn_router_nodes | default([])) -%}
+      {%-   set peer_map = {} -%}
+      {%-   for peer_node in (k8s_bgp_evpn_internal_neighbors[node] | default([])) -%}
+      {%-     set peer_extra = (
+                hostvars[node].k8s_bgp_evpn_internal_peer_extra_prefixes | default({})
+              ).get(peer_node, []) -%}
+      {%-     set _ = peer_map.update({peer_node: (peer_extra | unique)}) -%}
+      {%-   endfor -%}
+      {%-   set _ = ns.items.update({node: peer_map}) -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  no_log: true
+  changed_when: false
+
+- name: Render EVPN manifest
+  ansible.builtin.template:
+    src: k8s-bgp-evpn.yaml.j2
+    dest: /tmp/k8s-bgp-evpn.yaml
+    mode: "0600"
+  no_log: true
+  changed_when: false
+
+- name: Compute EVPN manifest diff
+  ansible.builtin.command:
+    cmd: "{{ k8s_bgp_evpn_kubectl_bin }} diff -f /tmp/k8s-bgp-evpn.yaml"
+  register: k8s_bgp_evpn_diff
+  failed_when: k8s_bgp_evpn_diff.rc not in [0, 1]
+  changed_when: false
+
+- name: Apply EVPN manifest when drift exists
+  ansible.builtin.command:
+    cmd: "{{ k8s_bgp_evpn_kubectl_bin }} apply -f /tmp/k8s-bgp-evpn.yaml"
+  register: k8s_bgp_evpn_apply
+  changed_when: >-
+    {{
+      ' created' in (k8s_bgp_evpn_apply.stdout | default(''))
+      or ' configured' in (k8s_bgp_evpn_apply.stdout | default(''))
+      or ' patched' in (k8s_bgp_evpn_apply.stdout | default(''))
+    }}
+  no_log: true
+  when: k8s_bgp_evpn_diff.rc == 1
+
+- name: Restart FRR EVPN pods on selected nodes when manifest drift exists
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_bgp_evpn_kubectl_bin }} -n {{ k8s_bgp_evpn_namespace }}
+      delete pod
+      -l app.kubernetes.io/name=frr-evpn,app.kubernetes.io/instance={{ item }}
+      --wait=true
+  loop: >-
+    {{
+      ((k8s_bgp_evpn_restart_nodes | default([]) | length) > 0)
+      | ternary(k8s_bgp_evpn_restart_nodes, k8s_bgp_evpn_router_nodes)
+    }}
+  loop_control:
+    label: "{{ item }}"
+  register: k8s_bgp_evpn_restart
+  changed_when: >-
+    {{
+      'deleted' in (stdout | default(''))
+      or 'deleted' in (stderr | default(''))
+    }}
+  when: k8s_bgp_evpn_diff.rc == 1
+
+- name: Wait for FRR EVPN daemonsets on selected nodes
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_bgp_evpn_kubectl_bin }} -n {{ k8s_bgp_evpn_namespace }}
+      rollout status daemonset/frr-evpn-{{ item }} --timeout=180s
+  loop: >-
+    {{
+      ((k8s_bgp_evpn_wait_nodes | default([]) | length) > 0)
+      | ternary(k8s_bgp_evpn_wait_nodes, k8s_bgp_evpn_router_nodes)
+    }}
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+  when:
+    - (k8s_bgp_evpn_verify_pods | default(true) | bool) or (k8s_bgp_evpn_diff.rc == 1)
+
+- name: Resolve EVPN rollout node set for post-rollout daemon health checks
+  ansible.builtin.set_fact:
+    k8s_bgp_evpn_rollout_nodes_effective: >-
+      {{
+        ((k8s_bgp_evpn_wait_nodes | default([]) | length) > 0)
+        | ternary(k8s_bgp_evpn_wait_nodes, k8s_bgp_evpn_router_nodes)
+      }}
+  changed_when: false
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_verify_pods | default(true) | bool) or (k8s_bgp_evpn_diff.rc == 1)
+
+- name: Resolve FRR EVPN pod names by node for daemon health checks
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_bgp_evpn_kubectl_bin }} -n {{ k8s_bgp_evpn_namespace }}
+      get pod
+      -l app.kubernetes.io/name=frr-evpn,app.kubernetes.io/instance={{ item }}
+      -o jsonpath={.items[0].metadata.name}
+  register: k8s_bgp_evpn_rollout_pods
+  changed_when: false
+  failed_when: false
+  loop: "{{ k8s_bgp_evpn_rollout_nodes_effective | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_verify_pods | default(true) | bool) or (k8s_bgp_evpn_diff.rc == 1)
+
+- name: Assert FRR EVPN pod names were resolved for daemon health checks
+  ansible.builtin.assert:
+    that:
+      - (item.rc | default(1) | int) == 0
+      - (item.stdout | default('') | string | trim | length) > 0
+    fail_msg: >-
+      Failed to resolve FRR EVPN pod for node {{ item.item | default('unknown') }}
+      during daemon health checks.
+  loop: "{{ k8s_bgp_evpn_rollout_pods.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  changed_when: false
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_verify_pods | default(true) | bool) or (k8s_bgp_evpn_diff.rc == 1)
+
+- name: Probe critical FRR daemons on EVPN pods
+  kubernetes.core.k8s_exec:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    namespace: "{{ k8s_bgp_evpn_namespace }}"
+    pod: "{{ item.stdout | default('') | trim }}"
+    container: frr
+    command: >-
+      sh -lc "ps -ef | grep -q '/usr/lib/frr/[z]ebra' && ps -ef | grep -q '/usr/lib/frr/[b]gpd'"
+  register: k8s_bgp_evpn_daemon_probe
+  changed_when: false
+  failed_when: false
+  loop: "{{ k8s_bgp_evpn_rollout_pods.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_verify_pods | default(true) | bool) or (k8s_bgp_evpn_diff.rc == 1)
+
+- name: Build EVPN node list requiring FRR auto-heal restart
+  ansible.builtin.set_fact:
+    k8s_bgp_evpn_autoheal_restart_nodes: >-
+      {{
+        (
+          k8s_bgp_evpn_daemon_probe.results | default([])
+          | rejectattr('rc', 'equalto', 0)
+          | map(attribute='item.item')
+          | list
+        )
+      }}
+  changed_when: false
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_verify_pods | default(true) | bool) or (k8s_bgp_evpn_diff.rc == 1)
+
+- name: Restart FRR EVPN pods flagged by daemon health probe
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_bgp_evpn_kubectl_bin }} -n {{ k8s_bgp_evpn_namespace }}
+      delete pod
+      -l app.kubernetes.io/name=frr-evpn,app.kubernetes.io/instance={{ item }}
+      --wait=true
+  register: k8s_bgp_evpn_autoheal_restart
+  changed_when: >-
+    {{
+      'deleted' in (stdout | default(''))
+      or 'deleted' in (stderr | default(''))
+    }}
+  loop: "{{ k8s_bgp_evpn_autoheal_restart_nodes | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_autoheal_restart_nodes | default([]) | length) > 0
+
+- name: Wait for FRR EVPN daemonsets after auto-heal restart
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_bgp_evpn_kubectl_bin }} -n {{ k8s_bgp_evpn_namespace }}
+      rollout status daemonset/frr-evpn-{{ item }} --timeout=180s
+  changed_when: false
+  loop: "{{ k8s_bgp_evpn_autoheal_restart_nodes | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_autoheal_restart_nodes | default([]) | length) > 0
+
+- name: Resolve FRR EVPN pod names after auto-heal restart
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_bgp_evpn_kubectl_bin }} -n {{ k8s_bgp_evpn_namespace }}
+      get pod
+      -l app.kubernetes.io/name=frr-evpn,app.kubernetes.io/instance={{ item }}
+      -o jsonpath={.items[0].metadata.name}
+  register: k8s_bgp_evpn_autoheal_pods
+  changed_when: false
+  failed_when: false
+  loop: "{{ k8s_bgp_evpn_autoheal_restart_nodes | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_autoheal_restart_nodes | default([]) | length) > 0
+
+- name: Assert FRR EVPN pod names were resolved after auto-heal restart
+  ansible.builtin.assert:
+    that:
+      - (item.rc | default(1) | int) == 0
+      - (item.stdout | default('') | string | trim | length) > 0
+    fail_msg: >-
+      Failed to resolve FRR EVPN pod for node {{ item.item | default('unknown') }}
+      after daemon auto-heal restart.
+  loop: "{{ k8s_bgp_evpn_autoheal_pods.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  changed_when: false
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_autoheal_restart_nodes | default([]) | length) > 0
+
+- name: Assert FRR daemons are healthy after auto-heal restart
+  kubernetes.core.k8s_exec:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    namespace: "{{ k8s_bgp_evpn_namespace }}"
+    pod: "{{ item.stdout | default('') | trim }}"
+    container: frr
+    command: >-
+      sh -lc "ps -ef | grep -q '/usr/lib/frr/[z]ebra' && ps -ef | grep -q '/usr/lib/frr/[b]gpd'"
+  register: k8s_bgp_evpn_autoheal_probe
+  changed_when: false
+  failed_when: (k8s_bgp_evpn_autoheal_probe.rc | default(1) | int) != 0
+  loop: "{{ k8s_bgp_evpn_autoheal_pods.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when:
+    - k8s_bgp_evpn_autoheal_enabled | default(true) | bool
+    - (k8s_bgp_evpn_autoheal_restart_nodes | default([]) | length) > 0
+
+- name: Remove rendered EVPN manifest
+  ansible.builtin.file:
+    path: /tmp/k8s-bgp-evpn.yaml
+    state: absent
+  changed_when: false

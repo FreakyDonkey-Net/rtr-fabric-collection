@@ -1,0 +1,82 @@
+---
+host_security_enabled: true
+
+host_security_sysctl_enabled: true
+host_security_sysctl_ignore_errors: true
+host_security_sysctl_file: /etc/sysctl.d/90-rtr-fabric-security.conf
+host_security_sysctl:
+  kernel.kptr_restrict: "2"
+  kernel.randomize_va_space: "2"
+  fs.protected_hardlinks: "1"
+  fs.protected_symlinks: "1"
+  net.ipv4.tcp_syncookies: "1"
+  net.ipv4.conf.all.accept_redirects: "0"
+  net.ipv4.conf.default.accept_redirects: "0"
+  net.ipv4.conf.all.secure_redirects: "0"
+  net.ipv4.conf.default.secure_redirects: "0"
+  net.ipv4.conf.all.send_redirects: "0"
+  net.ipv4.conf.default.send_redirects: "0"
+  net.ipv6.conf.all.accept_redirects: "0"
+  net.ipv6.conf.default.accept_redirects: "0"
+host_security_enable_ipv4_forwarding: false
+
+host_security_fail2ban_enabled: true
+host_security_fail2ban_packages:
+  - fail2ban
+host_security_fail2ban_jail_name: sshd
+host_security_fail2ban_jail_file: /etc/fail2ban/jail.d/rtr-fabric-sshd.local
+host_security_fail2ban_bantime: 1h
+host_security_fail2ban_findtime: 10m
+host_security_fail2ban_maxretry: 5
+host_security_fail2ban_backend: systemd
+
+host_security_firewall_enabled: true
+host_security_firewall_dry_run: true
+host_security_firewall_force_apply: false
+host_security_firewall_packages:
+  - nftables
+host_security_firewall_ruleset_path: /etc/nftables.conf
+host_security_firewall_artifact_dir: >-
+  {{ playbook_dir | default('.') }}/.ansible-generated/host-firewall
+host_security_firewall_wan_iface_autodetect: true
+host_security_firewall_wan_iface: ""
+host_security_firewall_wan_allow_tcp_ports:
+  - 22
+host_security_firewall_wan_allow_udp_ports:
+  - "{{ wireguard_listen_port | default(62000) }}"
+host_security_firewall_wan_allow_tcp_ports_extra: []
+host_security_firewall_wan_allow_udp_ports_extra: []
+host_security_firewall_allow_established: true
+host_security_firewall_allow_loopback: true
+host_security_firewall_allow_local_interfaces: true
+host_security_firewall_allow_icmp: true
+host_security_egress_gateway_enabled: false
+host_security_egress_gateway_wan_iface: "{{ host_security_firewall_wan_iface | default('') }}"
+host_security_egress_gateway_source_subnets: []
+host_security_fabric_transit_enabled: false
+host_security_fabric_transit_interface: wg0
+host_security_fabric_transit_source_subnets: []
+host_security_fabric_transit_table_id: 2100
+host_security_fabric_transit_rule_priority_base: 2100
+host_security_fabric_transit_script_path: /usr/local/sbin/rtr-fabric-transit-policy.sh
+host_security_fabric_transit_service_name: rtr-fabric-transit-policy
+host_security_fabric_transit_snat_enabled: false
+
+host_security_apparmor_enabled: true
+host_security_apparmor_packages:
+  - apparmor
+  - apparmor-utils
+host_security_apparmor_service_name: apparmor
+host_security_apparmor_manage_cmdline: false
+host_security_apparmor_cmdline_file: /boot/firmware/cmdline.txt
+host_security_apparmor_cmdline_enable_tokens:
+  - apparmor=1
+  - security=apparmor
+host_security_apparmor_cmdline_remove_tokens:
+  - apparmor=0
+host_security_apparmor_reboot_on_cmdline_change: true
+host_security_apparmor_reboot_timeout: 900
+host_security_apparmor_reboot_connect_timeout: 30
+host_security_apparmor_fail_if_disabled_after_apply: false
+host_security_apparmor_profiles_enforce: []
+host_security_apparmor_profiles_complain: []

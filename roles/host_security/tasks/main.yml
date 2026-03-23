@@ -1,0 +1,413 @@
+---
+- name: Skip host security when disabled
+  ansible.builtin.meta: end_host
+  when: not (host_security_enabled | default(true) | bool)
+
+- name: Install host security packages
+  ansible.builtin.apt:
+    name: >-
+      {{
+        (
+          (host_security_apparmor_packages | default([]))
+          + (host_security_fail2ban_packages | default([]))
+          + (host_security_firewall_packages | default([]))
+        ) | unique
+      }}
+    state: present
+    update_cache: true
+  when: ansible_os_family == 'Debian'
+
+- name: Ensure AppArmor service is enabled and started
+  ansible.builtin.service:
+    name: "{{ host_security_apparmor_service_name }}"
+    state: started
+    enabled: true
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Stat AppArmor boot cmdline file when managed
+  ansible.builtin.stat:
+    path: "{{ host_security_apparmor_cmdline_file }}"
+  register: host_security_apparmor_cmdline_stat
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - host_security_apparmor_manage_cmdline | default(false) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Read AppArmor boot cmdline
+  ansible.builtin.slurp:
+    path: "{{ host_security_apparmor_cmdline_file }}"
+  register: host_security_apparmor_cmdline_slurp
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - host_security_apparmor_manage_cmdline | default(false) | bool
+    - ansible_os_family == 'Debian'
+    - host_security_apparmor_cmdline_stat.stat.exists | default(false)
+
+- name: Compute effective AppArmor boot cmdline
+  ansible.builtin.set_fact:
+    host_security_apparmor_cmdline_effective: >-
+      {{
+        (
+          (
+            (host_security_apparmor_cmdline_slurp.content | b64decode | trim).split()
+            | reject('in', host_security_apparmor_cmdline_remove_tokens | default([]))
+            | reject('in', host_security_apparmor_cmdline_enable_tokens | default([]))
+            | list
+          )
+          + (host_security_apparmor_cmdline_enable_tokens | default([]))
+        ) | join(' ')
+      }}
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - host_security_apparmor_manage_cmdline | default(false) | bool
+    - ansible_os_family == 'Debian'
+    - host_security_apparmor_cmdline_stat.stat.exists | default(false)
+
+- name: Update AppArmor boot cmdline
+  ansible.builtin.copy:
+    dest: "{{ host_security_apparmor_cmdline_file }}"
+    content: "{{ host_security_apparmor_cmdline_effective | trim }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  register: host_security_apparmor_cmdline_result
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - host_security_apparmor_manage_cmdline | default(false) | bool
+    - ansible_os_family == 'Debian'
+    - host_security_apparmor_cmdline_stat.stat.exists | default(false)
+
+- name: Reboot after AppArmor boot cmdline change
+  ansible.builtin.reboot:
+    msg: "Reboot requested by rtr-fabric to enable AppArmor at boot"
+    reboot_timeout: "{{ host_security_apparmor_reboot_timeout }}"
+    connect_timeout: "{{ host_security_apparmor_reboot_connect_timeout }}"
+    post_reboot_delay: 5
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - host_security_apparmor_manage_cmdline | default(false) | bool
+    - host_security_apparmor_reboot_on_cmdline_change | default(true) | bool
+    - ansible_os_family == 'Debian'
+    - host_security_apparmor_cmdline_result is changed
+
+- name: Read AppArmor kernel enabled flag
+  ansible.builtin.command: cat /sys/module/apparmor/parameters/enabled
+  register: host_security_apparmor_kernel_flag
+  changed_when: false
+  failed_when: false
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Read AppArmor status JSON
+  ansible.builtin.command: aa-status --json
+  register: host_security_apparmor_status
+  changed_when: false
+  failed_when: false
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Set AppArmor profiles to complain mode
+  ansible.builtin.command: aa-complain "{{ item }}"
+  loop: "{{ host_security_apparmor_profiles_complain | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+    - (host_security_apparmor_kernel_flag.stdout | default('') | trim) == 'Y'
+
+- name: Set AppArmor profiles to enforce mode
+  ansible.builtin.command: aa-enforce "{{ item }}"
+  loop: "{{ host_security_apparmor_profiles_enforce | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+    - (host_security_apparmor_kernel_flag.stdout | default('') | trim) == 'Y'
+
+- name: Assert AppArmor is enabled after apply when required
+  ansible.builtin.assert:
+    that:
+      - (host_security_apparmor_kernel_flag.stdout | default('') | trim) == 'Y'
+    fail_msg: >-
+      AppArmor is still disabled on {{ inventory_hostname }} after convergence.
+      Check {{ host_security_apparmor_cmdline_file }} and kernel support.
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - host_security_apparmor_fail_if_disabled_after_apply | default(false) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Report AppArmor state
+  ansible.builtin.debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      kernel_enabled: "{{ host_security_apparmor_kernel_flag.stdout | default('missing') | trim }}"
+      service: "{{ host_security_apparmor_service_name }}"
+      status_rc: "{{ host_security_apparmor_status.rc | default('n/a') }}"
+      managed_cmdline: "{{ host_security_apparmor_manage_cmdline | default(false) | bool }}"
+  changed_when: false
+  when:
+    - host_security_apparmor_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Build effective host security sysctl map
+  ansible.builtin.set_fact:
+    host_security_sysctl_effective: >-
+      {{
+        (host_security_sysctl | default({}))
+        | combine(
+            {'net.ipv4.ip_forward': '1'}
+            if (host_security_enable_ipv4_forwarding | default(false) | bool)
+            else {},
+            recursive=True
+          )
+      }}
+  when:
+    - host_security_sysctl_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Apply safe sysctl hardening
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_file: "{{ host_security_sysctl_file }}"
+    reload: true
+    ignoreerrors: "{{ host_security_sysctl_ignore_errors | default(true) | bool }}"
+  loop: "{{ (host_security_sysctl_effective | default(host_security_sysctl | default({}))) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - host_security_sysctl_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Ensure local sbin directory exists for fabric transit helper
+  ansible.builtin.file:
+    path: "{{ host_security_fabric_transit_script_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - host_security_fabric_transit_enabled | default(false) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Install fabric transit routing helper
+  ansible.builtin.template:
+    src: fabric-transit-policy.sh.j2
+    dest: "{{ host_security_fabric_transit_script_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  register: host_security_fabric_transit_script_result
+  when:
+    - host_security_fabric_transit_enabled | default(false) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Install fabric transit systemd service
+  ansible.builtin.template:
+    src: fabric-transit-policy.service.j2
+    dest: "/etc/systemd/system/{{ host_security_fabric_transit_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  register: host_security_fabric_transit_service_result
+  when:
+    - host_security_fabric_transit_enabled | default(false) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Reload systemd after fabric transit service changes
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - host_security_fabric_transit_enabled | default(false) | bool
+    - ansible_os_family == 'Debian'
+    - >-
+      (host_security_fabric_transit_script_result is changed)
+      or (host_security_fabric_transit_service_result is changed)
+
+- name: Enable and run fabric transit routing helper
+  ansible.builtin.systemd:
+    name: "{{ host_security_fabric_transit_service_name }}"
+    enabled: true
+    state: restarted
+  when:
+    - host_security_fabric_transit_enabled | default(false) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Ensure fail2ban jail directory exists
+  ansible.builtin.file:
+    path: "{{ host_security_fail2ban_jail_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - host_security_fail2ban_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Install fail2ban sshd jail
+  ansible.builtin.template:
+    src: fail2ban-sshd.local.j2
+    dest: "{{ host_security_fail2ban_jail_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: host_security_fail2ban_jail_result
+  when:
+    - host_security_fail2ban_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Ensure fail2ban service is enabled and started
+  ansible.builtin.service:
+    name: fail2ban
+    state: started
+    enabled: true
+  when:
+    - host_security_fail2ban_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Build effective firewall port lists
+  ansible.builtin.set_fact:
+    host_security_firewall_effective_wan_tcp_ports: >-
+      {{
+        (
+          (host_security_firewall_wan_allow_tcp_ports | default([]))
+          + (host_security_firewall_wan_allow_tcp_ports_extra | default([]))
+        )
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    host_security_firewall_effective_wan_udp_ports: >-
+      {{
+        (
+          (host_security_firewall_wan_allow_udp_ports | default([]))
+          + (host_security_firewall_wan_allow_udp_ports_extra | default([]))
+        )
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+  when:
+    - host_security_firewall_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Resolve effective WAN interface candidate
+  ansible.builtin.set_fact:
+    host_security_firewall_effective_wan_iface: >-
+      {{
+        (
+          host_security_firewall_wan_iface
+          | default('')
+          | string
+          | trim
+        )
+        if (
+          host_security_firewall_wan_iface
+          | default('')
+          | string
+          | trim
+          | length
+        ) > 0
+        else (
+          ansible_default_ipv4.interface
+          | default('')
+          | string
+          | trim
+        )
+      }}
+  when:
+    - host_security_firewall_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Ensure local firewall artifact directory exists
+  ansible.builtin.file:
+    path: "{{ host_security_firewall_artifact_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+  when:
+    - host_security_firewall_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Render host firewall artifact locally
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: "{{ host_security_firewall_artifact_dir }}/{{ inventory_hostname }}.nft"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  when:
+    - host_security_firewall_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+
+- name: Show host firewall dry-run plan
+  ansible.builtin.debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      wan_iface_candidate: "{{ host_security_firewall_effective_wan_iface | default('') }}"
+      artifact: "{{ host_security_firewall_artifact_dir }}/{{ inventory_hostname }}.nft"
+      tcp_ports: "{{ host_security_firewall_effective_wan_tcp_ports | default([]) }}"
+      udp_ports: "{{ host_security_firewall_effective_wan_udp_ports | default([]) }}"
+  changed_when: false
+  when:
+    - host_security_firewall_enabled | default(true) | bool
+    - host_security_firewall_dry_run | default(true) | bool
+    - not (host_security_firewall_force_apply | default(false) | bool)
+    - ansible_os_family == 'Debian'
+
+- name: Apply nftables firewall on host
+  when:
+    - host_security_firewall_enabled | default(true) | bool
+    - ansible_os_family == 'Debian'
+    - >-
+      not (host_security_firewall_dry_run | default(true) | bool)
+      or (host_security_firewall_force_apply | default(false) | bool)
+  block:
+    - name: Ensure effective WAN interface is known before firewall apply
+      ansible.builtin.assert:
+        that:
+          - (host_security_firewall_effective_wan_iface | default('') | length) > 0
+        fail_msg: >-
+          No WAN interface candidate resolved for {{ inventory_hostname }}.
+          Define host_security_firewall_wan_iface explicitly before applying
+          nftables.
+
+    - name: Render candidate nftables ruleset on remote host
+      ansible.builtin.template:
+        src: nftables.conf.j2
+        dest: /tmp/rtr-fabric-nftables.conf
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Validate nftables ruleset syntax
+      ansible.builtin.command: nft -c -f /tmp/rtr-fabric-nftables.conf
+      changed_when: false
+
+    - name: Install nftables ruleset
+      ansible.builtin.copy:
+        src: /tmp/rtr-fabric-nftables.conf
+        dest: "{{ host_security_firewall_ruleset_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      register: host_security_firewall_ruleset_result
+
+    - name: Ensure nftables service is enabled and restarted when needed
+      ansible.builtin.service:
+        name: nftables
+        state: "{{ 'restarted' if (host_security_firewall_ruleset_result is changed) else 'started' }}"
+        enabled: true

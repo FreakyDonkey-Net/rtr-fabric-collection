@@ -1,0 +1,290 @@
+---
+- name: Normalize security agent action
+  ansible.builtin.set_fact:
+    security_agent_action_effective: "{{ security_agent_action | default('audit_security') }}"
+    security_agent_is_openwrt: "{{ 'external_edges' in group_names }}"
+    security_agent_is_debian: "{{ 'external_edges' not in group_names }}"
+
+- name: Validate security agent action and host compatibility
+  ansible.builtin.assert:
+    that:
+      - security_agent_action_effective in security_agent_supported_actions
+      - >-
+        not (
+          security_agent_action_effective
+          in ['configure_openwrt_security', 'update_openwrt_firewall']
+        )
+        or (security_agent_is_openwrt | bool)
+      - >-
+        not (
+          security_agent_action_effective
+          in [
+            'harden_ssh',
+            'configure_ssh',
+            'configure_firewall',
+            'update_firewall_rules',
+            'apply_security_baseline',
+            'audit_apparmor'
+          ]
+        )
+        or (security_agent_is_debian | bool)
+      - >-
+        not (
+          security_agent_action_effective
+          in ['harden_ssh', 'configure_ssh']
+        )
+        or (security_agent_ssh_dropin_path | string | trim | length) > 0
+      - >-
+        not (
+          security_agent_action_effective
+          in ['harden_ssh', 'configure_ssh']
+        )
+        or (security_agent_ssh_dropin_path | string).startswith('/')
+      - >-
+        not (
+          security_agent_action_effective
+          in ['harden_ssh', 'configure_ssh']
+        )
+        or (
+          (
+            security_agent_ssh_allow_users | default([])
+            | map('string')
+            | select('match', '^[A-Za-z_][A-Za-z0-9_.-]*$')
+            | list
+            | length
+          )
+          == (security_agent_ssh_allow_users | default([]) | length)
+        )
+      - >-
+        not (
+          security_agent_action_effective
+          in ['configure_firewall', 'update_firewall_rules']
+        )
+        or (
+          security_agent_firewall_allowed_ports is not defined
+          or (
+            (security_agent_firewall_allowed_ports is sequence)
+            and (security_agent_firewall_allowed_ports is not string)
+            and (
+              (
+                security_agent_firewall_allowed_ports
+                | map('int')
+                | select('ge', 1)
+                | list
+                | length
+              )
+              == (security_agent_firewall_allowed_ports | length)
+            )
+            and (
+              (
+                security_agent_firewall_allowed_ports
+                | map('int')
+                | select('le', 65535)
+                | list
+                | length
+              )
+              == (security_agent_firewall_allowed_ports | length)
+            )
+          )
+        )
+    fail_msg: >-
+      Invalid security_agent action for the current host class or missing SSH
+      hardening/firewall preflight inputs.
+
+- name: Ensure sshd binary is available for SSH hardening actions
+  ansible.builtin.command: /usr/sbin/sshd -t
+  register: security_agent_sshd_check
+  changed_when: false
+  failed_when: security_agent_sshd_check.rc != 0
+  when:
+    - security_agent_action_effective in ['harden_ssh', 'configure_ssh']
+    - security_agent_is_debian | bool
+
+- name: Ensure nft binary is available for Debian firewall actions
+  ansible.builtin.command: nft --version
+  register: security_agent_nft_check
+  changed_when: false
+  failed_when: security_agent_nft_check.rc != 0
+  when:
+    - security_agent_action_effective in ['configure_firewall', 'update_firewall_rules', 'list_firewall_rules', 'audit_security']
+    - security_agent_is_debian | bool
+
+- name: Ensure AppArmor tools are available for AppArmor audit actions
+  ansible.builtin.command: aa-status --help
+  register: security_agent_aa_tools_check
+  changed_when: false
+  failed_when: security_agent_aa_tools_check.rc != 0
+  when:
+    - security_agent_action_effective in ['audit_security', 'audit_apparmor']
+    - security_agent_is_debian | bool
+
+- name: Ensure UCI CLI is available for OpenWrt security actions
+  ansible.builtin.command: uci -q show system
+  register: security_agent_uci_check
+  changed_when: false
+  failed_when: security_agent_uci_check.rc != 0
+  when:
+    - security_agent_action_effective in ['configure_openwrt_security', 'update_openwrt_firewall', 'list_firewall_rules', 'audit_security']
+    - security_agent_is_openwrt | bool
+
+- name: Apply Debian SSH hardening from security agent
+  when: security_agent_action_effective in ['harden_ssh', 'configure_ssh']
+  block:
+    - name: Ensure openssh-server is installed
+      ansible.builtin.apt:
+        name: openssh-server
+        state: present
+        update_cache: true
+      when: security_agent_is_debian | bool
+
+    - name: Ensure sshd_config.d exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: security_agent_is_debian | bool
+
+    - name: Install SSH hardening drop-in
+      ansible.builtin.copy:
+        dest: "{{ security_agent_ssh_dropin_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible (rtr-fabric security_agent)
+          Protocol 2
+          PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          PubkeyAuthentication yes
+
+          ClientAliveInterval 60
+          ClientAliveCountMax 3
+          MaxAuthTries 3
+          LoginGraceTime 20
+
+          {% if security_agent_ssh_allow_users | default([]) | length > 0 -%}
+          AllowUsers {{ security_agent_ssh_allow_users | join(' ') }}
+          {% endif -%}
+      when: security_agent_is_debian | bool
+
+    - name: Validate sshd configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+      when: security_agent_is_debian | bool
+
+    - name: Reload SSH service
+      ansible.builtin.service:
+        name: ssh
+        state: reloaded
+      when: security_agent_is_debian | bool
+
+- name: Apply host security baseline through security agent
+  ansible.builtin.include_role:
+    name: host_security
+  when: security_agent_action_effective == 'apply_security_baseline'
+
+- name: Configure or update Debian firewall through security agent
+  ansible.builtin.include_role:
+    name: host_security
+  vars:
+    host_security_firewall_enabled: true
+    host_security_firewall_dry_run: false
+    host_security_firewall_force_apply: true
+    host_security_firewall_wan_allow_tcp_ports: "{{ security_agent_firewall_allowed_ports | default([22, 80, 443]) }}"
+  when: security_agent_action_effective in ['configure_firewall', 'update_firewall_rules']
+
+- name: Configure OpenWrt security through security agent
+  ansible.builtin.include_role:
+    name: openwrt_security
+  vars:
+    openwrt_security_uhttpd_dry_run: false
+    openwrt_security_uhttpd_force_apply: true
+    openwrt_security_firewall_dry_run: false
+    openwrt_security_firewall_force_apply: true
+  when: security_agent_action_effective in ['configure_openwrt_security', 'update_openwrt_firewall']
+
+- name: Gather service facts for security audit
+  ansible.builtin.service_facts:
+  when:
+    - security_agent_action_effective == 'audit_security'
+    - security_agent_is_debian | bool
+
+- name: Capture AppArmor kernel flag for audit
+  ansible.builtin.command: cat /sys/module/apparmor/parameters/enabled
+  register: security_agent_audit_apparmor_flag
+  changed_when: false
+  failed_when: false
+  when:
+    - security_agent_action_effective in ['audit_security', 'audit_apparmor']
+    - security_agent_is_debian | bool
+
+- name: Capture AppArmor status for audit
+  ansible.builtin.command: aa-status --json
+  register: security_agent_audit_apparmor_status
+  changed_when: false
+  failed_when: false
+  when:
+    - security_agent_action_effective in ['audit_security', 'audit_apparmor']
+    - security_agent_is_debian | bool
+
+- name: Capture Debian firewall ruleset for audit
+  ansible.builtin.command: nft list ruleset
+  register: security_agent_audit_nft
+  changed_when: false
+  failed_when: false
+  when:
+    - security_agent_action_effective in ['audit_security', 'list_firewall_rules']
+    - security_agent_is_debian | bool
+
+- name: Capture fail2ban sshd status for audit
+  ansible.builtin.command: fail2ban-client status sshd
+  register: security_agent_audit_fail2ban
+  changed_when: false
+  failed_when: false
+  when:
+    - security_agent_action_effective == 'audit_security'
+    - security_agent_is_debian | bool
+
+- name: Capture OpenWrt firewall summary for audit
+  ansible.builtin.raw: |
+    uci -q get dropbear.@dropbear[0].PasswordAuth || true
+    uci -q get uhttpd.main.redirect_https || true
+    uci -q show firewall | sed -n '1,40p'
+  register: security_agent_audit_openwrt
+  changed_when: false
+  failed_when: false
+  when:
+    - security_agent_action_effective in ['audit_security', 'list_firewall_rules']
+    - security_agent_is_openwrt | bool
+
+- name: Show security audit summary
+  ansible.builtin.debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      ssh_service: "{{ ansible_facts.services['ssh.service'].state | default('unknown') if (security_agent_is_debian | bool) else 'n/a' }}"
+      fail2ban_sshd: "{{ security_agent_audit_fail2ban.stdout | default('n/a') }}"
+      apparmor_kernel: "{{ security_agent_audit_apparmor_flag.stdout | default('n/a') | trim }}"
+      apparmor_status_rc: "{{ security_agent_audit_apparmor_status.rc | default('n/a') }}"
+      nftables_excerpt: "{{ (security_agent_audit_nft.stdout_lines | default([]))[:20] }}"
+      openwrt_excerpt: "{{ (security_agent_audit_openwrt.stdout_lines | default([]))[:20] }}"
+  changed_when: false
+  when: security_agent_action_effective == 'audit_security'
+
+- name: Show AppArmor audit summary
+  ansible.builtin.debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      kernel_enabled: "{{ security_agent_audit_apparmor_flag.stdout | default('n/a') | trim }}"
+      aa_status_json: "{{ security_agent_audit_apparmor_status.stdout | default('{}') }}"
+  changed_when: false
+  when: security_agent_action_effective == 'audit_apparmor'
+
+- name: Show firewall rules requested by security agent
+  ansible.builtin.debug:
+    msg: "{{ security_agent_audit_nft.stdout | default(security_agent_audit_openwrt.stdout | default('No firewall output captured')) }}"
+  changed_when: false
+  when: security_agent_action_effective == 'list_firewall_rules'

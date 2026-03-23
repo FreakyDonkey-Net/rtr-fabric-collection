@@ -1,0 +1,130 @@
+- name: Compute effective OVN DB tunnel mode
+  ansible.builtin.set_fact:
+    ovn_ssh_tunnel_should_manage: >-
+      {{
+        (ovn_ssh_tunnel_enabled | bool)
+        and
+        (inventory_hostname in (groups.get('k3s_server', []) | list))
+        and
+        (inventory_hostname != k3s_server_host)
+      }}
+  changed_when: false
+
+- name: Check whether OVN DB tunnel unit exists
+  ansible.builtin.stat:
+    path: "{{ ovn_ssh_tunnel_systemd_path }}"
+  register: ovn_ssh_tunnel_unit_stat
+
+- name: Ensure OVN DB tunnel SSH key exists
+  ansible.builtin.stat:
+    path: "{{ ovn_ssh_tunnel_ssh_key_path }}"
+  register: ovn_ssh_tunnel_key_stat
+  when: ovn_ssh_tunnel_should_manage | bool
+
+- name: Assert OVN DB tunnel prerequisites
+  ansible.builtin.assert:
+    that:
+      - ovn_ssh_tunnel_remote_host | string | trim | length > 0
+      - ovn_ssh_tunnel_key_stat.stat.exists | bool
+      - (ovn_ssh_tunnel_ports | default([]) | length) > 0
+    fail_msg: >-
+      OVN DB tunnel prerequisites are invalid on {{ inventory_hostname }}.
+      remote_host={{ ovn_ssh_tunnel_remote_host | default('') }},
+      key_exists={{ ovn_ssh_tunnel_key_stat.stat.exists | default(false) }},
+      ports={{ ovn_ssh_tunnel_ports | default([]) }}.
+  when: ovn_ssh_tunnel_should_manage | bool
+
+- name: Render OVN DB tunnel systemd unit
+  ansible.builtin.copy:
+    dest: "{{ ovn_ssh_tunnel_systemd_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=OVN DB SSH tunnel to {{ ovn_ssh_tunnel_remote_host }}
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User={{ ovn_ssh_tunnel_user }}
+      Group={{ ovn_ssh_tunnel_group }}
+      ExecStart={{ ovn_ssh_tunnel_ssh_bin }} -NT -4 \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval={{ ovn_ssh_tunnel_server_alive_interval | int }} \
+        -o ServerAliveCountMax={{ ovn_ssh_tunnel_server_alive_count_max | int }} \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile=/home/{{ ovn_ssh_tunnel_user }}/.ssh/known_hosts \
+        -i {{ ovn_ssh_tunnel_ssh_key_path }} \
+      {% for port in ovn_ssh_tunnel_ports %}
+        -L {{ ovn_ssh_tunnel_local_host }}:{{ port }}:{{ ovn_ssh_tunnel_remote_bind_host }}:{{ port }} \
+      {% endfor %}
+        {{ ovn_ssh_tunnel_remote_user }}@{{ ovn_ssh_tunnel_remote_host }}
+      Restart=always
+      RestartSec=5
+      TimeoutStartSec=30
+
+      [Install]
+      WantedBy=multi-user.target
+  when: ovn_ssh_tunnel_should_manage | bool
+  register: ovn_ssh_tunnel_unit_write
+
+- name: Reload systemd after OVN DB tunnel unit update
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - ovn_ssh_tunnel_should_manage | bool
+    - ovn_ssh_tunnel_unit_write is changed
+
+- name: Ensure OVN DB tunnel service is enabled and running
+  ansible.builtin.systemd_service:
+    name: "{{ ovn_ssh_tunnel_unit_name }}"
+    enabled: true
+    state: started
+  when: ovn_ssh_tunnel_should_manage | bool
+
+- name: Wait for OVN DB tunnel local listeners
+  ansible.builtin.shell: >
+    ss -ltn |
+    awk '/{{ ovn_ssh_tunnel_local_host | regex_escape }}:(6641|6642)/ {found++}
+    END { exit(found >= {{ ovn_ssh_tunnel_ports | length }} ? 0 : 1) }'
+  register: ovn_ssh_tunnel_listener_check
+  changed_when: false
+  retries: 10
+  delay: 2
+  until: ovn_ssh_tunnel_listener_check.rc == 0
+  when: ovn_ssh_tunnel_should_manage | bool
+
+- name: Stop OVN DB tunnel where it should not run
+  ansible.builtin.systemd_service:
+    name: "{{ ovn_ssh_tunnel_unit_name }}"
+    enabled: false
+    state: stopped
+  when:
+    - not (ovn_ssh_tunnel_should_manage | bool)
+    - ovn_ssh_tunnel_unit_stat.stat.exists | bool
+
+- name: Remove OVN DB tunnel systemd unit where it should not run
+  ansible.builtin.file:
+    path: "{{ ovn_ssh_tunnel_systemd_path }}"
+    state: absent
+  register: ovn_ssh_tunnel_unit_absent
+  when:
+    - not (ovn_ssh_tunnel_should_manage | bool)
+    - ovn_ssh_tunnel_unit_stat.stat.exists | bool
+
+- name: Reload systemd after OVN DB tunnel removal
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - not (ovn_ssh_tunnel_should_manage | bool)
+    - ovn_ssh_tunnel_unit_absent is changed
+
+- name: Show OVN DB tunnel summary
+  ansible.builtin.debug:
+    msg:
+      manage: "{{ ovn_ssh_tunnel_should_manage | bool }}"
+      remote_host: "{{ ovn_ssh_tunnel_remote_host }}"
+      ports: "{{ ovn_ssh_tunnel_ports }}"
+  changed_when: false

@@ -1,0 +1,125 @@
+---
+- name: Validate mDNS reflector inputs
+  ansible.builtin.assert:
+    that:
+      - (openwrt_mdns_reflector_allow_interfaces | default([])) | length > 0
+    fail_msg: >-
+      openwrt_mdns_reflector_allow_interfaces must contain at least one interface
+      when mDNS reflector is enabled.
+
+- name: Normalize mDNS reflector interface list
+  ansible.builtin.set_fact:
+    openwrt_mdns_reflector_allow_interfaces_effective: >-
+      {{
+        (openwrt_mdns_reflector_allow_interfaces | default([]))
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+
+- name: Build Avahi reflector config content
+  ansible.builtin.set_fact:
+    openwrt_mdns_reflector_config_content: |
+      [server]
+      allow-interfaces={{ openwrt_mdns_reflector_allow_interfaces_effective | join(',') }}
+      #host-name=foo
+      #domain-name=local
+      use-ipv4=yes
+      use-ipv6={{ 'yes' if (openwrt_mdns_reflector_use_ipv6 | default(false) | bool) else 'no' }}
+      check-response-ttl=no
+      use-iff-running=no
+
+      [publish]
+      publish-addresses=no
+      publish-hinfo=no
+      publish-workstation=no
+      publish-domain=no
+      #publish-dns-servers=192.168.1.1
+      #publish-resolv-conf-dns-servers=yes
+
+      [reflector]
+      enable-reflector=yes
+      reflect-ipv=no
+
+      [rlimits]
+      #rlimit-as=
+      rlimit-core=0
+      rlimit-data=4194304
+      rlimit-fsize=0
+      rlimit-nofile=30
+      rlimit-stack=4194304
+      rlimit-nproc=3
+
+- name: Build Avahi reflector config hash
+  ansible.builtin.set_fact:
+    openwrt_mdns_reflector_config_hash: >-
+      {{ (openwrt_mdns_reflector_config_content | hash('sha256')) }}
+
+- name: Show mDNS reflector dry-run plan
+  ansible.builtin.debug:
+    msg:
+      interfaces: "{{ openwrt_mdns_reflector_allow_interfaces_effective }}"
+      config_path: "{{ openwrt_mdns_reflector_config_path }}"
+      service: "{{ openwrt_mdns_reflector_service_name }}"
+  changed_when: false
+  when:
+    - openwrt_mdns_reflector_dry_run | default(true) | bool
+    - not (openwrt_mdns_reflector_force_apply | default(false) | bool)
+
+- name: Apply mDNS reflector package and config
+  when: >-
+    not (openwrt_mdns_reflector_dry_run | default(true) | bool)
+    or (openwrt_mdns_reflector_force_apply | default(false) | bool)
+  block:
+    - name: Ensure Avahi packages are installed
+      ansible.builtin.raw: |
+        changed=0
+        {% for pkg in (openwrt_mdns_reflector_packages | default([])) %}
+        if ! opkg status "{{ pkg }}" 2>/dev/null | grep -q " installed"; then
+          opkg install "{{ pkg }}"
+          changed=1
+        fi
+        {% endfor %}
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_mdns_reflector_opkg_result
+      changed_when: "'CHANGED' in (openwrt_mdns_reflector_opkg_result.stdout | default(''))"
+
+    - name: Render Avahi reflector config file
+      ansible.builtin.raw: |
+        if [ -f "{{ openwrt_mdns_reflector_config_path }}" ]; then
+          current_hash="$(sed -e 's/[[:space:]]*$//' "{{ openwrt_mdns_reflector_config_path }}" | sha256sum | cut -d' ' -f1)"
+        else
+          current_hash=""
+        fi
+        if [ "$current_hash" != "{{ openwrt_mdns_reflector_config_hash }}" ]; then
+          printf '%s\n' "$(cat <<'EOF'
+        {{ openwrt_mdns_reflector_config_content }}
+        EOF
+          )" > "{{ openwrt_mdns_reflector_config_path }}"
+          echo CHANGED
+        fi
+      register: openwrt_mdns_reflector_config_write
+      changed_when: "'CHANGED' in (openwrt_mdns_reflector_config_write.stdout | default(''))"
+
+    - name: Ensure Avahi service is enabled and started
+      ansible.builtin.raw: |
+        changed=0
+        if ! /etc/init.d/{{ openwrt_mdns_reflector_service_name }} enabled >/dev/null 2>&1; then
+          /etc/init.d/{{ openwrt_mdns_reflector_service_name }} enable
+          changed=1
+        fi
+        if ! /etc/init.d/{{ openwrt_mdns_reflector_service_name }} status >/dev/null 2>&1; then
+          /etc/init.d/{{ openwrt_mdns_reflector_service_name }} start
+          changed=1
+        fi
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_mdns_reflector_service_state
+      changed_when: "'CHANGED' in (openwrt_mdns_reflector_service_state.stdout | default(''))"
+
+    - name: Restart Avahi service when package/config changed
+      ansible.builtin.raw: /etc/init.d/{{ openwrt_mdns_reflector_service_name }} restart
+      when: >-
+        (openwrt_mdns_reflector_config_write is changed)
+        or (openwrt_mdns_reflector_opkg_result is changed)

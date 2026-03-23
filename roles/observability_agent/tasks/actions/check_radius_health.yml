@@ -1,0 +1,12 @@
+---
+- name: Check RADIUS pods in net-services namespace
+  ansible.builtin.command: >-
+    {{ observability_agent_kubectl_bin }} -n {{ observability_agent_radius_namespace }}
+    get pods -l app.kubernetes.io/name=infra-radius -o wide
+  register: observability_agent_radius_pods
+  changed_when: false
+  failed_when: false
+
+- name: Display RADIUS pod status
+  ansible.builtin.debug:
+    msg: "{{ observability_agent_radius_pods.stdout_lines | default([]) }}"

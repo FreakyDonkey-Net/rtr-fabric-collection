@@ -1,0 +1,6 @@
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived
+rules:
+{{ k3s_audit_policy_rules | default([]) | to_nice_yaml(indent=2) | indent(2, true) }}

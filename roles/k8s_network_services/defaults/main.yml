@@ -1,0 +1,116 @@
+---
+k8s_network_services_namespace: net-services
+k8s_network_services_namespace_pod_security_enforce: baseline
+k8s_network_services_namespace_pod_security_warn: restricted
+k8s_network_services_namespace_pod_security_audit: restricted
+k8s_network_services_kubectl_bin: /usr/local/bin/kubectl
+k8s_network_services_dry_run: false
+k8s_network_services_prod_hostnetwork_exceptions: {}
+
+k8s_network_services_dns_enabled: false
+k8s_network_services_dns_image: docker.io/coredns/coredns:1.11.3
+k8s_network_services_dns_internal_domain: localdomain
+k8s_network_services_dns_internal_autodiscover_inventory_hosts: false
+k8s_network_services_dns_internal_autodiscover_groups: []
+k8s_network_services_dns_internal_records: []
+k8s_network_services_dns_internal_fallthrough: true
+k8s_network_services_dns_forwarders: []
+k8s_network_services_dns_apparmor_type: RuntimeDefault
+k8s_network_services_dns_seccomp_type: RuntimeDefault
+k8s_network_services_dns_allow_privilege_escalation: false
+k8s_network_services_dns_read_only_root_filesystem: true
+k8s_network_services_dns_run_as_non_root: true
+k8s_network_services_dns_run_as_user: 65532
+k8s_network_services_dns_run_as_group: 65532
+k8s_network_services_dns_capabilities_drop:
+  - ALL
+k8s_network_services_dns_capabilities_add:
+  - NET_BIND_SERVICE
+k8s_network_services_dns_node_selector:
+  freakydonkey.net/frontend: "true"
+
+k8s_network_services_radius_enabled: false
+k8s_network_services_radius_require_users: true
+k8s_network_services_radius_image: docker.io/freeradius/freeradius-server:3.2.5
+k8s_network_services_radius_clients: []
+k8s_network_services_radius_users: []
+k8s_network_services_radius_custom_tls_assets_enabled: false
+k8s_network_services_radius_tls_server_pem: ""
+k8s_network_services_radius_tls_ca_pem: ""
+k8s_network_services_radius_eap_default_type: peap
+k8s_network_services_radius_eap_tls_enabled: false
+k8s_network_services_radius_eap_tls_client_ca_pem: ""
+k8s_network_services_radius_eap_tls_check_cert_cn_enabled: true
+k8s_network_services_radius_eap_tls_min_version: "1.2"
+k8s_network_services_radius_eap_tls_max_version: "1.2"
+k8s_network_services_radius_eap_tls_reject_unknown_intermediate_ca: true
+k8s_network_services_radius_cert_manager_enabled: false
+k8s_network_services_radius_cert_manager_secret_name: infra-radius-tls-public
+k8s_network_services_radius_cert_manager_certificate_name: infra-radius-tls-public
+k8s_network_services_radius_cert_manager_dns_names: []
+k8s_network_services_radius_cert_manager_duration: 2160h
+k8s_network_services_radius_cert_manager_renew_before: 720h
+k8s_network_services_radius_apparmor_type: RuntimeDefault
+k8s_network_services_radius_seccomp_type: RuntimeDefault
+k8s_network_services_radius_allow_privilege_escalation: true
+k8s_network_services_radius_read_only_root_filesystem: false
+k8s_network_services_radius_capabilities_drop: []
+k8s_network_services_radius_capabilities_add: []
+k8s_network_services_radius_helper_apparmor_type: RuntimeDefault
+k8s_network_services_radius_helper_seccomp_type: RuntimeDefault
+k8s_network_services_radius_helper_allow_privilege_escalation: false
+k8s_network_services_radius_helper_read_only_root_filesystem: true
+k8s_network_services_radius_helper_capabilities_drop:
+  - ALL
+k8s_network_services_radius_helper_capabilities_add: []
+k8s_network_services_radius_node_selector:
+  freakydonkey.net/frontend: "true"
+
+k8s_network_services_cert_manager_enabled: false
+k8s_network_services_cert_manager_install: false
+k8s_network_services_cert_manager_version: v1.17.1
+k8s_network_services_cert_manager_manifest_url: >-
+  https://github.com/cert-manager/cert-manager/releases/download/{{ k8s_network_services_cert_manager_version }}/cert-manager.yaml
+k8s_network_services_cert_manager_acme_email: ""
+k8s_network_services_cert_manager_cloudflare_api_token: ""
+k8s_network_services_cert_manager_clusterissuer_name: letsencrypt-cloudflare-dns
+
+k8s_network_services_ca_enabled: false
+k8s_network_services_ca_image: docker.io/smallstep/step-ca:0.27.4
+k8s_network_services_ca_host_network: false
+k8s_network_services_ca_node_name: ""
+k8s_network_services_ca_service_port: 9000
+k8s_network_services_ca_dns_name: ""
+k8s_network_services_ca_config_json: ""
+k8s_network_services_ca_defaults_json: "{}\n"
+k8s_network_services_ca_password: ""
+k8s_network_services_ca_root_crt_pem: ""
+k8s_network_services_ca_intermediate_crt_pem: ""
+k8s_network_services_ca_intermediate_key_pem: ""
+k8s_network_services_ca_apparmor_type: RuntimeDefault
+k8s_network_services_ca_seccomp_type: RuntimeDefault
+k8s_network_services_ca_allow_privilege_escalation: true
+k8s_network_services_ca_read_only_root_filesystem: false
+k8s_network_services_ca_capabilities_drop: []
+k8s_network_services_ca_capabilities_add: []
+
+k8s_network_services_ldap_enabled: false
+k8s_network_services_ldap_image: docker.io/osixia/openldap:1.5.0
+k8s_network_services_ldap_host_network: false
+k8s_network_services_ldap_node_name: ""
+k8s_network_services_ldap_bind_port: 389
+k8s_network_services_ldap_service_port: 389
+k8s_network_services_ldap_tls_enabled: false
+k8s_network_services_ldap_tls_enforce: false
+k8s_network_services_ldap_tls_verify_client: never
+k8s_network_services_ldap_apparmor_type: RuntimeDefault
+k8s_network_services_ldap_seccomp_type: RuntimeDefault
+k8s_network_services_ldap_allow_privilege_escalation: true
+k8s_network_services_ldap_read_only_root_filesystem: false
+k8s_network_services_ldap_capabilities_drop: []
+k8s_network_services_ldap_capabilities_add: []
+k8s_network_services_ldap_admin_password: ""
+k8s_network_services_ldap_seed_users_dn: ou=Users,ou=FreakyDonkey,dc=freakydonkey,dc=net
+k8s_network_services_ldap_seed_groups_dn: ou=Groups,ou=FreakyDonkey,dc=freakydonkey,dc=net
+k8s_network_services_ldap_seed_users: []
+k8s_network_services_ldap_seed_groups: []

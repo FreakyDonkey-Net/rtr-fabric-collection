@@ -1,0 +1,286 @@
+---
+- name: Validate requested BGP agent action
+  ansible.builtin.assert:
+    that:
+      - bgp_agent_action in bgp_agent_supported_actions
+    fail_msg: >-
+      Unsupported bgp_agent_action='{{ bgp_agent_action }}'.
+      Supported actions: {{ bgp_agent_supported_actions | join(', ') }}
+
+- name: Detect FRR vtysh binary
+  ansible.builtin.command:
+    argv:
+      - which
+      - vtysh
+  register: bgp_agent_vtysh
+  changed_when: false
+  failed_when: false
+
+- name: Detect BIRD control binary
+  ansible.builtin.command:
+    argv:
+      - which
+      - birdc
+  register: bgp_agent_birdc
+  changed_when: false
+  failed_when: false
+
+- name: Detect kubectl binary
+  ansible.builtin.command:
+    argv:
+      - which
+      - "{{ bgp_agent_kubectl_bin }}"
+  register: bgp_agent_kubectl
+  changed_when: false
+  failed_when: false
+
+- name: Build available BGP control plane facts
+  ansible.builtin.set_fact:
+    bgp_agent_has_vtysh: "{{ bgp_agent_vtysh.rc == 0 }}"
+    bgp_agent_has_birdc: "{{ bgp_agent_birdc.rc == 0 }}"
+    bgp_agent_has_kubectl: "{{ bgp_agent_kubectl.rc == 0 }}"
+  changed_when: false
+
+- name: Discover FRR EVPN pod for current node through kubectl
+  ansible.builtin.command:
+    cmd: >-
+      {{ bgp_agent_kubectl_bin }} -n {{ bgp_agent_kubectl_namespace }}
+      get pods
+      -l app.kubernetes.io/name=frr-evpn,app.kubernetes.io/instance={{ inventory_hostname }}
+      -o jsonpath={.items[0].metadata.name}
+  register: bgp_agent_frr_pod
+  changed_when: false
+  failed_when: false
+  when:
+    - not bgp_agent_has_vtysh
+    - bgp_agent_has_kubectl
+
+- name: Assert host exposes a supported BGP control plane for status actions
+  ansible.builtin.assert:
+    that:
+      - bgp_agent_has_vtysh or bgp_agent_has_birdc or (bgp_agent_frr_pod.stdout | default('') | length > 0) or bgp_agent_action == 'test_bgp_connectivity'
+    fail_msg: >-
+      No supported BGP control plane detected on {{ inventory_hostname }}.
+      Expected either vtysh (FRR), birdc (BIRD), or an EVPN FRR pod reachable through kubectl.
+  when: bgp_agent_action != "test_bgp_connectivity"
+
+- name: Collect FRR BGP summary
+  ansible.builtin.command:
+    cmd: vtysh -c "show bgp summary"
+  register: bgp_agent_bgp_summary
+  changed_when: false
+  when: bgp_agent_has_vtysh
+
+- name: Collect FRR BGP summary through kubectl
+  ansible.builtin.command:
+    argv:
+      - "{{ bgp_agent_kubectl_bin }}"
+      - -n
+      - "{{ bgp_agent_kubectl_namespace }}"
+      - exec
+      - "{{ bgp_agent_frr_pod.stdout }}"
+      - -c
+      - frr
+      - --
+      - vtysh
+      - -c
+      - show bgp summary
+  register: bgp_agent_bgp_summary_kubectl
+  changed_when: false
+  when:
+    - not bgp_agent_has_vtysh
+    - (bgp_agent_frr_pod.stdout | default('') | length) > 0
+
+- name: Collect FRR EVPN summary
+  ansible.builtin.command:
+    cmd: vtysh -c "show bgp l2vpn evpn summary"
+  register: bgp_agent_evpn_summary
+  changed_when: false
+  failed_when: false
+  when: bgp_agent_has_vtysh
+
+- name: Collect FRR EVPN summary through kubectl
+  ansible.builtin.command:
+    argv:
+      - "{{ bgp_agent_kubectl_bin }}"
+      - -n
+      - "{{ bgp_agent_kubectl_namespace }}"
+      - exec
+      - "{{ bgp_agent_frr_pod.stdout }}"
+      - -c
+      - frr
+      - --
+      - vtysh
+      - -c
+      - show bgp l2vpn evpn summary
+  register: bgp_agent_evpn_summary_kubectl
+  changed_when: false
+  failed_when: false
+  when:
+    - not bgp_agent_has_vtysh
+    - (bgp_agent_frr_pod.stdout | default('') | length) > 0
+
+- name: Collect BIRD protocol summary
+  ansible.builtin.command:
+    cmd: birdc show protocols
+  register: bgp_agent_bird_summary
+  changed_when: false
+  when: bgp_agent_has_birdc
+
+- name: Collect FRR route debug snapshot
+  ansible.builtin.command:
+    cmd: vtysh -c "show bgp ipv4 unicast summary"
+  register: bgp_agent_route_debug_frr
+  changed_when: false
+  when:
+    - bgp_agent_action == "debug_bgp"
+    - bgp_agent_has_vtysh
+
+- name: Collect BIRD route debug snapshot
+  ansible.builtin.command:
+    cmd: birdc show route all
+  register: bgp_agent_route_debug_bird
+  changed_when: false
+  when:
+    - bgp_agent_action == "debug_bgp"
+    - bgp_agent_has_birdc
+
+- name: Determine BGP peer status text
+  ansible.builtin.set_fact:
+    bgp_agent_peer_status_text: >-
+      {{
+        (bgp_agent_bgp_summary.stdout | default(''))
+        if bgp_agent_has_vtysh
+        else (
+          (bgp_agent_bgp_summary_kubectl.stdout | default(''))
+          if (bgp_agent_frr_pod.stdout | default('') | length > 0)
+          else (bgp_agent_bird_summary.stdout | default(''))
+        )
+      }}
+    bgp_agent_evpn_status_text: >-
+      {{
+        (bgp_agent_evpn_summary.stdout | default(''))
+        if bgp_agent_has_vtysh
+        else (bgp_agent_bird_summary.stdout | default(''))
+      }}
+  changed_when: false
+
+- name: Normalize EVPN status text from kubectl fallback
+  ansible.builtin.set_fact:
+    bgp_agent_evpn_status_text: "{{ bgp_agent_evpn_summary_kubectl.stdout | default(bgp_agent_evpn_status_text) }}"
+  changed_when: false
+  when:
+    - not bgp_agent_has_vtysh
+    - (bgp_agent_frr_pod.stdout | default('') | length) > 0
+
+- name: Collect FRR route debug snapshot through kubectl
+  ansible.builtin.command:
+    argv:
+      - "{{ bgp_agent_kubectl_bin }}"
+      - -n
+      - "{{ bgp_agent_kubectl_namespace }}"
+      - exec
+      - "{{ bgp_agent_frr_pod.stdout }}"
+      - -c
+      - frr
+      - --
+      - vtysh
+      - -c
+      - show bgp ipv4 unicast summary
+  register: bgp_agent_route_debug_frr_kubectl
+  changed_when: false
+  when:
+    - bgp_agent_action == "debug_bgp"
+    - not bgp_agent_has_vtysh
+    - (bgp_agent_frr_pod.stdout | default('') | length) > 0
+
+- name: Derive BGP health booleans
+  ansible.builtin.set_fact:
+    bgp_agent_bgp_status_ok: >-
+      {{
+        (
+          'No BGP neighbors found' not in bgp_agent_peer_status_text
+          and 'Idle' not in bgp_agent_peer_status_text
+          and 'Active' not in bgp_agent_peer_status_text
+          and 'Connect' not in bgp_agent_peer_status_text
+        )
+        if bgp_agent_has_vtysh else
+        ('Established' in bgp_agent_peer_status_text or 'up' in bgp_agent_peer_status_text)
+      }}
+    bgp_agent_evpn_status_ok: >-
+      {{
+        bgp_agent_has_vtysh
+        and 'No BGP neighbors found' not in bgp_agent_evpn_status_text
+        and (bgp_agent_evpn_status_text | length) > 0
+      }}
+    bgp_agent_route_debug_text: >-
+      {{
+        (bgp_agent_route_debug_frr.stdout | default(''))
+        if bgp_agent_has_vtysh else
+        (
+          (bgp_agent_route_debug_frr_kubectl.stdout | default(''))
+          if (bgp_agent_frr_pod.stdout | default('') | length > 0)
+          else (bgp_agent_route_debug_bird.stdout | default(''))
+        )
+      }}
+  changed_when: false
+
+- name: Assert BGP peers are established
+  ansible.builtin.assert:
+    that:
+      - bgp_agent_bgp_status_ok
+    fail_msg: >-
+      BGP peer verification failed on {{ inventory_hostname }}.
+      Output:
+      {{ bgp_agent_peer_status_text }}
+  when: bgp_agent_action == "verify_bgp_peers"
+
+- name: Assert EVPN session state is present
+  ansible.builtin.assert:
+    that:
+      - bgp_agent_evpn_status_ok
+    fail_msg: >-
+      EVPN summary on {{ inventory_hostname }} does not show an expected state.
+      Output:
+      {{ bgp_agent_evpn_status_text }}
+  when: bgp_agent_action == "verify_evpn"
+
+- name: Test BGP connectivity targets
+  ansible.builtin.command:
+    cmd: "ping -c {{ bgp_agent_default_ping_count }} -W 2 {{ item }}"
+  register: bgp_agent_ping_results
+  changed_when: false
+  loop: "{{ bgp_agent_test_targets | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: bgp_agent_action == "test_bgp_connectivity"
+
+- name: Require connectivity targets when requested
+  ansible.builtin.assert:
+    that:
+      - (bgp_agent_test_targets | default([]) | length) > 0
+    fail_msg: "bgp_agent_test_targets must be provided for test_bgp_connectivity."
+  when: bgp_agent_action == "test_bgp_connectivity"
+
+- name: Show BGP status
+  ansible.builtin.debug:
+    msg: "{{ bgp_agent_peer_status_text }}"
+  when: bgp_agent_action == "show_bgp_status"
+
+- name: Show EVPN status
+  ansible.builtin.debug:
+    msg: "{{ bgp_agent_evpn_status_text }}"
+  when: bgp_agent_action == "verify_evpn"
+
+- name: Show BGP debug bundle
+  ansible.builtin.debug:
+    msg:
+      peer_summary: "{{ bgp_agent_peer_status_text }}"
+      evpn_summary: "{{ bgp_agent_evpn_status_text }}"
+      route_debug: "{{ bgp_agent_route_debug_text }}"
+  when: bgp_agent_action == "debug_bgp"
+
+- name: Show BGP connectivity results
+  ansible.builtin.debug:
+    msg: "{{ bgp_agent_ping_results.results | map(attribute='stdout') | list }}"
+  when: bgp_agent_action == "test_bgp_connectivity"

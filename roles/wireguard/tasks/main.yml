@@ -1,0 +1,235 @@
+---
+- name: Skip wireguard role when disabled
+  ansible.builtin.meta: end_host
+  when: not (wireguard_enabled | default(true) | bool)
+
+- name: Validate wireguard role inputs
+  ansible.builtin.assert:
+    that:
+      - wireguard_interface | string | trim | length > 0
+      - wireguard_interface is match('^[A-Za-z0-9_.-]+$')
+      - wireguard_group | string | trim | length > 0
+      - wireguard_package_name | string | trim | length > 0
+      - wireguard_config_dir | string | trim | length > 0
+      - wireguard_config_dir.startswith('/')
+      - (wireguard_listen_port | int) > 0
+      - (wireguard_listen_port | int) < 65536
+      - >-
+        (wireguard_disable_host_interface | default(true) | bool)
+        or (
+          (wireguard_address | default('') | string | trim | length) > 0
+          and ('/' in (wireguard_address | string))
+        )
+    fail_msg: >-
+      Invalid WireGuard configuration. Check interface name, listen port, and
+      wireguard_address when host interface mode is enabled.
+
+- name: Validate WireGuard peer inventory inputs
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (hostvars[item].wireguard_enabled | default(true) | bool)
+        or ((hostvars[item].wireguard_address | default('') | string | trim | length) > 0)
+      - >-
+        not (hostvars[item].wireguard_enabled | default(true) | bool)
+        or (
+          (hostvars[item].wireguard_endpoint_host
+          | default(hostvars[item].node_public_ip | default(hostvars[item].ansible_host | default('')))
+          | string | trim | length) > 0
+        )
+      - >-
+        not (hostvars[item].wireguard_enabled | default(true) | bool)
+        or ((hostvars[item].wireguard_listen_port | default(wireguard_listen_port) | int) > 0)
+      - >-
+        not (hostvars[item].wireguard_enabled | default(true) | bool)
+        or ((hostvars[item].wireguard_listen_port | default(wireguard_listen_port) | int) < 65536)
+    fail_msg: >-
+      Invalid WireGuard peer inputs for {{ item }}. Check wireguard_address,
+      endpoint host and listen port.
+  loop: "{{ groups[wireguard_group] | default([]) }}"
+  when: item != inventory_hostname
+
+- name: Ensure wireguard-tools is installed
+  ansible.builtin.apt:
+    name: "{{ wireguard_package_name }}"
+    state: present
+    update_cache: true
+  when: ansible_os_family == 'Debian'
+
+- name: Ensure wg binary is available
+  ansible.builtin.command: wg --version
+  register: wireguard_wg_binary
+  changed_when: false
+  failed_when: wireguard_wg_binary.rc != 0
+
+- name: Ensure ip binary is available when host interface mode is enabled
+  ansible.builtin.command: ip -V
+  register: wireguard_ip_binary
+  changed_when: false
+  failed_when: wireguard_ip_binary.rc != 0
+  when: not (wireguard_disable_host_interface | default(true) | bool)
+
+- name: Ensure wireguard config directory exists
+  ansible.builtin.file:
+    path: "{{ wireguard_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Ensure WireGuard private key exists
+  ansible.builtin.shell: |
+    umask 077
+    if [ ! -s "{{ wireguard_private_key_path }}" ]; then
+      wg genkey > "{{ wireguard_private_key_path }}"
+      echo CHANGED
+    fi
+  args:
+    executable: /bin/bash
+  register: wireguard_private_key_result
+  changed_when: "'CHANGED' in (wireguard_private_key_result.stdout | default(''))"
+
+- name: Ensure WireGuard public key exists
+  ansible.builtin.shell: |
+    umask 077
+    if [ ! -s "{{ wireguard_public_key_path }}" ]; then
+      wg pubkey < "{{ wireguard_private_key_path }}" > "{{ wireguard_public_key_path }}"
+      echo CHANGED
+    fi
+  args:
+    executable: /bin/bash
+  register: wireguard_public_key_result
+  changed_when: "'CHANGED' in (wireguard_public_key_result.stdout | default(''))"
+
+- name: Read WireGuard key material
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop:
+    - "{{ wireguard_private_key_path }}"
+    - "{{ wireguard_public_key_path }}"
+  register: wireguard_key_slurps
+  no_log: true
+
+- name: Expose WireGuard key facts
+  ansible.builtin.set_fact:
+    wireguard_private_key_effective: "{{ (wireguard_key_slurps.results[0].content | b64decode | trim) }}"
+    wireguard_public_key: "{{ (wireguard_key_slurps.results[1].content | b64decode | trim) }}"
+  no_log: true
+
+- name: Build WireGuard peer model
+  ansible.builtin.set_fact:
+    wireguard_effective_peers: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for peer in (groups[wireguard_group] | default([])) -%}
+      {%-   if peer != inventory_hostname
+            and (hostvars[peer].wireguard_enabled | default(true) | bool)
+            and (hostvars[peer].wireguard_address | default('') | string | length) > 0
+            and (hostvars[peer].wireguard_public_key | default('') | string | length) > 0 -%}
+      {%-     set base_allowed = [
+                (hostvars[peer].wireguard_address | regex_replace('/.*$', '') ~ '/32')
+              ] -%}
+      {%-     set extra_allowed = (hostvars[peer].wireguard_peer_allowed_ips_extra | default([])) -%}
+      {%-     set _ = ns.items.append({
+                'name': peer,
+                'public_key': hostvars[peer].wireguard_public_key,
+                'endpoint': (
+                  hostvars[peer].wireguard_endpoint_host
+                  | default(hostvars[peer].node_public_ip | default(hostvars[peer].ansible_host))
+                ),
+                'listen_port': (
+                  hostvars[peer].wireguard_listen_port
+                  | default(wireguard_listen_port)
+                ),
+                'persistent_keepalive': (
+                  hostvars[peer].wireguard_persistent_keepalive
+                  | default(wireguard_persistent_keepalive)
+                ),
+                'allowed_ips': (base_allowed + extra_allowed) | unique
+              }) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {%-   if wireguard_include_external_peers | default(true) | bool -%}
+      {%-     for peer in (bgp_evpn_external_peers | default([])) -%}
+      {%-       if peer.node == inventory_hostname
+                and (peer.peer_public_key | default('') | string | trim | length) > 0
+                and (peer.peer_allowed_ips | default([]) | length) > 0 -%}
+      {%-         set _ = ns.items.append({
+                    'name': peer.name,
+                    'public_key': (peer.peer_public_key | string | trim),
+                    'endpoint': (peer.endpoint_host | default('') | string | trim),
+                    'listen_port': (peer.endpoint_port | default(wireguard_listen_port)),
+                    'persistent_keepalive': (peer.persistent_keepalive | default(wireguard_persistent_keepalive)),
+                    'allowed_ips': (peer.peer_allowed_ips | default([]) | unique | list)
+                  }) -%}
+      {%-       endif -%}
+      {%-     endfor -%}
+      {%-   endif -%}
+      {{ ns.items }}
+  no_log: true
+
+- name: Render WireGuard host interface config
+  ansible.builtin.template:
+    src: wg0.conf.j2
+    dest: "{{ wireguard_config_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  register: wireguard_config_result
+  no_log: true
+  when: not (wireguard_disable_host_interface | default(true) | bool)
+
+- name: Check whether WireGuard host interface already exists
+  ansible.builtin.command: "ip link show {{ wireguard_interface }}"
+  register: wireguard_host_iface_state
+  changed_when: false
+  failed_when: false
+  when: not (wireguard_disable_host_interface | default(true) | bool)
+
+- name: Ensure WireGuard service is enabled for reboot persistence
+  ansible.builtin.service:
+    name: "wg-quick@{{ wireguard_interface }}"
+    enabled: true
+  when: not (wireguard_disable_host_interface | default(true) | bool)
+
+- name: Sync existing WireGuard host interface in place
+  ansible.builtin.shell: |
+    set -euo pipefail
+    tmp="$(mktemp)"
+    wg-quick strip "{{ wireguard_config_path }}" > "$tmp"
+    wg syncconf "{{ wireguard_interface }}" "$tmp"
+    rm -f "$tmp"
+    ip address replace "{{ wireguard_address }}" dev "{{ wireguard_interface }}"
+    ip link set "{{ wireguard_interface }}" up
+  args:
+    executable: /bin/bash
+  when:
+    - not (wireguard_disable_host_interface | default(true) | bool)
+    - wireguard_host_iface_state.rc == 0
+  register: wireguard_sync_result
+  changed_when: wireguard_config_result is changed
+  no_log: true
+
+- name: Start WireGuard service when interface is absent
+  ansible.builtin.service:
+    name: "wg-quick@{{ wireguard_interface }}"
+    state: started
+    enabled: true
+  when:
+    - not (wireguard_disable_host_interface | default(true) | bool)
+    - wireguard_host_iface_state.rc != 0
+
+- name: Stop and disable host WireGuard interface when legacy host interface is disabled
+  ansible.builtin.service:
+    name: "wg-quick@{{ wireguard_interface }}"
+    state: stopped
+    enabled: false
+  failed_when: false
+  when:
+    - wireguard_disable_host_interface | default(true) | bool
+    - wireguard_remove_host_interface_when_disabled | default(false) | bool
+
+- name: Read live WireGuard status when host interface is enabled
+  ansible.builtin.command: "wg show {{ wireguard_interface }}"
+  register: wireguard_show
+  changed_when: false
+  when: not (wireguard_disable_host_interface | default(true) | bool)

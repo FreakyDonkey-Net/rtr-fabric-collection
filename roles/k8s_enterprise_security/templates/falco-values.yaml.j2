@@ -1,0 +1,88 @@
+driver:
+  enabled: true
+  kind: {{ k8s_enterprise_security_falco_driver_kind }}
+  loader:
+    enabled: {{ (not (k8s_enterprise_security_falco_custom_driver_loader_enabled | bool)) | lower }}
+
+collectors:
+  enabled: true
+  kubernetes:
+    enabled: false
+
+falco:
+  json_output: {{ k8s_enterprise_security_falco_json_output | bool | lower }}
+  json_include_output_property: true
+  log_level: {{ k8s_enterprise_security_falco_log_level }}
+  priority: {{ k8s_enterprise_security_falco_priority }}
+
+falcoctl:
+  artifact:
+    install:
+      enabled: true
+    follow:
+      enabled: true
+
+{% if k8s_enterprise_security_falco_custom_driver_loader_enabled | bool %}
+mounts:
+  volumes:
+    - name: usr-src-fs
+      hostPath:
+        path: /usr/src
+  volumeMounts: []
+{% endif %}
+
+resources:
+{{ k8s_enterprise_security_falco_resources | to_nice_yaml(indent=2) | indent(2, true) }}
+
+nodeSelector:
+{{ k8s_enterprise_security_falco_node_selector | to_nice_yaml(indent=2) | indent(2, true) }}
+
+affinity:
+{{ k8s_enterprise_security_falco_affinity | to_nice_yaml(indent=2) | indent(2, true) }}
+
+tolerations:
+{{ k8s_enterprise_security_falco_tolerations | to_nice_yaml(indent=2) | indent(2, true) }}
+
+extra:
+  env: []
+  args: []
+{% if k8s_enterprise_security_falco_custom_driver_loader_enabled | bool %}
+  initContainers:
+    - name: falco-driver-loader-custom
+      image: {{ k8s_enterprise_security_falco_custom_driver_loader_image }}
+      imagePullPolicy: IfNotPresent
+      args:
+        - {{ k8s_enterprise_security_falco_driver_kind }}
+      securityContext:
+        privileged: true
+      env:
+        - name: HOST_ROOT
+          value: /host
+        - name: FALCOCTL_DRIVER_CONFIG_UPDATE_FALCO
+          value: "false"
+      volumeMounts:
+        - mountPath: /root/.falco
+          name: root-falco-fs
+        - mountPath: /host/proc
+          name: proc-fs
+          readOnly: true
+        - mountPath: /host/boot
+          name: boot-fs
+          readOnly: true
+        - mountPath: /host/lib/modules
+          name: lib-modules
+        - mountPath: /lib/modules
+          name: lib-modules
+        - mountPath: /host/usr
+          name: usr-fs
+          readOnly: true
+        - mountPath: /usr/src
+          name: usr-src-fs
+        - mountPath: /host/etc
+          name: etc-fs
+          readOnly: true
+        - mountPath: /sys/kernel/debug
+          name: debugfs
+{% else %}
+  initContainers: []
+{% endif %}

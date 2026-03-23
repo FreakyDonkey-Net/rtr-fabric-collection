@@ -1,0 +1,18 @@
+---
+kube_ovn_underlay_enabled: true
+kube_ovn_underlay_autodetect: true
+kube_ovn_underlay_force_apply: false
+kube_ovn_underlay_dry_run: false
+kube_ovn_underlay_kubectl_bin: kubectl
+kube_ovn_underlay_provider_network_name: underlay-net
+kube_ovn_underlay_vlan_name_prefix: fabric-vlan
+kube_ovn_underlay_subnet_provider_mode: ovn
+kube_ovn_underlay_subnet_disable_gateway_check: true
+kube_ovn_underlay_cleanup_legacy: true
+kube_ovn_underlay_trunk_interface_map: {}
+kube_ovn_underlay_trunk_interface_default_bondy: ""
+kube_ovn_underlay_trunk_interface_default_noisy: ""
+kube_ovn_underlay_access_ports: []
+kube_ovn_underlay_internal_ports: []
+kube_ovn_underlay_artifact_dir: >-
+  {{ playbook_dir | default('.') }}/.ansible-generated/kube-ovn-underlay

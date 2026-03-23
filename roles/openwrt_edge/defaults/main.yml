@@ -1,0 +1,105 @@
+---
+openwrt_edge_enabled: true
+openwrt_edge_dry_run: false
+openwrt_edge_routing_backend: bird
+
+openwrt_edge_package_install_enabled: true
+openwrt_edge_packages_bird:
+  - wireguard-tools
+  - bird3
+openwrt_edge_packages_frr:
+  - wireguard-tools
+  - frr
+  - frr-bgpd
+  - frr-ospfd
+  - frr-watchfrr
+  - frr-zebra
+openwrt_edge_packages: >-
+  {{
+    openwrt_edge_packages_frr
+    if (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+    else openwrt_edge_packages_bird
+  }}
+
+openwrt_edge_cleanup_network_sections: []
+
+openwrt_edge_loopback_section_name: lo_bgp
+openwrt_edge_loopback_device: lo
+openwrt_edge_loopback_netmask: 255.255.255.255
+
+openwrt_edge_wg_iface_prefix: wg_rr_
+openwrt_edge_wg_mtu: 1360
+openwrt_edge_wg_allowed_ips_default:
+  - 0.0.0.0/0
+openwrt_edge_wg_route_allowed_ips: false
+
+openwrt_edge_advertise_site_vlans: true
+openwrt_edge_extra_advertised_prefixes: []
+openwrt_edge_advertised_routes: []
+
+openwrt_edge_bgp_use_loopbacks: true
+openwrt_edge_bgp_multihop: 2
+openwrt_edge_bgp_keepalive_time: 10
+openwrt_edge_bgp_hold_time: 30
+openwrt_edge_bgp_rr_asn: "{{ bgp_evpn_asn | default(65000) }}"
+openwrt_edge_bgp_neighbor_password_enabled: true
+
+# Optional OSPF underlay for edge uplinks.
+# Keep disabled unless a migration plan explicitly enables it.
+openwrt_edge_ospf_enabled: false
+openwrt_edge_ospf_router_id: "{{ edge_router_id }}"
+openwrt_edge_ospf_area: "0.0.0.0"
+# WireGuard carries unicast only; prefer explicit unicast OSPF neighbors.
+openwrt_edge_ospf_network_type: non-broadcast
+openwrt_edge_ospf_hello_interval: 10
+openwrt_edge_ospf_dead_interval: 40
+openwrt_edge_ospf_mtu_ignore: true
+openwrt_edge_ospf_advertise_loopback: true
+openwrt_edge_ospf_extra_networks: []
+openwrt_edge_ospf_firewall_rule_enabled: true
+openwrt_edge_ospf_firewall_rule_section_name: rtr_fabric_allow_ospf_from_edge
+openwrt_edge_ospf_firewall_rule_name: rtr-fabric allow ospf from edge
+openwrt_edge_ospf_firewall_rule_src_zone: rtr_fabric_edge
+openwrt_edge_ospf_firewall_rule_family: ipv4
+
+openwrt_edge_bird_conf_path: /etc/bird.conf
+openwrt_edge_bird_service_name: bird
+openwrt_edge_frr_conf_path: /etc/frr/frr.conf
+openwrt_edge_frr_daemons_path: /etc/frr/daemons
+openwrt_edge_frr_service_name: frr
+
+openwrt_edge_external_peer_name_prefix: "{{ inventory_hostname }}"
+
+openwrt_edge_egress_policies_enabled: false
+openwrt_edge_egress_policies: []
+openwrt_edge_egress_wan_interface_name: wan
+openwrt_edge_egress_wan_gateway: ""
+openwrt_edge_egress_policy_apply_mode: uci
+openwrt_edge_egress_gateway_transport_interface: ""
+openwrt_edge_egress_gateway_recursive_via: ""
+openwrt_edge_egress_primary_transport_interface: ""
+openwrt_edge_egress_primary_recursive_via: ""
+openwrt_edge_egress_secondary_transport_interface: ""
+openwrt_edge_egress_secondary_recursive_via: ""
+openwrt_edge_egress_use_onlink_defaults: false
+openwrt_edge_egress_probe_gateways: false
+openwrt_edge_egress_probe_count: 1
+openwrt_edge_egress_probe_timeout_seconds: 1
+openwrt_edge_egress_local_bypass_prefixes: []
+openwrt_edge_egress_bypass_destination_prefixes:
+  - 10.77.0.0/16
+  - 10.42.0.0/16
+  - 10.43.0.0/16
+openwrt_edge_egress_snat_enabled: false
+openwrt_edge_egress_snat_destination_prefixes:
+  - 10.77.0.0/16
+  - 10.88.0.0/16
+openwrt_edge_egress_snat_table_name: rtr_fabric_egress
+openwrt_edge_egress_snat_chain_name: postrouting
+openwrt_edge_egress_apply_script_path: /usr/local/sbin/rtr-fabric-egress-policy.sh
+openwrt_edge_egress_init_service_path: /etc/init.d/rtr-fabric-egress-policy
+openwrt_edge_egress_init_service_name: rtr-fabric-egress-policy
+openwrt_edge_egress_cron_enabled: false
+openwrt_edge_egress_cron_schedule: "*/1 * * * *"
+openwrt_edge_egress_cron_line: >-
+  {{ openwrt_edge_egress_cron_schedule }} {{ openwrt_edge_egress_apply_script_path }} >/dev/null 2>&1

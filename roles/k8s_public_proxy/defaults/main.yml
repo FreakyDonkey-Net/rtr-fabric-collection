@@ -1,0 +1,27 @@
+k8s_public_proxy_namespace: ingress-public
+k8s_public_proxy_serviceaccount_name: ingress-nginx
+k8s_public_proxy_configmap_name: ingress-nginx-controller
+k8s_public_proxy_deployment_name: ingress-nginx-controller
+k8s_public_proxy_ingress_class_name: public
+k8s_public_proxy_controller_class_name: k8s.io/ingress-nginx
+k8s_public_proxy_image: registry.k8s.io/ingress-nginx/controller:v1.11.3
+k8s_public_proxy_replicas: 2
+k8s_public_proxy_max_surge: 0
+k8s_public_proxy_max_unavailable: 1
+k8s_public_proxy_default_server_port: 18080
+k8s_public_proxy_http_port: 80
+k8s_public_proxy_https_port: 443
+k8s_public_proxy_namespace_pod_security_enforce: privileged
+k8s_public_proxy_namespace_pod_security_warn: restricted
+k8s_public_proxy_namespace_pod_security_audit: restricted
+k8s_public_proxy_apparmor_type: RuntimeDefault
+k8s_public_proxy_seccomp_type: RuntimeDefault
+k8s_public_proxy_allow_privilege_escalation: false
+k8s_public_proxy_run_as_non_root: true
+k8s_public_proxy_run_as_user: 101
+k8s_public_proxy_run_as_group: 82
+k8s_public_proxy_read_only_root_filesystem: false
+k8s_public_proxy_capabilities_drop:
+  - ALL
+k8s_public_proxy_capabilities_add:
+  - NET_BIND_SERVICE

@@ -1,0 +1,53 @@
+---
+openwrt_security_enabled: true
+
+openwrt_security_operator_pubkey: ""
+openwrt_security_operator_pubkey_file: files/admin_authorized_keys/admin.pub
+openwrt_security_dropbear_authorized_keys_path: /etc/dropbear/authorized_keys
+
+openwrt_security_dropbear_enabled: true
+openwrt_security_dropbear_section: "@dropbear[0]"
+openwrt_security_dropbear_password_auth: "off"
+openwrt_security_dropbear_root_password_auth: "off"
+openwrt_security_dropbear_gateway_ports: "off"
+
+openwrt_security_uhttpd_enabled: true
+openwrt_security_uhttpd_section: main
+openwrt_security_uhttpd_dry_run: true
+openwrt_security_uhttpd_force_apply: false
+openwrt_security_uhttpd_redirect_https: true
+openwrt_security_uhttpd_disable_http: false
+openwrt_security_uhttpd_listen_http: []
+openwrt_security_uhttpd_listen_https: []
+
+openwrt_security_sysctl_enabled: false
+openwrt_security_sysctl_ignore_errors: true
+openwrt_security_sysctl_dry_run: true
+openwrt_security_sysctl_force_apply: false
+openwrt_security_sysctl_reload: false
+openwrt_security_sysctl: {}
+openwrt_security_sysctl_set: {}
+
+openwrt_security_firewall_enabled: true
+openwrt_security_firewall_dry_run: true
+openwrt_security_firewall_force_apply: false
+openwrt_security_firewall_wan_zone: wan
+openwrt_security_firewall_rule_family: ""
+openwrt_security_firewall_manage_wan_zone_policy: true
+openwrt_security_firewall_wan_zone_input_policy: REJECT
+openwrt_security_firewall_wan_zone_output_policy: ACCEPT
+openwrt_security_firewall_wan_zone_forward_policy: REJECT
+openwrt_security_firewall_wan_allow_tcp_ports: []
+openwrt_security_firewall_wan_allow_udp_ports:
+  - "{{ wireguard_listen_port | default(62000) }}"
+openwrt_security_firewall_wan_allow_tcp_ports_extra: []
+openwrt_security_firewall_wan_allow_udp_ports_extra: []
+openwrt_security_firewall_management_rules_enabled: true
+openwrt_security_firewall_management_source_zones:
+  - lan
+  - wg
+openwrt_security_firewall_management_allow_tcp_ports:
+  - 22
+  - 80
+  - 443
+openwrt_security_firewall_management_allow_tcp_ports_extra: []

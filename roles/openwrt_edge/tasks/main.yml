@@ -1,0 +1,1066 @@
+---
+- name: Assert OpenWrt edge routing context is available
+  ansible.builtin.assert:
+    that:
+      - (openwrt_edge_routing_backend | default('bird') | lower) in ['bird', 'frr']
+      - (edge_asn | default(0) | int) > 0
+      - (edge_router_id | default('') | string | trim | length) > 0
+      - (openwrt_edge_uplinks | default([]) | length) > 0
+    fail_msg: >-
+      openwrt_edge requires a supported routing backend, edge_asn, edge_router_id,
+      and at least one uplink in openwrt_edge_uplinks.
+
+- name: Build OpenWrt edge routes derived from SSOT and extra prefixes
+  ansible.builtin.set_fact:
+    openwrt_edge_advertised_routes_derived: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- if openwrt_edge_advertise_site_vlans | default(true) | bool -%}
+      {%-   for vlan in (fabric_site_vlans[fabric_site] | default([])) -%}
+      {%-     if (vlan.cidr | default('') | string | trim | length) > 0 -%}
+      {%-       set _ = ns.items.append({'prefix': (vlan.cidr | string)}) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%- endif -%}
+      {%- for prefix in (openwrt_edge_extra_advertised_prefixes | default([])) -%}
+      {%-   if (prefix | string | trim | length) > 0 -%}
+      {%-     set _ = ns.items.append({'prefix': (prefix | string)}) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+
+- name: Build effective OpenWrt edge route export plan
+  ansible.builtin.set_fact:
+    openwrt_edge_advertised_routes_effective: >-
+      {%- set raw = (
+            openwrt_edge_advertised_routes
+            if (openwrt_edge_advertised_routes | default([]) | length) > 0
+            else (openwrt_edge_advertised_routes_derived | default([]))
+          ) -%}
+      {%- set ns = namespace(items=[]) -%}
+      {%- for route in raw -%}
+      {%-   if (route.prefix | default('') | string | trim | length) > 0 -%}
+      {%-     set export_flag = route.export | default(true) | bool -%}
+      {%-     set _ = ns.items.append(
+              route | combine({
+                'prefix': (route.prefix | string | trim),
+                'export': export_flag,
+                'peer_allowed': (route.peer_allowed | default(export_flag) | bool)
+              }, recursive=True)
+            ) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+
+- name: Build effective OpenWrt edge uplink plan
+  ansible.builtin.set_fact:
+    openwrt_edge_uplinks_effective: >-
+      {%- set prefix = (openwrt_edge_wg_iface_prefix | default('wg_rr_')) -%}
+      {%- set ns = namespace(items=[]) -%}
+      {%- for uplink in (openwrt_edge_uplinks | default([])) -%}
+      {%-   set rr = hostvars[uplink.rr_node] | default({}) -%}
+      {%-   set uplink_id = (
+              uplink.uplink_id
+              | default(uplink.name)
+              | default(uplink.rr_node | default('rr'))
+              | lower
+              | regex_replace('^rtr-', '')
+              | regex_replace('[^a-z0-9]+', '')
+            ) -%}
+      {%-   set ifname = (
+              uplink.interface_name
+              | default((prefix ~ uplink_id)[:15], true)
+              | string
+              | trim
+            ) -%}
+      {%-   set local_tunnel_ip = (uplink.local_tunnel_ip | string | regex_replace('/.*$', '')) -%}
+      {%-   set remote_tunnel_ip = (uplink.remote_tunnel_ip | string | regex_replace('/.*$', '')) -%}
+      {%-   set local_bgp_ip = (
+              uplink.local_bgp_ip
+              | default(
+                  (edge_router_id if (openwrt_edge_bgp_use_loopbacks | default(true) | bool) else local_tunnel_ip),
+                  true
+                )
+              | string
+              | trim
+            ) -%}
+      {%-   set remote_bgp_ip = (
+              uplink.remote_bgp_ip
+              | default(
+                  (
+                    rr.bgp_evpn_loopback_ip
+                    if (openwrt_edge_bgp_use_loopbacks | default(true) | bool)
+                    else remote_tunnel_ip
+                  ),
+                  true
+                )
+              | string
+              | trim
+            ) -%}
+      {%-   set allowed_ips = uplink.allowed_ips | default(openwrt_edge_wg_allowed_ips_default) -%}
+      {%-   set remote_public_key = (
+              uplink.remote_public_key
+              | default(rr.wireguard_public_key | default(''), true)
+              | string
+              | trim
+            ) -%}
+      {%-   set _ = ns.items.append(
+              uplink | combine({
+                'interface_name': ifname,
+                'interface_section': ifname,
+                'peer_section': ifname ~ '_peer',
+                'route_section': ifname ~ '_route',
+                'bgp_route_section': ifname ~ '_bgp_route',
+                'description': ('fabric-' ~ (uplink.name | default(uplink_id))),
+                'endpoint_host': (
+                  uplink.endpoint_host
+                  | default(rr.node_public_ip | default(''), true)
+                  | string
+                  | trim
+                ),
+                'endpoint_port': (uplink.endpoint_port | default(wireguard_listen_port | default(62000))),
+                'persistent_keepalive': (uplink.persistent_keepalive | default(15)),
+                'remote_public_key': remote_public_key,
+                'allowed_ips': allowed_ips,
+                'local_tunnel_ip': local_tunnel_ip,
+                'local_tunnel_cidr': local_tunnel_ip ~ '/32',
+                'remote_tunnel_ip': remote_tunnel_ip,
+                'local_bgp_ip': local_bgp_ip,
+                'remote_bgp_ip': remote_bgp_ip,
+                'remote_asn': (uplink.remote_asn | default(openwrt_edge_bgp_rr_asn)),
+                'needs_bgp_host_route': (remote_bgp_ip != remote_tunnel_ip)
+              }, recursive=True)
+            ) -%}
+      {%- endfor -%}
+      {{ ns.items }}
+
+- name: Build OpenWrt edge peer-allowed prefix list
+  ansible.builtin.set_fact:
+    openwrt_edge_peer_allowed_prefixes: >-
+      {{
+        openwrt_edge_advertised_routes_effective
+        | default([])
+        | selectattr('peer_allowed', 'equalto', true)
+        | map(attribute='prefix')
+        | list
+      }}
+
+- name: Build effective OpenWrt edge egress policy plan
+  ansible.builtin.set_fact:
+    openwrt_edge_egress_policies_effective: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for policy in (openwrt_edge_egress_policies | default([])) -%}
+      {%-   set policy_id = (
+              policy.name
+              | default('policy-' ~ loop.index)
+              | string
+              | lower
+              | regex_replace('[^a-z0-9]+', '_')
+              | regex_replace('^_+|_+$', '')
+            ) -%}
+      {%-   set priority = (policy.priority | default((100 + (loop.index0 * 10))) | int) -%}
+      {%-   set table_id = (policy.table_id | default(1000 + priority) | int) -%}
+      {%-   set _ = ns.items.append(
+              policy | combine({
+                'policy_id': policy_id,
+                'priority': priority,
+                'table_id': table_id,
+                'apply_mode': (
+                  policy.apply_mode
+                  | default(openwrt_edge_egress_policy_apply_mode | default('uci'), true)
+                  | string
+                  | trim
+                  | lower
+                ),
+                'incoming_interface': (policy.incoming_interface | default('', true) | string | trim),
+                'source_subnets': (policy.source_subnets | default([])),
+                'snat_enabled': (
+                  policy.snat_enabled
+                  | default(openwrt_edge_egress_snat_enabled | default(false), true)
+                  | bool
+                ),
+                'snat_destination_prefixes': (
+                  policy.snat_destination_prefixes
+                  | default(openwrt_edge_egress_snat_destination_prefixes | default([]), true)
+                ),
+                'primary_transport_interface': (
+                  policy.primary_transport_interface
+                  | default(
+                      openwrt_edge_egress_primary_transport_interface
+                      | default(openwrt_edge_egress_gateway_transport_interface | default('', true), true),
+                      true
+                    )
+                  | string
+                  | trim
+                ),
+                'primary_recursive_via': (
+                  policy.primary_recursive_via
+                  | default(
+                      openwrt_edge_egress_primary_recursive_via
+                      | default(openwrt_edge_egress_gateway_recursive_via | default('', true), true),
+                      true
+                    )
+                  | string
+                  | trim
+                ),
+                'secondary_transport_interface': (
+                  policy.secondary_transport_interface
+                  | default(
+                      openwrt_edge_egress_secondary_transport_interface
+                      | default(
+                          openwrt_edge_egress_primary_transport_interface
+                          | default(openwrt_edge_egress_gateway_transport_interface | default('', true), true),
+                          true
+                        ),
+                      true
+                    )
+                  | string
+                  | trim
+                ),
+                'secondary_recursive_via': (
+                  policy.secondary_recursive_via
+                  | default(
+                      openwrt_edge_egress_secondary_recursive_via
+                      | default(
+                          openwrt_edge_egress_primary_recursive_via
+                          | default(openwrt_edge_egress_gateway_recursive_via | default('', true), true),
+                          true
+                        ),
+                      true
+                    )
+                  | string
+                  | trim
+                ),
+                'use_onlink_defaults': (
+                  policy.use_onlink_defaults
+                  | default(openwrt_edge_egress_use_onlink_defaults | default(false), true)
+                  | bool
+                ),
+                'probe_gateways': (
+                  policy.probe_gateways
+                  | default(openwrt_edge_egress_probe_gateways | default(false), true)
+                  | bool
+                ),
+                'fallback_to_local_wan': (policy.fallback_to_local_wan | default(true) | bool)
+              }, recursive=True)
+            ) -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  changed_when: false
+  when: openwrt_edge_egress_policies_enabled | default(false) | bool
+
+- name: Build effective OpenWrt edge egress bypass prefix list
+  ansible.builtin.set_fact:
+    openwrt_edge_egress_bypass_prefixes_effective: >-
+      {{
+        (
+          (openwrt_edge_egress_local_bypass_prefixes | default([]))
+          + (openwrt_edge_egress_bypass_destination_prefixes | default([]))
+        )
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+  changed_when: false
+  when: openwrt_edge_egress_policies_enabled | default(false) | bool
+
+- name: Assert OpenWrt edge uplinks are complete
+  ansible.builtin.assert:
+    that:
+      - (item.interface_name | string | trim | length) > 0
+      - (item.interface_name | string | trim | length) <= 15
+      - (item.local_tunnel_ip | string | trim | length) > 0
+      - (item.remote_tunnel_ip | string | trim | length) > 0
+      - (item.endpoint_host | string | trim | length) > 0
+      - (item.endpoint_port | int) > 0
+      - (item.remote_public_key | string | trim | length) > 0
+      - (item.remote_bgp_ip | string | trim | length) > 0
+    fail_msg: >-
+      Invalid uplink definition for {{ item.name | default(item.interface_name) }}.
+      Check openwrt_edge_uplinks and RR hostvars.
+  loop: "{{ openwrt_edge_uplinks_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.interface_name }}"
+
+- name: Show OpenWrt edge dry-run plan
+  ansible.builtin.debug:
+    msg:
+      uplinks: "{{ openwrt_edge_uplinks_effective | default([]) }}"
+      advertised_routes: "{{ openwrt_edge_advertised_routes_effective | default([]) }}"
+      peer_allowed_prefixes: "{{ openwrt_edge_peer_allowed_prefixes | default([]) }}"
+  when: openwrt_edge_dry_run | default(false) | bool
+
+- name: Apply OpenWrt edge WireGuard and BIRD runtime
+  when: not (openwrt_edge_dry_run | default(false) | bool)
+  block:
+    - name: Probe missing OpenWrt edge packages
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          missing=""
+          for package in {{ (openwrt_edge_packages | default([])) | join(' ') }}; do
+            opkg status "${package}" 2>/dev/null | grep -q '^Status: .* installed$' || missing="${missing} ${package}"
+          done
+          printf '%s\n' "${missing}" | xargs
+      register: openwrt_edge_packages_missing_probe
+      changed_when: false
+      failed_when: false
+      when: openwrt_edge_package_install_enabled | default(true) | bool
+
+    - name: Build missing OpenWrt edge package list
+      ansible.builtin.set_fact:
+        openwrt_edge_packages_missing: >-
+          {{
+            (
+              openwrt_edge_packages_missing_probe.stdout
+              | default('')
+              | trim
+            ).split()
+          }}
+      when: openwrt_edge_package_install_enabled | default(true) | bool
+
+    - name: Install missing OpenWrt edge packages
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          opkg update
+          opkg install {{ (openwrt_edge_packages_missing | default([])) | join(' ') }}
+      when:
+        - openwrt_edge_package_install_enabled | default(true) | bool
+        - (openwrt_edge_packages_missing | default([]) | length) > 0
+
+    - name: Remove legacy OpenWrt edge network sections
+      ansible.builtin.raw: |
+        changed=0
+        for section in {{ (openwrt_edge_cleanup_network_sections | default([]) | unique) | join(' ') }}; do
+          if uci -q show "network.${section}" >/dev/null 2>&1; then
+            uci -q delete "network.${section}"
+            changed=1
+          fi
+        done
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_edge_cleanup_result
+      changed_when: "'CHANGED' in (openwrt_edge_cleanup_result.stdout | default(''))"
+
+    - name: Ensure OpenWrt edge BGP loopback interface exists
+      ansible.builtin.raw: |
+        changed=0
+        section='{{ openwrt_edge_loopback_section_name }}'
+        [ "$(uci -q show "network.${section}" 2>/dev/null | sed -n '1s/^network\.[^.]*=//p')" = "interface" ] || {
+          uci set "network.${section}=interface"
+          changed=1
+        }
+
+        ensure_opt() {
+          key="$1"
+          val="$2"
+          current="$(uci -q get "network.${section}.${key}" 2>/dev/null || true)"
+          [ "${current}" = "${val}" ] || {
+            uci set "network.${section}.${key}=${val}"
+            changed=1
+          }
+        }
+
+        ensure_opt device '{{ openwrt_edge_loopback_device }}'
+        ensure_opt proto 'static'
+        ensure_opt ipaddr '{{ edge_router_id }}'
+        ensure_opt netmask '{{ openwrt_edge_loopback_netmask }}'
+
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_edge_loopback_result
+      changed_when: "'CHANGED' in (openwrt_edge_loopback_result.stdout | default(''))"
+
+    - name: Ensure OpenWrt edge uplink interface, peer, and routes exist
+      ansible.builtin.raw: |
+        changed=0
+        iface='{{ item.interface_section }}'
+        peer='{{ item.peer_section }}'
+        route_main='{{ item.route_section }}'
+        route_bgp='{{ item.bgp_route_section }}'
+
+        section_type() {
+          uci -q show "network.$1" 2>/dev/null | sed -n '1s/^network\.[^.]*=//p'
+        }
+
+        ensure_section() {
+          name="$1"
+          typ="$2"
+          [ "$(section_type "$name")" = "$typ" ] || {
+            uci set "network.${name}=${typ}"
+            changed=1
+          }
+        }
+
+        ensure_opt() {
+          section="$1"
+          key="$2"
+          val="$3"
+          current="$(uci -q get "network.${section}.${key}" 2>/dev/null || true)"
+          [ "${current}" = "${val}" ] || {
+            uci set "network.${section}.${key}=${val}"
+            changed=1
+          }
+        }
+
+        ensure_list() {
+          section="$1"
+          key="$2"
+          desired="$3"
+          current="$(
+            uci -q show "network.${section}.${key}" 2>/dev/null \
+            | sed -n "s/^network\.[^.]*\.${key}='//p" \
+            | sed "s/'$//" \
+            | tr '\n' ' ' \
+            | sed 's/ $//'
+          )"
+          if [ "${current}" != "${desired}" ]; then
+            uci -q delete "network.${section}.${key}" || true
+            for value in ${desired}; do
+              uci add_list "network.${section}.${key}=${value}"
+            done
+            changed=1
+          fi
+        }
+
+        ensure_section "${iface}" interface
+        private_key="$(uci -q get "network.${iface}.private_key" 2>/dev/null || true)"
+        if [ -z "${private_key}" ]; then
+          private_key="$(wg genkey)"
+          uci set "network.${iface}.private_key=${private_key}"
+          changed=1
+        fi
+        ensure_opt "${iface}" proto 'wireguard'
+        ensure_opt "${iface}" mtu '{{ openwrt_edge_wg_mtu }}'
+        ensure_opt "${iface}" addresses '{{ item.local_tunnel_cidr }}'
+
+        ensure_section "${peer}" "wireguard_{{ item.interface_name }}"
+        ensure_opt "${peer}" description '{{ item.description }}'
+        ensure_opt "${peer}" public_key '{{ item.remote_public_key }}'
+        ensure_opt "${peer}" endpoint_host '{{ item.endpoint_host }}'
+        ensure_opt "${peer}" endpoint_port '{{ item.endpoint_port }}'
+        ensure_opt "${peer}" persistent_keepalive '{{ item.persistent_keepalive }}'
+        ensure_opt "${peer}" route_allowed_ips '{{ "1" if (openwrt_edge_wg_route_allowed_ips | default(false) | bool) else "0" }}'
+        ensure_list "${peer}" allowed_ips '{{ item.allowed_ips | join(" ") }}'
+
+        ensure_section "${route_main}" route
+        ensure_opt "${route_main}" interface '{{ item.interface_name }}'
+        ensure_opt "${route_main}" target '{{ item.remote_tunnel_ip }}'
+        ensure_opt "${route_main}" netmask '255.255.255.255'
+
+        if {{ 'true' if item.needs_bgp_host_route else 'false' }}; then
+          ensure_section "${route_bgp}" route
+          ensure_opt "${route_bgp}" interface '{{ item.interface_name }}'
+          ensure_opt "${route_bgp}" target '{{ item.remote_bgp_ip }}'
+          ensure_opt "${route_bgp}" netmask '255.255.255.255'
+        else
+          if uci -q show "network.${route_bgp}" >/dev/null 2>&1; then
+            uci -q delete "network.${route_bgp}"
+            changed=1
+          fi
+        fi
+
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      loop: "{{ openwrt_edge_uplinks_effective | default([]) }}"
+      loop_control:
+        label: "{{ item.interface_name }}"
+      register: openwrt_edge_uplink_converge_result
+      changed_when: "'CHANGED' in (stdout | default(''))"
+      no_log: true
+
+    - name: Check pending OpenWrt edge network changes
+      ansible.builtin.raw: "uci changes network || true"
+      register: openwrt_edge_network_changes
+      changed_when: false
+
+    - name: Discover local WAN gateway for OpenWrt edge egress policies
+      community.openwrt.command:
+        cmd: >-
+          ip -4 route show default dev {{ openwrt_edge_egress_wan_interface_name | default('wan') }} 2>/dev/null
+          | awk 'NR==1 {for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}'
+        uses_shell: true
+      register: openwrt_edge_egress_wan_gateway_probe
+      changed_when: false
+      when: openwrt_edge_egress_policies_enabled | default(false) | bool
+
+    - name: Fallback-discover local WAN gateway from ifstatus payload
+      community.openwrt.command:
+        cmd: >-
+          ifstatus {{ openwrt_edge_egress_wan_interface_name | default('wan') }} 2>/dev/null
+          | sed -n 's/.*"nexthop":[[:space:]]*"\([0-9.]\+\)".*/\1/p'
+          | head -n1
+        uses_shell: true
+      register: openwrt_edge_egress_wan_gateway_probe_route
+      changed_when: false
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_wan_gateway_probe.stdout
+            | default('')
+            | regex_findall('(?:[0-9]{1,3}\\.){3}[0-9]{1,3}')
+            | length
+          ) == 0
+
+    - name: Derive effective local WAN gateway for OpenWrt edge egress policies
+      ansible.builtin.set_fact:
+        openwrt_edge_egress_wan_gateway_effective: >-
+          {%- set configured_gateway = (
+                openwrt_edge_egress_wan_gateway
+                | default('', true)
+                | string
+                | trim
+              ) -%}
+          {%- set discovered_gateway_raw = (
+                (
+                  openwrt_edge_egress_wan_gateway_probe.stdout
+                  | default('')
+                  | string
+                  | trim
+                )
+                if (
+                  openwrt_edge_egress_wan_gateway_probe.stdout
+                  | default('')
+                  | regex_findall('(?:[0-9]{1,3}\\.){3}[0-9]{1,3}')
+                  | length
+                ) > 0
+                else (
+                  openwrt_edge_egress_wan_gateway_probe_route.stdout
+                  | default('')
+                  | string
+                  | trim
+                )
+              ) -%}
+          {{
+            (
+              configured_gateway
+              if (configured_gateway | length) > 0
+              else discovered_gateway_raw
+            )
+            | regex_findall('(?:[0-9]{1,3}\\.){3}[0-9]{1,3}')
+            | last
+            | default('')
+          }}
+      changed_when: false
+      when: openwrt_edge_egress_policies_enabled | default(false) | bool
+
+    - name: Ensure OpenWrt edge local and fabric bypass ip rules exist in UCI
+      ansible.builtin.raw: |
+        changed=0
+
+        section_type() {
+          uci -q show "network.$1" 2>/dev/null | sed -n '1s/^network\.[^.]*=//p'
+        }
+
+        ensure_section() {
+          name="$1"
+          typ="$2"
+          [ "$(section_type "$name")" = "$typ" ] || {
+            uci set "network.${name}=${typ}"
+            changed=1
+          }
+        }
+
+        ensure_opt() {
+          section="$1"
+          key="$2"
+          val="$3"
+          current="$(uci -q get "network.${section}.${key}" 2>/dev/null || true)"
+          [ "${current}" = "${val}" ] || {
+            uci set "network.${section}.${key}=${val}"
+            changed=1
+          }
+        }
+
+        {% for prefix in openwrt_edge_egress_bypass_prefixes_effective | default([]) %}
+        ensure_section "pbr_bypass_rule_{{ loop.index0 }}" rule
+        ensure_opt "pbr_bypass_rule_{{ loop.index0 }}" dest '{{ prefix }}'
+        ensure_opt "pbr_bypass_rule_{{ loop.index0 }}" lookup 'main'
+        ensure_opt "pbr_bypass_rule_{{ loop.index0 }}" priority '{{ 40 + loop.index0 }}'
+        {% endfor %}
+
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_edge_egress_bypass_rule_converge_result
+      changed_when: "'CHANGED' in (openwrt_edge_egress_bypass_rule_converge_result.stdout | default(''))"
+      when: openwrt_edge_egress_policies_enabled | default(false) | bool
+
+    - name: Ensure OpenWrt edge egress policy routes and rules exist
+      ansible.builtin.raw: |
+        changed=0
+
+        section_type() {
+          uci -q show "network.$1" 2>/dev/null | sed -n '1s/^network\.[^.]*=//p'
+        }
+
+        ensure_section() {
+          name="$1"
+          typ="$2"
+          [ "$(section_type "$name")" = "$typ" ] || {
+            uci set "network.${name}=${typ}"
+            changed=1
+          }
+        }
+
+        ensure_opt() {
+          section="$1"
+          key="$2"
+          val="$3"
+          current="$(uci -q get "network.${section}.${key}" 2>/dev/null || true)"
+          [ "${current}" = "${val}" ] || {
+            uci set "network.${section}.${key}=${val}"
+            changed=1
+          }
+        }
+
+        delete_section() {
+          name="$1"
+          if uci -q get "network.${name}" >/dev/null 2>&1; then
+            uci -q delete "network.${name}"
+            changed=1
+          fi
+        }
+
+        primary_route="pbr_{{ item.policy_id }}_primary"
+        secondary_route="pbr_{{ item.policy_id }}_secondary"
+        fallback_route="pbr_{{ item.policy_id }}_fallback"
+
+        if [ '{{ item.apply_mode }}' = 'script' ]; then
+          delete_section "${primary_route}"
+          delete_section "${secondary_route}"
+          delete_section "${fallback_route}"
+        else
+          ensure_section "${primary_route}" route
+          ensure_opt "${primary_route}" target '0.0.0.0'
+          ensure_opt "${primary_route}" netmask '0.0.0.0'
+          ensure_opt "${primary_route}" gateway '{{ item.primary_gateway_loopback }}'
+          ensure_opt "${primary_route}" metric '10'
+          ensure_opt "${primary_route}" table '{{ item.table_id }}'
+
+          ensure_section "${secondary_route}" route
+          ensure_opt "${secondary_route}" target '0.0.0.0'
+          ensure_opt "${secondary_route}" netmask '0.0.0.0'
+          ensure_opt "${secondary_route}" gateway '{{ item.secondary_gateway_loopback }}'
+          ensure_opt "${secondary_route}" metric '20'
+          ensure_opt "${secondary_route}" table '{{ item.table_id }}'
+
+          {% if item.fallback_to_local_wan | bool %}
+          if [ -n '{{ openwrt_edge_egress_wan_gateway_effective | default("") }}' ]; then
+            ensure_section "${fallback_route}" route
+            ensure_opt "${fallback_route}" interface '{{ openwrt_edge_egress_wan_interface_name | default("wan") }}'
+            ensure_opt "${fallback_route}" target '0.0.0.0'
+            ensure_opt "${fallback_route}" netmask '0.0.0.0'
+            ensure_opt "${fallback_route}" gateway '{{ openwrt_edge_egress_wan_gateway_effective | default("") }}'
+            ensure_opt "${fallback_route}" metric '100'
+            ensure_opt "${fallback_route}" table '{{ item.table_id }}'
+          fi
+          {% else %}
+          delete_section "${fallback_route}"
+          {% endif %}
+        fi
+
+        {% for subnet in item.source_subnets | default([]) %}
+        ensure_section "pbr_{{ item.policy_id }}_rule_{{ loop.index0 }}" rule
+        {% if item.incoming_interface | default('') | string | trim | length > 0 %}
+        ensure_opt "pbr_{{ item.policy_id }}_rule_{{ loop.index0 }}" in '{{ item.incoming_interface }}'
+        {% endif %}
+        ensure_opt "pbr_{{ item.policy_id }}_rule_{{ loop.index0 }}" src '{{ subnet }}'
+        ensure_opt "pbr_{{ item.policy_id }}_rule_{{ loop.index0 }}" lookup '{{ item.table_id }}'
+        ensure_opt "pbr_{{ item.policy_id }}_rule_{{ loop.index0 }}" priority '{{ item.priority + loop.index0 }}'
+        {% endfor %}
+
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      loop: "{{ openwrt_edge_egress_policies_effective | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default(item.policy_id) }}"
+      register: openwrt_edge_egress_policy_converge_result
+      changed_when: "'CHANGED' in (stdout | default(''))"
+      when: openwrt_edge_egress_policies_enabled | default(false) | bool
+
+    - name: Render OpenWrt edge egress policy apply script
+      ansible.builtin.set_fact:
+        openwrt_edge_egress_apply_script_rendered: "{{ lookup('ansible.builtin.template', 'rtr-fabric-egress-policy.sh.j2') }}"
+        openwrt_edge_egress_init_service_rendered: "{{ lookup('ansible.builtin.template', 'rtr-fabric-egress-policy.init.j2') }}"
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Ensure OpenWrt root crontab exists for egress policy helper
+      ansible.builtin.raw: "touch /etc/crontabs/root"
+      changed_when: false
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - openwrt_edge_egress_cron_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Re-check pending OpenWrt edge network changes
+      ansible.builtin.raw: "uci changes network || true"
+      register: openwrt_edge_network_changes_final
+      changed_when: false
+
+    - name: Commit OpenWrt edge network changes
+      ansible.builtin.raw: "uci commit network"
+      changed_when: true
+      when: (openwrt_edge_network_changes_final.stdout | default('') | trim | length) > 0
+
+    - name: Reload OpenWrt network when edge interfaces changed
+      ansible.builtin.raw: "/etc/init.d/network reload"
+      changed_when: true
+      when: (openwrt_edge_network_changes_final.stdout | default('') | trim | length) > 0
+
+    - name: Ensure OpenWrt edge firewall allows OSPF from edge zone
+      ansible.builtin.raw: |
+        changed=0
+        section='{{ openwrt_edge_ospf_firewall_rule_section_name }}'
+
+        section_type() {
+          uci -q show "firewall.$1" 2>/dev/null | sed -n '1s/^firewall\.[^.]*=//p'
+        }
+
+        ensure_section() {
+          name="$1"
+          typ="$2"
+          [ "$(section_type "$name")" = "$typ" ] || {
+            uci set "firewall.${name}=${typ}"
+            changed=1
+          }
+        }
+
+        ensure_opt() {
+          section="$1"
+          key="$2"
+          val="$3"
+          current="$(uci -q get "firewall.${section}.${key}" 2>/dev/null || true)"
+          [ "${current}" = "${val}" ] || {
+            uci set "firewall.${section}.${key}=${val}"
+            changed=1
+          }
+        }
+
+        ensure_section "${section}" rule
+        ensure_opt "${section}" name '{{ openwrt_edge_ospf_firewall_rule_name }}'
+        ensure_opt "${section}" src '{{ openwrt_edge_ospf_firewall_rule_src_zone }}'
+        ensure_opt "${section}" proto 'ospf'
+        ensure_opt "${section}" family '{{ openwrt_edge_ospf_firewall_rule_family }}'
+        ensure_opt "${section}" target 'ACCEPT'
+        ensure_opt "${section}" enabled '1'
+
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_edge_ospf_firewall_rule_result
+      changed_when: "'CHANGED' in (openwrt_edge_ospf_firewall_rule_result.stdout | default(''))"
+      when:
+        - (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+        - openwrt_edge_ospf_enabled | default(false) | bool
+        - openwrt_edge_ospf_firewall_rule_enabled | default(true) | bool
+
+    - name: Remove OpenWrt edge OSPF firewall rule when disabled
+      ansible.builtin.raw: |
+        if uci -q show "firewall.{{ openwrt_edge_ospf_firewall_rule_section_name }}" >/dev/null 2>&1; then
+          uci -q delete "firewall.{{ openwrt_edge_ospf_firewall_rule_section_name }}"
+          echo CHANGED
+        fi
+      register: openwrt_edge_ospf_firewall_rule_remove_result
+      changed_when: "'CHANGED' in (openwrt_edge_ospf_firewall_rule_remove_result.stdout | default(''))"
+      when: >-
+        (openwrt_edge_routing_backend | default('bird') | lower) != 'frr'
+        or not (openwrt_edge_ospf_enabled | default(false) | bool)
+        or not (openwrt_edge_ospf_firewall_rule_enabled | default(true) | bool)
+
+    - name: Check pending OpenWrt edge firewall changes
+      ansible.builtin.raw: "uci changes firewall || true"
+      register: openwrt_edge_firewall_changes
+      changed_when: false
+
+    - name: Commit OpenWrt edge firewall changes
+      ansible.builtin.raw: "uci commit firewall"
+      changed_when: true
+      when: (openwrt_edge_firewall_changes.stdout | default('') | trim | length) > 0
+
+    - name: Reload OpenWrt firewall when edge firewall changed
+      ansible.builtin.raw: "/etc/init.d/firewall reload"
+      changed_when: true
+      when: (openwrt_edge_firewall_changes.stdout | default('') | trim | length) > 0
+
+    - name: Ensure OpenWrt local sbin directory exists for egress apply helper
+      ansible.builtin.raw: "mkdir -p $(dirname '{{ openwrt_edge_egress_apply_script_path }}')"
+      changed_when: false
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Write OpenWrt edge egress apply script when it changes
+      ansible.builtin.raw: |
+        tmp="$(mktemp)"
+        cat >"${tmp}" <<'EOF'
+        {{ openwrt_edge_egress_apply_script_rendered }}
+        EOF
+        chmod 0755 "${tmp}"
+        if [ ! -f "{{ openwrt_edge_egress_apply_script_path }}" ] || ! cmp -s "${tmp}" "{{ openwrt_edge_egress_apply_script_path }}"; then
+          mv "${tmp}" "{{ openwrt_edge_egress_apply_script_path }}"
+          echo CHANGED
+        else
+          rm -f "${tmp}"
+        fi
+      register: openwrt_edge_egress_apply_script_write
+      changed_when: "'CHANGED' in (openwrt_edge_egress_apply_script_write.stdout | default(''))"
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Write OpenWrt edge egress init service when it changes
+      ansible.builtin.raw: |
+        tmp="$(mktemp)"
+        cat >"${tmp}" <<'EOF'
+        {{ openwrt_edge_egress_init_service_rendered }}
+        EOF
+        chmod 0755 "${tmp}"
+        if [ ! -f "{{ openwrt_edge_egress_init_service_path }}" ] || ! cmp -s "${tmp}" "{{ openwrt_edge_egress_init_service_path }}"; then
+          mv "${tmp}" "{{ openwrt_edge_egress_init_service_path }}"
+          echo CHANGED
+        else
+          rm -f "${tmp}"
+        fi
+      register: openwrt_edge_egress_init_service_write
+      changed_when: "'CHANGED' in (openwrt_edge_egress_init_service_write.stdout | default(''))"
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Enable OpenWrt edge egress init service
+      ansible.builtin.raw: "/etc/init.d/{{ openwrt_edge_egress_init_service_name }} enable"
+      changed_when: false
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Install OpenWrt edge egress cron entry
+      ansible.builtin.raw: |
+        if ! grep -Fqx "{{ openwrt_edge_egress_cron_line }}" /etc/crontabs/root; then
+          printf '%s\n' "{{ openwrt_edge_egress_cron_line }}" >> /etc/crontabs/root
+          echo CHANGED
+        fi
+      register: openwrt_edge_egress_cron_line_result
+      changed_when: "'CHANGED' in (openwrt_edge_egress_cron_line_result.stdout | default(''))"
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - openwrt_edge_egress_cron_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Restart OpenWrt cron service when egress cron changes
+      ansible.builtin.raw: "/etc/init.d/cron restart"
+      changed_when: false
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - openwrt_edge_egress_cron_enabled | default(false) | bool
+        - openwrt_edge_egress_cron_line_result is changed
+
+    - name: Apply OpenWrt edge selective egress routes via helper
+      ansible.builtin.raw: "{{ openwrt_edge_egress_apply_script_path }}"
+      register: openwrt_edge_egress_apply_script_run
+      changed_when: false
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Read effective OpenWrt edge WireGuard public keys
+      ansible.builtin.raw: "uci -q get network.{{ item.interface_name }}.private_key | wg pubkey"
+      loop: "{{ openwrt_edge_uplinks_effective | default([]) }}"
+      loop_control:
+        label: "{{ item.interface_name }}"
+      register: openwrt_edge_public_keys
+      changed_when: false
+      no_log: true
+
+    - name: Build runtime OpenWrt external peer facts
+      ansible.builtin.set_fact:
+        openwrt_edge_external_peers: >-
+          {%- set ns = namespace(items=[]) -%}
+          {%- for uplink in (openwrt_edge_uplinks_effective | default([])) -%}
+          {%-   set public_key = (
+                  openwrt_edge_public_keys.results[loop.index0].stdout
+                  | default('')
+                  | string
+                  | trim
+                ) -%}
+          {%-   if public_key | length > 0 -%}
+          {%-     set _ = ns.items.append({
+                    'name': (openwrt_edge_external_peer_name_prefix ~ '-' ~ uplink.name),
+                    'node': uplink.rr_node,
+                    'peer_ip': uplink.local_bgp_ip,
+                    'peer_asn': edge_asn,
+                    'peer_public_key': public_key,
+                    'peer_allowed_ips': openwrt_edge_peer_allowed_prefixes | default([]),
+                    'persistent_keepalive': uplink.persistent_keepalive | default(15),
+                    'activate_evpn': true
+                  }) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ ns.items }}
+
+    - name: Render OpenWrt edge BIRD configuration
+      ansible.builtin.set_fact:
+        openwrt_edge_bird_conf_rendered: "{{ lookup('ansible.builtin.template', 'bird.conf.j2') }}"
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'bird'
+
+    - name: Write OpenWrt edge BIRD configuration when it changes
+      ansible.builtin.raw: |
+        tmp="$(mktemp)"
+        cat >"${tmp}" <<'EOF'
+        {{ openwrt_edge_bird_conf_rendered }}
+        EOF
+        if [ ! -f "{{ openwrt_edge_bird_conf_path }}" ] || ! cmp -s "${tmp}" "{{ openwrt_edge_bird_conf_path }}"; then
+          mv "${tmp}" "{{ openwrt_edge_bird_conf_path }}"
+          echo CHANGED
+        else
+          rm -f "${tmp}"
+        fi
+      register: openwrt_edge_bird_conf_write
+      changed_when: "'CHANGED' in (openwrt_edge_bird_conf_write.stdout | default(''))"
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'bird'
+
+    - name: Ensure OpenWrt BIRD service is enabled and started
+      ansible.builtin.raw: "/etc/init.d/{{ openwrt_edge_bird_service_name }} enable && /etc/init.d/{{ openwrt_edge_bird_service_name }} start"
+      changed_when: false
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'bird'
+
+    - name: Reload OpenWrt BIRD when configuration changed # noqa: no-handler
+      ansible.builtin.raw: "/etc/init.d/{{ openwrt_edge_bird_service_name }} restart"
+      changed_when: true
+      when: openwrt_edge_bird_conf_write.changed | bool
+
+    - name: Ensure OpenWrt FRR service is disabled and stopped when BIRD is selected
+      ansible.builtin.raw: >-
+        /etc/init.d/{{ openwrt_edge_frr_service_name }} disable >/dev/null 2>&1 || true;
+        /etc/init.d/{{ openwrt_edge_frr_service_name }} stop >/dev/null 2>&1 || true
+      changed_when: false
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'bird'
+
+    - name: Ensure OpenWrt BIRD service is disabled and stopped when FRR is selected
+      ansible.builtin.raw: >-
+        /etc/init.d/{{ openwrt_edge_bird_service_name }} disable >/dev/null 2>&1 || true;
+        /etc/init.d/{{ openwrt_edge_bird_service_name }} stop >/dev/null 2>&1 || true
+      changed_when: false
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+
+    - name: Render OpenWrt edge FRR configuration
+      ansible.builtin.set_fact:
+        openwrt_edge_frr_conf_rendered: "{{ lookup('ansible.builtin.template', 'frr.conf.j2') }}"
+        openwrt_edge_frr_daemons_rendered: "{{ lookup('ansible.builtin.template', 'frr-daemons.j2') }}"
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+
+    - name: Ensure OpenWrt FRR config directory exists
+      ansible.builtin.raw: "mkdir -p /etc/frr"
+      changed_when: false
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+
+    - name: Write OpenWrt edge FRR daemon enablement when it changes
+      ansible.builtin.raw: |
+        tmp="$(mktemp)"
+        cat >"${tmp}" <<'EOF'
+        {{ openwrt_edge_frr_daemons_rendered }}
+        EOF
+        if [ ! -f "{{ openwrt_edge_frr_daemons_path }}" ] || ! cmp -s "${tmp}" "{{ openwrt_edge_frr_daemons_path }}"; then
+          mv "${tmp}" "{{ openwrt_edge_frr_daemons_path }}"
+          echo CHANGED
+        else
+          rm -f "${tmp}"
+        fi
+      register: openwrt_edge_frr_daemons_write
+      changed_when: "'CHANGED' in (openwrt_edge_frr_daemons_write.stdout | default(''))"
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+
+    - name: Write OpenWrt edge FRR configuration when it changes
+      ansible.builtin.raw: |
+        tmp="$(mktemp)"
+        cat >"${tmp}" <<'EOF'
+        {{ openwrt_edge_frr_conf_rendered }}
+        EOF
+        if [ ! -f "{{ openwrt_edge_frr_conf_path }}" ] || ! cmp -s "${tmp}" "{{ openwrt_edge_frr_conf_path }}"; then
+          mv "${tmp}" "{{ openwrt_edge_frr_conf_path }}"
+          echo CHANGED
+        else
+          rm -f "${tmp}"
+        fi
+      register: openwrt_edge_frr_conf_write
+      changed_when: "'CHANGED' in (openwrt_edge_frr_conf_write.stdout | default(''))"
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+
+    - name: Ensure OpenWrt FRR service is enabled and started
+      ansible.builtin.raw: "/etc/init.d/{{ openwrt_edge_frr_service_name }} enable && /etc/init.d/{{ openwrt_edge_frr_service_name }} start"
+      changed_when: false
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+
+    - name: Reload OpenWrt FRR when configuration changed
+      ansible.builtin.raw: "/etc/init.d/{{ openwrt_edge_frr_service_name }} restart"
+      changed_when: true
+      when:
+        - (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'
+        - >-
+          (openwrt_edge_frr_conf_write.changed | default(false))
+          or (openwrt_edge_frr_daemons_write.changed | default(false))
+
+    - name: Post-check OpenWrt edge WireGuard runtime
+      ansible.builtin.raw: "wg show {{ item.interface_name }}"
+      loop: "{{ openwrt_edge_uplinks_effective | default([]) }}"
+      loop_control:
+        label: "{{ item.interface_name }}"
+      changed_when: false
+
+    - name: Post-check OpenWrt BIRD status
+      ansible.builtin.raw: "birdc show status"
+      register: openwrt_edge_bird_status
+      changed_when: false
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'bird'
+
+    - name: Post-check OpenWrt FRR status
+      ansible.builtin.raw: "vtysh -c 'show bgp ipv4 unicast summary'"
+      register: openwrt_edge_frr_status
+      changed_when: false
+      when: (openwrt_edge_routing_backend | default('bird') | lower) == 'frr'

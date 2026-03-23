@@ -1,0 +1,4 @@
+- name: Restart public proxy
+  ansible.builtin.systemd_service:
+    name: "{{ public_proxy_service_name }}"
+    state: restarted

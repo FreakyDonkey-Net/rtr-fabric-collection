@@ -1,0 +1,37 @@
+---
+k3s_config_path: /etc/rancher/k3s/config.yaml
+k3s_server_service_name: k3s
+k3s_agent_service_name: k3s-agent
+k3s_cluster_cidr: 10.42.0.0/16
+k3s_service_cidr: 10.43.0.0/16
+k3s_flannel_backend: none
+k3s_disable_network_policy: true
+k3s_disable_apiserver_lb: false
+k3s_server_tls_sans_extra: []
+k3s_write_kubeconfig_mode: "0644"
+k3s_etcd_snapshot_schedule_cron: "0 */6 * * *"
+k3s_etcd_snapshot_retention: 56
+k3s_etcd_snapshot_dir: /var/lib/rancher/k3s/server/db/snapshots
+k3s_etcd_snapshot_compress: true
+k3s_secrets_encryption_enabled: false
+k3s_secrets_encryption_provider: aescbc
+k3s_install_bootstrap_enabled: false
+k3s_install_bootstrap_url: https://get.k3s.io
+k3s_manage_promoted_server_unit: true
+k3s_server_unit_path: /etc/systemd/system/k3s.service
+k3s_secrets_encryption_sync_files:
+  - /var/lib/rancher/k3s/server/cred/encryption-config.json
+  - /var/lib/rancher/k3s/server/cred/encryption-state.json
+k3s_server_kube_apiserver_args: []
+k3s_audit_policy_enabled: false
+k3s_audit_policy_path: /var/lib/rancher/k3s/server/audit-policy.yaml
+k3s_audit_log_dir: /var/lib/rancher/k3s/server/logs
+k3s_audit_log_path: "{{ k3s_audit_log_dir }}/audit.log"
+k3s_audit_log_format: json
+k3s_audit_log_max_age: 30
+k3s_audit_log_max_backups: 10
+k3s_audit_log_max_size: 100
+k3s_audit_policy_rules:
+  - level: Metadata
+    omitStages:
+      - RequestReceived

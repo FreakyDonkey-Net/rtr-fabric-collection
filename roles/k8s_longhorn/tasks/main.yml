@@ -1,0 +1,801 @@
+---
+- name: Validate Longhorn inputs
+  ansible.builtin.assert:
+    that:
+      - k8s_longhorn_namespace | string | trim | length > 0
+      - k8s_longhorn_release_name | string | trim | length > 0
+      - k8s_longhorn_chart_name | string | trim | length > 0
+      - k8s_longhorn_chart_repo | string | trim | length > 0
+      - k8s_longhorn_chart_version | string | trim | length > 0
+      - (k8s_longhorn_storage_hosts | default([]) | length) > 0
+      - >-
+        (
+          k8s_longhorn_storage_hosts
+          | select('in', groups.get('rtr_fabric', []))
+          | list
+          | length
+        ) == (k8s_longhorn_storage_hosts | length)
+    fail_msg: >-
+      Longhorn requires a namespace, chart source, pinned chart version, and at
+      least one declared storage host in rtr_fabric.
+
+- name: Ensure Kubernetes Python client package is installed
+  ansible.builtin.apt:
+    name: python3-kubernetes
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Check whether helm is available on the control-plane host
+  ansible.builtin.stat:
+    path: "{{ k8s_longhorn_helm_bin }}"
+  register: k8s_longhorn_remote_helm
+
+- name: Copy local helm binary to control-plane host when missing
+  ansible.builtin.copy:
+    src: "{{ k8s_longhorn_local_helm_binary }}"
+    dest: "{{ k8s_longhorn_helm_bin }}"
+    mode: "0755"
+  when:
+    - k8s_longhorn_copy_local_helm_binary | bool
+    - not k8s_longhorn_remote_helm.stat.exists
+
+- name: Validate helm is available on the control-plane host
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_longhorn_helm_bin }}"
+      - version
+      - --short
+  environment: "{{ k8s_longhorn_helm_environment }}"
+  changed_when: false
+
+- name: Ensure Longhorn namespace exists
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ k8s_longhorn_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ k8s_longhorn_namespace_pod_security_enforce }}"
+          pod-security.kubernetes.io/warn: "{{ k8s_longhorn_namespace_pod_security_warn }}"
+          pod-security.kubernetes.io/audit: "{{ k8s_longhorn_namespace_pod_security_audit }}"
+
+- name: Normalize Longhorn node disk annotation payloads
+  ansible.builtin.set_fact:
+    k8s_longhorn_node_disk_configs: >-
+      {{
+        (k8s_longhorn_node_disk_configs | default({}))
+        | combine(
+            {
+              item: normalized_disks
+            }
+          )
+      }}
+  loop: "{{ k8s_longhorn_storage_hosts }}"
+  loop_control:
+    label: "{{ item }}"
+  vars:
+    effective_disks_raw: >-
+      {{
+        (
+          hostvars[item].k8s_longhorn_storage_disks
+          if (
+            (hostvars[item].k8s_longhorn_storage_disks is defined)
+            and (hostvars[item].k8s_longhorn_storage_disks is sequence)
+            and not (hostvars[item].k8s_longhorn_storage_disks is string)
+          )
+          else (hostvars[item].rpi_longhorn_storage_disks | default([]))
+        )
+      }}
+    normalized_disks: >-
+      {%- set ns = namespace(disks=[]) -%}
+      {%- for disk in (effective_disks_raw | default([])) -%}
+      {%-   set disk_path = (
+              disk.path
+              | default(disk.mountpoint | default('', true), true)
+              | string
+              | trim
+            ) -%}
+      {%-   if disk_path | length > 0 -%}
+      {%-   set _ = ns.disks.append(
+              {
+                'path': disk_path,
+                'allowScheduling': (disk.allow_scheduling | default(true) | bool),
+                'storageReserved': (disk.storage_reserved | default(0) | int),
+                'tags': (disk.tags | default([]))
+              }
+            ) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.disks }}
+  changed_when: false
+
+- name: Compute Longhorn non-storage hosts
+  ansible.builtin.set_fact:
+    k8s_longhorn_non_storage_hosts: >-
+      {{
+        groups.get('rtr_fabric', [])
+        | difference(k8s_longhorn_storage_hosts | default([]))
+        | list
+      }}
+  changed_when: false
+
+- name: Detect existing Longhorn admission webhook service
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: v1
+    kind: Service
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: longhorn-admission-webhook
+  register: k8s_longhorn_admission_webhook_service
+  changed_when: false
+
+- name: Wait for Longhorn admission webhook endpoints when service exists
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: v1
+    kind: Endpoints
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: longhorn-admission-webhook
+  register: k8s_longhorn_admission_webhook_endpoints
+  changed_when: false
+  retries: 12
+  delay: 5
+  until:
+    - (k8s_longhorn_admission_webhook_endpoints.resources | default([]) | length) > 0
+    - (k8s_longhorn_admission_webhook_endpoints.resources[0].subsets | default([]) | length) > 0
+  when: (k8s_longhorn_admission_webhook_service.resources | default([]) | length) > 0
+
+- name: Keep Longhorn admission webhooks fail-open before node metadata reconciliation
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ k8s_longhorn_kubeconfig }}"
+      - patch
+      - "{{ item.kind }}"
+      - "{{ item.name }}"
+      - --type=json
+      - "-p={{ k8s_longhorn_webhook_fail_open_patch }}"
+  loop:
+    - kind: validatingwebhookconfiguration
+      name: longhorn-webhook-validator
+    - kind: mutatingwebhookconfiguration
+      name: longhorn-webhook-mutator
+  register: k8s_longhorn_webhook_fail_open_pre_result
+  changed_when: false
+  failed_when: >-
+    k8s_longhorn_webhook_fail_open_pre_result.rc != 0
+    and ('NotFound' not in (k8s_longhorn_webhook_fail_open_pre_result.stderr | default('')))
+  vars:
+    k8s_longhorn_webhook_fail_open_patch: >-
+      [{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"},{"op":"replace","path":"/webhooks/0/timeoutSeconds","value":2}]
+
+- name: Label Longhorn storage nodes
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: v1
+      kind: Node
+      metadata:
+        name: "{{ item }}"
+        labels: >-
+          {{
+            {
+              (k8s_longhorn_worker_node_label_key): (k8s_longhorn_worker_node_label_value | string),
+              'freakydonkey.net/longhorn-storage': 'true'
+            }
+          }}
+  loop: "{{ k8s_longhorn_storage_hosts }}"
+  loop_control:
+    label: "{{ item }}"
+  register: k8s_longhorn_node_patch_result
+  retries: 6
+  delay: 8
+  until: k8s_longhorn_node_patch_result is succeeded
+
+- name: Annotate Longhorn storage nodes with explicit disk configs
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: v1
+      kind: Node
+      metadata:
+        name: "{{ item }}"
+        annotations:
+          node.longhorn.io/default-disks-config: "{{ k8s_longhorn_node_disk_configs[item] | to_json }}"
+  loop: "{{ k8s_longhorn_storage_hosts }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - (k8s_longhorn_node_disk_configs | default({})).get(item, []) | length > 0
+  register: k8s_longhorn_node_annotation_patch_result
+  retries: 6
+  delay: 8
+  until: k8s_longhorn_node_annotation_patch_result is succeeded
+
+- name: Remove Longhorn storage metadata from excluded Kubernetes nodes
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: v1
+      kind: Node
+      metadata:
+        name: "{{ item }}"
+        labels: >-
+          {{
+            {
+              (k8s_longhorn_worker_node_label_key): none,
+              'freakydonkey.net/longhorn-storage': none
+            }
+          }}
+        annotations:
+          node.longhorn.io/default-disks-config: null
+  loop: "{{ k8s_longhorn_non_storage_hosts }}"
+  loop_control:
+    label: "{{ item }}"
+  register: k8s_longhorn_node_metadata_cleanup_result
+  retries: 6
+  delay: 8
+  until: k8s_longhorn_node_metadata_cleanup_result is succeeded
+
+- name: Render Longhorn Helm values
+  ansible.builtin.template:
+    src: longhorn-values.yaml.j2
+    dest: /tmp/longhorn-values.yaml
+    mode: "0600"
+  changed_when: false
+
+- name: Install or upgrade Longhorn
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_longhorn_helm_bin }}
+      upgrade --install
+      {{ k8s_longhorn_release_name }}
+      {{ k8s_longhorn_chart_name }}
+      --repo {{ k8s_longhorn_chart_repo }}
+      --namespace {{ k8s_longhorn_namespace }}
+      --create-namespace
+      --wait
+      --timeout {{ k8s_longhorn_helm_wait_timeout }}
+      --version {{ k8s_longhorn_chart_version }}
+      -f /tmp/longhorn-values.yaml
+      --kubeconfig {{ k8s_longhorn_kubeconfig }}
+      {{ '--no-hooks' if (k8s_longhorn_helm_no_hooks | bool) else '' }}
+  register: k8s_longhorn_install
+  environment: "{{ k8s_longhorn_helm_environment }}"
+  changed_when: >-
+    {{
+      'STATUS: deployed' in (k8s_longhorn_install.stdout | default(''))
+      or 'STATUS: pending-upgrade' in (k8s_longhorn_install.stdout | default(''))
+      or 'STATUS: pending-install' in (k8s_longhorn_install.stdout | default(''))
+    }}
+
+- name: Wait for Longhorn CSI provisioner deployment object
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: csi-provisioner
+  register: k8s_longhorn_csi_provisioner_deploy
+  changed_when: false
+  retries: 30
+  delay: 10
+  until: (k8s_longhorn_csi_provisioner_deploy.resources | default([]) | length) > 0
+  when: k8s_longhorn_csi_provisioner_args_override_enabled | bool
+
+- name: Extract live Longhorn CSI provisioner args
+  ansible.builtin.set_fact:
+    k8s_longhorn_csi_provisioner_live_args: >-
+      {{
+        (
+          k8s_longhorn_csi_provisioner_deploy.resources[0].spec.template.spec.containers
+          | default([])
+          | selectattr('name', 'equalto', 'csi-provisioner')
+          | map(attribute='args')
+          | list
+          | first
+        ) | default([])
+      }}
+  changed_when: false
+  when:
+    - k8s_longhorn_csi_provisioner_args_override_enabled | bool
+    - (k8s_longhorn_csi_provisioner_deploy.resources | default([]) | length) > 0
+
+- name: Patch Longhorn CSI provisioner args for resilience
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: csi-provisioner
+        namespace: "{{ k8s_longhorn_namespace }}"
+      spec:
+        template:
+          spec:
+            containers:
+              - name: csi-provisioner
+                args: "{{ k8s_longhorn_csi_provisioner_args_override }}"
+  when:
+    - k8s_longhorn_csi_provisioner_args_override_enabled | bool
+    - (k8s_longhorn_csi_provisioner_deploy.resources | default([]) | length) > 0
+    - (k8s_longhorn_csi_provisioner_live_args | default([])) != (k8s_longhorn_csi_provisioner_args_override | default([]))
+
+- name: Wait for Longhorn CSI provisioner availability
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: csi-provisioner
+  register: k8s_longhorn_csi_provisioner_ready
+  changed_when: false
+  retries: 30
+  delay: 10
+  until:
+    - (k8s_longhorn_csi_provisioner_ready.resources | default([]) | length) > 0
+    - (k8s_longhorn_csi_provisioner_ready.resources[0].status.availableReplicas | default(0) | int) >= 1
+  when: k8s_longhorn_csi_provisioner_args_override_enabled | bool
+
+- name: Read Longhorn backend service for CSI manager URL
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: v1
+    kind: Service
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: "{{ k8s_longhorn_csi_plugin_manager_service_name }}"
+  register: k8s_longhorn_backend_service
+  changed_when: false
+  when: k8s_longhorn_csi_plugin_manager_url_use_service_ip | bool
+
+- name: Assert Longhorn backend service exposes a ClusterIP
+  ansible.builtin.assert:
+    that:
+      - (k8s_longhorn_backend_service.resources | default([]) | length) > 0
+      - (k8s_longhorn_backend_service.resources[0].spec.clusterIP | default('') | string | trim | length) > 0
+      - (k8s_longhorn_backend_service.resources[0].spec.clusterIP | string | trim) != 'None'
+    fail_msg: >-
+      Longhorn backend service {{ k8s_longhorn_csi_plugin_manager_service_name }}
+      has no routable ClusterIP; cannot build CSI manager URL override.
+  when: k8s_longhorn_csi_plugin_manager_url_use_service_ip | bool
+
+- name: Wait for Longhorn CSI plugin DaemonSet object
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: longhorn-csi-plugin
+  register: k8s_longhorn_csi_plugin_daemonset
+  changed_when: false
+  retries: 30
+  delay: 10
+  until: (k8s_longhorn_csi_plugin_daemonset.resources | default([]) | length) > 0
+  when: k8s_longhorn_csi_plugin_manager_url_use_service_ip | bool
+
+- name: Build Longhorn CSI plugin manager URL override from backend ClusterIP
+  ansible.builtin.set_fact:
+    k8s_longhorn_csi_plugin_manager_url_effective: >-
+      {{
+        'http://'
+        ~ (k8s_longhorn_backend_service.resources[0].spec.clusterIP | string | trim)
+        ~ ':'
+        ~ (k8s_longhorn_csi_plugin_manager_service_port | int | string)
+        ~ (k8s_longhorn_csi_plugin_manager_api_path | string)
+      }}
+    k8s_longhorn_csi_plugin_args_live: >-
+      {{
+        (
+          k8s_longhorn_csi_plugin_daemonset.resources[0].spec.template.spec.containers
+          | default([])
+          | selectattr('name', 'equalto', 'longhorn-csi-plugin')
+          | map(attribute='args')
+          | list
+          | first
+        ) | default([])
+      }}
+  changed_when: false
+  when:
+    - k8s_longhorn_csi_plugin_manager_url_use_service_ip | bool
+    - (k8s_longhorn_csi_plugin_daemonset.resources | default([]) | length) > 0
+
+- name: Compute Longhorn CSI plugin args with manager URL override
+  ansible.builtin.set_fact:
+    k8s_longhorn_csi_plugin_args_effective: >-
+      {%- set ns = namespace(items=[], has_manager_url=false) -%}
+      {%- for arg in (k8s_longhorn_csi_plugin_args_live | default([])) -%}
+      {%-   if arg is match('^--manager-url=.*$') -%}
+      {%-     set _ = ns.items.append('--manager-url=' ~ k8s_longhorn_csi_plugin_manager_url_effective) -%}
+      {%-     set ns.has_manager_url = true -%}
+      {%-   else -%}
+      {%-     set _ = ns.items.append(arg) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {%- if not ns.has_manager_url -%}
+      {%-   set _ = ns.items.append('--manager-url=' ~ k8s_longhorn_csi_plugin_manager_url_effective) -%}
+      {%- endif -%}
+      {{ ns.items }}
+  changed_when: false
+  when:
+    - k8s_longhorn_csi_plugin_manager_url_use_service_ip | bool
+    - (k8s_longhorn_csi_plugin_daemonset.resources | default([]) | length) > 0
+
+- name: Patch Longhorn CSI plugin manager URL to backend ClusterIP
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: longhorn-csi-plugin
+        namespace: "{{ k8s_longhorn_namespace }}"
+      spec:
+        template:
+          spec:
+            containers:
+              - name: longhorn-csi-plugin
+                args: "{{ k8s_longhorn_csi_plugin_args_effective }}"
+  when:
+    - k8s_longhorn_csi_plugin_manager_url_use_service_ip | bool
+    - (k8s_longhorn_csi_plugin_daemonset.resources | default([]) | length) > 0
+    - (k8s_longhorn_csi_plugin_args_live | default([])) != (k8s_longhorn_csi_plugin_args_effective | default([]))
+
+- name: Wait for Longhorn CSI plugin DaemonSet readiness
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: longhorn-csi-plugin
+  register: k8s_longhorn_csi_plugin_ready
+  changed_when: false
+  retries: 30
+  delay: 10
+  until:
+    - (k8s_longhorn_csi_plugin_ready.resources | default([]) | length) > 0
+    - >-
+      (k8s_longhorn_csi_plugin_ready.resources[0].status.numberReady | default(0) | int)
+      >= 1
+  when: k8s_longhorn_csi_plugin_manager_url_use_service_ip | bool
+
+- name: Remove local-path default flag when Longhorn becomes default
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: local-path
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "false"
+  when: k8s_longhorn_default_storage_class | bool
+
+- name: Read existing additional Longhorn storage classes
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    name: "{{ item.name }}"
+  loop: "{{ k8s_longhorn_storage_classes | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: k8s_longhorn_existing_storage_classes
+  changed_when: false
+  when: (k8s_longhorn_storage_classes | default([]) | length) > 0
+
+- name: Recreate additional Longhorn storage classes when immutable fields drift
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: absent
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    name: "{{ item.item.name }}"
+  loop: "{{ k8s_longhorn_existing_storage_classes.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  vars:
+    desired_definition:
+      allowVolumeExpansion: "{{ item.item.allow_volume_expansion | default(true) | bool }}"
+      reclaimPolicy: "{{ item.item.reclaim_policy | default('Delete') }}"
+      volumeBindingMode: "{{ item.item.volume_binding_mode | default(k8s_longhorn_volume_binding_mode) }}"
+      provisioner: driver.longhorn.io
+      parameters: >-
+        {{
+          {
+            'numberOfReplicas': (item.item.number_of_replicas | default(k8s_longhorn_default_replica_count) | int | string),
+            'staleReplicaTimeout': (item.item.stale_replica_timeout | default(30) | int | string),
+            'fsType': (item.item.fs_type | default(k8s_longhorn_default_fs_type) | string),
+            'dataLocality': (item.item.data_locality | default(k8s_longhorn_default_data_locality) | string)
+          }
+          | combine(
+              ((item.item.disk_selector | default([]) | length) > 0)
+              | ternary({'diskSelector': (item.item.disk_selector | join(','))}, {})
+            )
+          | combine(
+              ((item.item.node_selector | default([]) | length) > 0)
+              | ternary({'nodeSelector': (item.item.node_selector | join(','))}, {})
+            )
+        }}
+    current_resource: "{{ item.resources | default([]) | first | default({}) }}"
+    immutable_drift: >-
+      {{
+        (item.resources | default([]) | length) > 0
+        and (
+          (current_resource.parameters | default({})) != (desired_definition.parameters | default({}))
+          or (current_resource.provisioner | default('')) != (desired_definition.provisioner | string)
+          or (current_resource.reclaimPolicy | default('')) != (desired_definition.reclaimPolicy | string)
+          or (current_resource.volumeBindingMode | default('')) != (desired_definition.volumeBindingMode | string)
+          or (current_resource.allowVolumeExpansion | default(false) | bool) != (desired_definition.allowVolumeExpansion | bool)
+        )
+      }}
+  when: immutable_drift | bool
+
+- name: Reconcile additional Longhorn storage classes
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: "{{ item.name }}"
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "{{ (item.is_default | default(false) | bool) | ternary('true', 'false') }}"
+      provisioner: driver.longhorn.io
+      allowVolumeExpansion: "{{ item.allow_volume_expansion | default(true) | bool }}"
+      reclaimPolicy: "{{ item.reclaim_policy | default('Delete') }}"
+      volumeBindingMode: "{{ item.volume_binding_mode | default(k8s_longhorn_volume_binding_mode) }}"
+      parameters: >-
+        {{
+          {
+            'numberOfReplicas': (item.number_of_replicas | default(k8s_longhorn_default_replica_count) | int | string),
+            'staleReplicaTimeout': (item.stale_replica_timeout | default(30) | int | string),
+            'fsType': (item.fs_type | default(k8s_longhorn_default_fs_type) | string),
+            'dataLocality': (item.data_locality | default(k8s_longhorn_default_data_locality) | string)
+          }
+          | combine(
+              ((item.disk_selector | default([]) | length) > 0)
+              | ternary({'diskSelector': (item.disk_selector | join(','))}, {})
+            )
+          | combine(
+              ((item.node_selector | default([]) | length) > 0)
+              | ternary({'nodeSelector': (item.node_selector | join(','))}, {})
+            )
+        }}
+  loop: "{{ k8s_longhorn_storage_classes | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: (k8s_longhorn_storage_classes | default([]) | length) > 0
+
+- name: Wait for Longhorn manager DaemonSet
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: longhorn-manager
+  register: k8s_longhorn_manager_ds
+  changed_when: false
+  retries: 30
+  delay: 10
+  until:
+    - (k8s_longhorn_manager_ds.resources | default([]) | length) > 0
+    - (k8s_longhorn_manager_ds.resources[0].status.numberReady | default(0) | int) >= 1
+
+- name: Wait for Longhorn node objects on declared storage hosts
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: longhorn.io/v1beta2
+    kind: Node
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: "{{ item }}"
+  loop: "{{ k8s_longhorn_storage_hosts | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  register: k8s_longhorn_storage_node_objects
+  changed_when: false
+  retries: 30
+  delay: 10
+  until: (k8s_longhorn_storage_node_objects.resources | default([]) | length) > 0
+
+- name: Ensure Longhorn storage nodes allow scheduling
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: longhorn.io/v1beta2
+      kind: Node
+      metadata:
+        name: "{{ item }}"
+        namespace: "{{ k8s_longhorn_namespace }}"
+      spec:
+        allowScheduling: true
+  loop: "{{ k8s_longhorn_storage_hosts | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Reconcile Longhorn storage node tags
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: longhorn.io/v1beta2
+      kind: Node
+      metadata:
+        name: "{{ item }}"
+        namespace: "{{ k8s_longhorn_namespace }}"
+      spec:
+        tags: "{{ hostvars[item].k8s_longhorn_storage_node_tags | default([]) }}"
+  loop: "{{ k8s_longhorn_storage_hosts | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Index Longhorn custom node objects by host
+  ansible.builtin.set_fact:
+    k8s_longhorn_storage_node_object_map: >-
+      {{
+        (k8s_longhorn_storage_node_object_map | default({}))
+        | combine({item.item: item.resources[0]})
+      }}
+  loop: "{{ k8s_longhorn_storage_node_objects.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: (item.resources | default([]) | length) > 0
+  changed_when: false
+
+- name: Build explicit Longhorn disk specs for storage hosts
+  ansible.builtin.set_fact:
+    k8s_longhorn_storage_host_disk_specs: >-
+      {{
+        (k8s_longhorn_storage_host_disk_specs | default({}))
+        | combine({item: desired_disks})
+      }}
+  loop: "{{ k8s_longhorn_storage_hosts | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  vars:
+    live_disks: >-
+      {{
+        (
+          (k8s_longhorn_storage_node_object_map | default({})).get(item, {})
+          .get('spec', {})
+          .get('disks', {})
+        )
+      }}
+    desired_disks: >-
+      {%- set ns = namespace(live_by_path={}, disks={}) -%}
+      {%- for live_item in (live_disks | dict2items) -%}
+      {%-   if (live_item.value.path | default('', true) | string | trim | length) > 0 -%}
+      {%-     set _ = ns.live_by_path.update({
+                (live_item.value.path | string): {
+                  'name': live_item.key,
+                  'spec': live_item.value
+                }
+              }) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {%- for desired_disk in ((k8s_longhorn_node_disk_configs | default({})).get(item, [])) -%}
+      {%-   set disk_path = desired_disk.path | string -%}
+      {%-   set live_match = ns.live_by_path.get(disk_path, {}) -%}
+      {%-   set disk_name = (
+              live_match.name
+              | default(
+                  'disk-' ~ (
+                    disk_path
+                    | basename
+                    | lower
+                    | regex_replace('[^a-z0-9]+', '-')
+                    | regex_replace('(^-+|-+$)', '')
+                  )
+                )
+            ) -%}
+      {%-   set base_spec = live_match.spec | default({
+                'diskDriver': '',
+                'diskType': 'filesystem',
+                'evictionRequested': false
+              }) -%}
+      {%-   set _ = ns.disks.update({
+              disk_name: (
+                base_spec
+                | combine(
+                    {
+                      'path': disk_path,
+                      'allowScheduling': (desired_disk.allowScheduling | default(true) | bool),
+                      'storageReserved': (desired_disk.storageReserved | default(0) | int),
+                      'tags': (desired_disk.tags | default([]))
+                    },
+                    recursive=True
+                  )
+              )
+            }) -%}
+      {%- endfor -%}
+      {{ ns.disks }}
+  when: ((k8s_longhorn_node_disk_configs | default({})).get(item, []) | length) > 0
+  changed_when: false
+
+- name: Reconcile explicit Longhorn disk specs on storage hosts
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: longhorn.io/v1beta2
+      kind: Node
+      metadata:
+        name: "{{ item }}"
+        namespace: "{{ k8s_longhorn_namespace }}"
+      spec:
+        allowScheduling: true
+        disks: "{{ k8s_longhorn_storage_host_disk_specs[item] }}"
+  loop: "{{ k8s_longhorn_storage_hosts | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: ((k8s_longhorn_storage_host_disk_specs | default({})).get(item, {}) | length) > 0
+
+- name: Read Longhorn node CRs
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: longhorn.io/v1beta2
+    kind: Node
+    namespace: "{{ k8s_longhorn_namespace }}"
+  register: k8s_longhorn_node_crs
+  changed_when: false
+
+- name: Disable Longhorn scheduling on excluded Longhorn nodes
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: longhorn.io/v1beta2
+      kind: Node
+      metadata:
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ k8s_longhorn_namespace }}"
+      spec:
+        allowScheduling: false
+        disks: "{{ disabled_disks }}"
+  loop: >-
+    {{
+      k8s_longhorn_node_crs.resources
+      | default([])
+      | selectattr('metadata.name', 'in', k8s_longhorn_non_storage_hosts)
+      | list
+    }}
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  vars:
+    disabled_disks: >-
+      {%- set ns = namespace(disks={}) -%}
+      {%- for disk_name, disk_config in (item.spec.disks | default({})).items() -%}
+      {%-   set _ = ns.disks.update(
+              {
+                disk_name: (disk_config | combine({'allowScheduling': false}, recursive=True))
+              }
+            ) -%}
+      {%- endfor -%}
+      {{ ns.disks }}
+
+- name: Wait for Longhorn UI deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_longhorn_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ k8s_longhorn_namespace }}"
+    name: longhorn-ui
+  register: k8s_longhorn_ui_deploy
+  changed_when: false
+  retries: 30
+  delay: 10
+  until:
+    - (k8s_longhorn_ui_deploy.resources | default([]) | length) > 0
+    - (k8s_longhorn_ui_deploy.resources[0].status.availableReplicas | default(0) | int) >= 1

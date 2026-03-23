@@ -1,0 +1,478 @@
+---
+- name: Resolve OpenWrt operator public key from explicit value or file
+  ansible.builtin.set_fact:
+    openwrt_security_operator_pubkey_effective: >-
+      {{
+        (
+          openwrt_security_operator_pubkey
+          | default('')
+          | string
+          | trim
+        )
+        if (
+          openwrt_security_operator_pubkey
+          | default('')
+          | string
+          | trim
+          | length
+        ) > 0
+        else (
+          lookup(
+            'ansible.builtin.file',
+            openwrt_security_operator_pubkey_file,
+            errors='ignore'
+          )
+          | default('')
+          | string
+          | trim
+        )
+      }}
+
+- name: Ensure operator public key is available when Dropbear management is enabled
+  ansible.builtin.assert:
+    that:
+      - (openwrt_security_operator_pubkey_effective | default('') | length) > 0
+    fail_msg: >-
+      No operator public key resolved for OpenWrt security role. Define
+      openwrt_security_operator_pubkey or provide
+      openwrt_security_operator_pubkey_file.
+  when: openwrt_security_dropbear_enabled | default(true) | bool
+
+- name: Ensure operator key is present in Dropbear authorized_keys
+  ansible.builtin.raw: >-
+    sh -lc "test -f {{ openwrt_security_dropbear_authorized_keys_path | quote }}
+    && grep -qxF {{ openwrt_security_operator_pubkey_effective | quote }}
+    {{ openwrt_security_dropbear_authorized_keys_path | quote }}"
+  register: openwrt_security_authorized_key_check
+  changed_when: (openwrt_security_authorized_key_check.rc | default(1) | int) != 0
+  failed_when: false
+  check_mode: false
+  when:
+    - openwrt_security_dropbear_enabled | default(true) | bool
+    - ansible_check_mode
+
+- name: Ensure operator key is present in Dropbear authorized_keys
+  community.openwrt.command:
+    uses_shell: true
+    cmd: |
+      umask 077
+      mkdir -p "$(dirname '{{ openwrt_security_dropbear_authorized_keys_path }}')"
+      touch '{{ openwrt_security_dropbear_authorized_keys_path }}'
+      if ! grep -qxF '{{ openwrt_security_operator_pubkey_effective | replace("'", "'\\''") }}' '{{ openwrt_security_dropbear_authorized_keys_path }}'; then
+        printf '%s\n' '{{ openwrt_security_operator_pubkey_effective | replace("'", "'\\''") }}' >> '{{ openwrt_security_dropbear_authorized_keys_path }}'
+        echo CHANGED
+      fi
+  register: openwrt_security_authorized_key_result
+  changed_when: "'CHANGED' in (openwrt_security_authorized_key_result.stdout | default(''))"
+  when:
+    - openwrt_security_dropbear_enabled | default(true) | bool
+    - not ansible_check_mode
+
+- name: Configure Dropbear hardening options
+  community.openwrt.uci:
+    command: set
+    key: "{{ item.key }}"
+    value: "{{ item.value }}"
+  loop:
+    - key: "dropbear.{{ openwrt_security_dropbear_section }}.PasswordAuth"
+      value: "{{ openwrt_security_dropbear_password_auth }}"
+    - key: "dropbear.{{ openwrt_security_dropbear_section }}.RootPasswordAuth"
+      value: "{{ openwrt_security_dropbear_root_password_auth }}"
+    - key: "dropbear.{{ openwrt_security_dropbear_section }}.GatewayPorts"
+      value: "{{ openwrt_security_dropbear_gateway_ports }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: openwrt_security_dropbear_enabled | default(true) | bool
+
+- name: Check pending Dropbear UCI changes
+  community.openwrt.uci:
+    command: changes
+    config: dropbear
+  register: openwrt_security_dropbear_changes
+  changed_when: false
+  when: openwrt_security_dropbear_enabled | default(true) | bool
+
+- name: Commit Dropbear UCI changes
+  community.openwrt.uci:
+    command: commit
+    config: dropbear
+  when:
+    - openwrt_security_dropbear_enabled | default(true) | bool
+    - (openwrt_security_dropbear_changes.result | default('') | trim | length) > 0
+
+- name: Restart Dropbear when security settings changed
+  community.openwrt.service:
+    name: dropbear
+    state: restarted
+  when:
+    - openwrt_security_dropbear_enabled | default(true) | bool
+    - >-
+      (openwrt_security_dropbear_changes.result | default('') | trim | length) > 0
+      or (
+        openwrt_security_authorized_key_result is defined
+        and (openwrt_security_authorized_key_result is changed)
+      )
+
+- name: Normalize uhttpd listen lists
+  ansible.builtin.set_fact:
+    openwrt_security_uhttpd_listen_http_effective: >-
+      {{
+        (openwrt_security_uhttpd_listen_http | default([]))
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    openwrt_security_uhttpd_listen_https_effective: >-
+      {{
+        (openwrt_security_uhttpd_listen_https | default([]))
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    openwrt_security_uhttpd_listen_http_serialized: >-
+      {{
+        (
+          (openwrt_security_uhttpd_listen_http | default([]))
+          | map('string')
+          | map('trim')
+          | reject('equalto', '')
+          | unique
+          | list
+        ) | join('|')
+      }}
+    openwrt_security_uhttpd_listen_https_serialized: >-
+      {{
+        (
+          (openwrt_security_uhttpd_listen_https | default([]))
+          | map('string')
+          | map('trim')
+          | reject('equalto', '')
+          | unique
+          | list
+        ) | join('|')
+      }}
+  when: openwrt_security_uhttpd_enabled | default(true) | bool
+
+- name: Show OpenWrt uhttpd hardening dry-run plan
+  ansible.builtin.debug:
+    msg:
+      section: "{{ openwrt_security_uhttpd_section }}"
+      redirect_https: "{{ openwrt_security_uhttpd_redirect_https | default(true) | bool }}"
+      disable_http: "{{ openwrt_security_uhttpd_disable_http | default(false) | bool }}"
+      listen_http: "{{ openwrt_security_uhttpd_listen_http_effective | default([]) }}"
+      listen_https: "{{ openwrt_security_uhttpd_listen_https_effective | default([]) }}"
+  changed_when: false
+  when:
+    - openwrt_security_uhttpd_enabled | default(true) | bool
+    - openwrt_security_uhttpd_dry_run | default(true) | bool
+    - not (openwrt_security_uhttpd_force_apply | default(false) | bool)
+
+- name: Apply OpenWrt uhttpd hardening
+  when:
+    - openwrt_security_uhttpd_enabled | default(true) | bool
+    - >-
+      not (openwrt_security_uhttpd_dry_run | default(true) | bool)
+      or (openwrt_security_uhttpd_force_apply | default(false) | bool)
+  block:
+    - name: Set uhttpd redirect_https
+      community.openwrt.uci:
+        command: set
+        key: "uhttpd.{{ openwrt_security_uhttpd_section }}.redirect_https"
+        value: "{{ '1' if (openwrt_security_uhttpd_redirect_https | default(true) | bool) else '0' }}"
+
+    - name: Set uhttpd listen lists
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          current_http="$(
+            uci -q show "uhttpd.{{ openwrt_security_uhttpd_section }}.listen_http" \
+            | sed -n "s/^uhttpd\.{{ openwrt_security_uhttpd_section }}\.listen_http=//p" \
+            | tr -d "'" \
+            | tr ' ' '\n' \
+            | sed '/^$/d' \
+            | paste -sd'|' -
+          )"
+          current_https="$(
+            uci -q show "uhttpd.{{ openwrt_security_uhttpd_section }}.listen_https" \
+            | sed -n "s/^uhttpd\.{{ openwrt_security_uhttpd_section }}\.listen_https=//p" \
+            | tr -d "'" \
+            | tr ' ' '\n' \
+            | sed '/^$/d' \
+            | paste -sd'|' -
+          )"
+          desired_http='{{ openwrt_security_uhttpd_listen_http_serialized | default("") }}'
+          desired_https='{{ openwrt_security_uhttpd_listen_https_serialized | default("") }}'
+          {% if openwrt_security_uhttpd_disable_http | default(false) | bool %}
+          desired_http=''
+          {% endif %}
+
+          if [ "${current_http}" != "${desired_http}" ] || [ "${current_https}" != "${desired_https}" ]; then
+            uci -q del "uhttpd.{{ openwrt_security_uhttpd_section }}.listen_http" || true
+            uci -q del "uhttpd.{{ openwrt_security_uhttpd_section }}.listen_https" || true
+            {% if not (openwrt_security_uhttpd_disable_http | default(false) | bool) %}
+            {% for entry in openwrt_security_uhttpd_listen_http_effective | default([]) %}
+            uci add_list "uhttpd.{{ openwrt_security_uhttpd_section }}.listen_http={{ entry }}"
+            {% endfor %}
+            {% endif %}
+            {% for entry in openwrt_security_uhttpd_listen_https_effective | default([]) %}
+            uci add_list "uhttpd.{{ openwrt_security_uhttpd_section }}.listen_https={{ entry }}"
+            {% endfor %}
+            echo CHANGED
+          fi
+      register: openwrt_security_uhttpd_listen_result
+      changed_when: "'CHANGED' in (openwrt_security_uhttpd_listen_result.stdout | default(''))"
+
+    - name: Check pending uhttpd UCI changes
+      community.openwrt.uci:
+        command: changes
+        config: uhttpd
+      register: openwrt_security_uhttpd_changes
+      changed_when: false
+
+    - name: Commit uhttpd UCI changes
+      community.openwrt.uci:
+        command: commit
+        config: uhttpd
+      when: (openwrt_security_uhttpd_changes.result | default('') | trim | length) > 0
+
+    - name: Restart uhttpd when security settings changed
+      community.openwrt.service:
+        name: uhttpd
+        state: restarted
+      when: (openwrt_security_uhttpd_changes.result | default('') | trim | length) > 0
+
+- name: Build effective firewall port lists
+  ansible.builtin.set_fact:
+    openwrt_security_firewall_wan_tcp_ports_effective: >-
+      {{
+        (
+          (openwrt_security_firewall_wan_allow_tcp_ports | default([]))
+          + (openwrt_security_firewall_wan_allow_tcp_ports_extra | default([]))
+        )
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    openwrt_security_firewall_wan_udp_ports_effective: >-
+      {{
+        (
+          (openwrt_security_firewall_wan_allow_udp_ports | default([]))
+          + (openwrt_security_firewall_wan_allow_udp_ports_extra | default([]))
+        )
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    openwrt_security_firewall_management_tcp_ports_effective: >-
+      {{
+        (
+          (openwrt_security_firewall_management_allow_tcp_ports | default([]))
+          + (openwrt_security_firewall_management_allow_tcp_ports_extra | default([]))
+        )
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+  when: openwrt_security_firewall_enabled | default(true) | bool
+
+- name: Build OpenWrt managed firewall rule plan
+  ansible.builtin.set_fact:
+    openwrt_security_firewall_managed_rules: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for port in (openwrt_security_firewall_wan_tcp_ports_effective | default([])) -%}
+      {%-   set _ = ns.items.append({
+              'section_name': 'rtr_fabric_allow_wan_tcp_' ~ port,
+              'name': 'rtr-fabric allow wan tcp ' ~ port,
+              'src': openwrt_security_firewall_wan_zone,
+              'proto': 'tcp',
+              'dest_port': port,
+              'target': 'ACCEPT'
+            }) -%}
+      {%- endfor -%}
+      {%- for port in (openwrt_security_firewall_wan_udp_ports_effective | default([])) -%}
+      {%-   set _ = ns.items.append({
+              'section_name': 'rtr_fabric_allow_wan_udp_' ~ port,
+              'name': 'rtr-fabric allow wan udp ' ~ port,
+              'src': openwrt_security_firewall_wan_zone,
+              'proto': 'udp',
+              'dest_port': port,
+              'target': 'ACCEPT'
+            }) -%}
+      {%- endfor -%}
+      {%- if openwrt_security_firewall_management_rules_enabled | default(true) | bool -%}
+      {%-   for zone in (openwrt_security_firewall_management_source_zones | default([])) -%}
+      {%-     for port in (openwrt_security_firewall_management_tcp_ports_effective | default([])) -%}
+      {%-       set _ = ns.items.append({
+                'section_name': 'rtr_fabric_allow_mgmt_' ~ zone ~ '_tcp_' ~ port,
+                'name': 'rtr-fabric allow mgmt ' ~ zone ~ ' tcp ' ~ port,
+                'src': zone,
+                'proto': 'tcp',
+                'dest_port': port,
+                'target': 'ACCEPT'
+              }) -%}
+      {%-     endfor -%}
+      {%-   endfor -%}
+      {%- endif -%}
+      {{ ns.items }}
+  when: openwrt_security_firewall_enabled | default(true) | bool
+
+- name: Build OpenWrt managed firewall section names
+  ansible.builtin.set_fact:
+    openwrt_security_firewall_managed_rule_section_names: >-
+      {{
+        (openwrt_security_firewall_managed_rules | default([]))
+        | map(attribute='section_name')
+        | list
+      }}
+  when: openwrt_security_firewall_enabled | default(true) | bool
+
+- name: Show OpenWrt firewall dry-run plan
+  ansible.builtin.debug:
+    msg:
+      wan_zone: "{{ openwrt_security_firewall_wan_zone }}"
+      manage_wan_zone_policy: "{{ openwrt_security_firewall_manage_wan_zone_policy | default(true) | bool }}"
+      wan_policy:
+        input: "{{ openwrt_security_firewall_wan_zone_input_policy }}"
+        output: "{{ openwrt_security_firewall_wan_zone_output_policy }}"
+        forward: "{{ openwrt_security_firewall_wan_zone_forward_policy }}"
+      managed_rules: "{{ openwrt_security_firewall_managed_rules | default([]) }}"
+  changed_when: false
+  when:
+    - openwrt_security_firewall_enabled | default(true) | bool
+    - openwrt_security_firewall_dry_run | default(true) | bool
+    - not (openwrt_security_firewall_force_apply | default(false) | bool)
+
+- name: Apply OpenWrt firewall hardening
+  when:
+    - openwrt_security_firewall_enabled | default(true) | bool
+    - >-
+      not (openwrt_security_firewall_dry_run | default(true) | bool)
+      or (openwrt_security_firewall_force_apply | default(false) | bool)
+  block:
+    - name: Remove previously managed OpenWrt firewall allow rules
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          changed=0
+          wanted_sections=' {{ (openwrt_security_firewall_managed_rule_section_names | default([])) | join(" ") }} '
+          for section in $(uci -q show firewall | sed -n "s/^firewall\.\(rtr_fabric_allow_[^.=]*\)=rule$/\1/p"); do
+            case "${wanted_sections}" in
+              *" ${section} "*) ;;
+              *)
+                uci -q delete "firewall.${section}" && changed=1 || true
+                ;;
+            esac
+          done
+          [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_security_firewall_cleanup_result
+      changed_when: "'CHANGED' in (openwrt_security_firewall_cleanup_result.stdout | default(''))"
+
+    - name: Set WAN zone policy when managed
+      community.openwrt.uci:
+        command: section
+        config: firewall
+        type: zone
+        name: "{{ openwrt_security_firewall_wan_zone }}"
+        find:
+          name: "{{ openwrt_security_firewall_wan_zone }}"
+        set_find: true
+        replace: false
+        value:
+          input: "{{ openwrt_security_firewall_wan_zone_input_policy }}"
+          output: "{{ openwrt_security_firewall_wan_zone_output_policy }}"
+          forward: "{{ openwrt_security_firewall_wan_zone_forward_policy }}"
+      when: openwrt_security_firewall_manage_wan_zone_policy | default(true) | bool
+
+    - name: Apply managed OpenWrt firewall allow rules
+      community.openwrt.uci:
+        command: section
+        config: firewall
+        type: rule
+        name: "{{ item.section_name }}"
+        find:
+          name: "{{ item.name }}"
+        set_find: true
+        replace: true
+        value: >-
+          {{
+            {
+              'name': item.name,
+              'src': item.src,
+              'proto': item.proto,
+              'dest_port': item.dest_port,
+              'target': item.target
+            }
+            | combine(
+                {'family': openwrt_security_firewall_rule_family},
+                recursive=True
+              )
+            if (openwrt_security_firewall_rule_family | default('') | string | trim | length) > 0
+            else {
+              'name': item.name,
+              'src': item.src,
+              'proto': item.proto,
+              'dest_port': item.dest_port,
+              'target': item.target
+            }
+          }}
+      loop: "{{ openwrt_security_firewall_managed_rules | default([]) }}"
+      loop_control:
+        label: "{{ item.section_name }}"
+
+    - name: Check pending firewall UCI changes
+      community.openwrt.uci:
+        command: changes
+        config: firewall
+      register: openwrt_security_firewall_changes
+      changed_when: false
+
+    - name: Commit firewall UCI changes
+      community.openwrt.uci:
+        command: commit
+        config: firewall
+      when: (openwrt_security_firewall_changes.result | default('') | trim | length) > 0
+
+    - name: Reload firewall when security settings changed
+      community.openwrt.service:
+        name: firewall
+        state: restarted
+      when: (openwrt_security_firewall_changes.result | default('') | trim | length) > 0
+
+- name: Show OpenWrt sysctl dry-run plan
+  ansible.builtin.debug:
+    msg:
+      sysctl: "{{ openwrt_security_sysctl | default({}) | combine(openwrt_security_sysctl_set | default({})) }}"
+  changed_when: false
+  when:
+    - openwrt_security_sysctl_enabled | default(false) | bool
+    - openwrt_security_sysctl_dry_run | default(true) | bool
+    - not (openwrt_security_sysctl_force_apply | default(false) | bool)
+
+- name: Apply OpenWrt sysctl settings (best effort)
+  community.openwrt.command:
+    uses_shell: true
+    cmd: |
+      sysctl -w '{{ item.key }}={{ item.value }}'
+  loop: "{{ (openwrt_security_sysctl | default({})) | combine(openwrt_security_sysctl_set | default({})) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: openwrt_security_sysctl_apply
+  failed_when: >-
+    (not (openwrt_security_sysctl_ignore_errors | default(true) | bool))
+    and ((openwrt_security_sysctl_apply.rc | default(0)) != 0)
+  changed_when: true
+  when:
+    - openwrt_security_sysctl_enabled | default(false) | bool
+    - >-
+      not (openwrt_security_sysctl_dry_run | default(true) | bool)
+      or (openwrt_security_sysctl_force_apply | default(false) | bool)

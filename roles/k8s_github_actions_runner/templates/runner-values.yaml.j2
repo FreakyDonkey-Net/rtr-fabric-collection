@@ -1,0 +1,86 @@
+githubConfigUrl: {{ k8s_github_actions_runner_github_config_url }}
+githubConfigSecret: {{ k8s_github_actions_runner_github_auth_secret_name }}
+runnerGroup: {{ k8s_github_actions_runner_runner_group }}
+runnerScaleSetName: {{ k8s_github_actions_runner_scale_set_name }}
+minRunners: {{ k8s_github_actions_runner_min_runners | int }}
+maxRunners: {{ k8s_github_actions_runner_max_runners | int }}
+controllerServiceAccount:
+  namespace: {{ k8s_github_actions_runner_controller_namespace }}
+  name: {{ k8s_github_actions_runner_controller_service_account_name }}
+template:
+  metadata:
+    labels:
+      app.kubernetes.io/part-of: rtr-fabric
+      freakydonkey.net/workload-tier: automation
+  spec:
+    nodeSelector:
+{{ k8s_github_actions_runner_node_selector | to_nice_yaml(indent=2) | indent(6, true) }}
+    tolerations:
+{{ k8s_github_actions_runner_tolerations | to_nice_yaml(indent=2) | indent(6, true) }}
+    securityContext:
+{{ k8s_github_actions_runner_runner_pod_security_context | to_nice_yaml(indent=2) | indent(6, true) }}
+    containers:
+      - name: runner
+        image: {{ k8s_github_actions_runner_runner_image }}
+        command:
+          - /home/runner/run.sh
+        env:
+{{ k8s_github_actions_runner_runner_env | to_nice_yaml(indent=2) | indent(10, true) }}
+        resources:
+{{ k8s_github_actions_runner_runner_resources | to_nice_yaml(indent=2) | indent(10, true) }}
+        securityContext:
+{{ (
+    k8s_github_actions_runner_runner_container_security_context
+    | combine({
+        'runAsGroup': (k8s_github_actions_runner_runner_gid | int),
+        'runAsUser': (k8s_github_actions_runner_runner_uid | int)
+      })
+  ) | to_nice_yaml(indent=2) | indent(10, true) }}
+        volumeMounts:
+          - name: work
+            mountPath: /home/runner/_work
+          - name: rtr-fabric-runner-support
+            mountPath: {{ k8s_github_actions_runner_mount_support_dir }}
+            readOnly: true
+          - name: rtr-fabric-runner-ssh
+            mountPath: {{ k8s_github_actions_runner_mount_ssh_dir }}
+            readOnly: true
+    volumes:
+      - name: work
+        emptyDir: {}
+      - name: rtr-fabric-runner-support
+        secret:
+          secretName: {{ k8s_github_actions_runner_support_secret_name }}
+          defaultMode: 0400
+          items:
+            - key: 99-secrets.local.yml
+              path: 99-secrets.local.yml
+            - key: runner-secrets.prod.yml
+              path: runner-secrets.prod.yml
+            - key: k3s-token
+              path: k3s-token
+            - key: openbao-approle-role-id
+              path: openbao-approle-role-id
+            - key: openbao-approle-secret-id
+              path: openbao-approle-secret-id
+      - name: rtr-fabric-runner-ssh
+        secret:
+          secretName: {{ k8s_github_actions_runner_support_secret_name }}
+          defaultMode: 0400
+          items:
+            - key: id_ed25519
+              path: id_ed25519
+            - key: known_hosts
+              path: known_hosts
+listenerTemplate:
+  spec:
+    nodeSelector:
+{{ k8s_github_actions_runner_listener_node_selector | to_nice_yaml(indent=2) | indent(6, true) }}
+    tolerations:
+{{ k8s_github_actions_runner_tolerations | to_nice_yaml(indent=2) | indent(6, true) }}
+    containers:
+      - name: listener
+        resources:
+{{ k8s_github_actions_runner_listener_resources | to_nice_yaml(indent=2) | indent(10, true) }}
+        securityContext:
+{{ k8s_github_actions_runner_listener_container_security_context | to_nice_yaml(indent=2) | indent(10, true) }}

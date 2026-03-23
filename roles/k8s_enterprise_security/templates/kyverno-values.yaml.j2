@@ -1,0 +1,115 @@
+crds:
+  migration:
+    enabled: {{ k8s_enterprise_security_kyverno_crds_migration_enabled | bool | lower }}
+
+admissionController:
+  replicas: {{ k8s_enterprise_security_kyverno_admission_controller_replicas | int }}
+  nodeSelector:
+{% if (k8s_enterprise_security_kyverno_node_selector | default({}) | length) == 0 %}
+    {}
+{% else %}
+{% for key, value in k8s_enterprise_security_kyverno_node_selector.items() %}
+    {{ key }}: "{{ value }}"
+{% endfor %}
+{% endif %}
+  tolerations:
+{% if (k8s_enterprise_security_kyverno_tolerations | default([]) | length) == 0 %}
+    []
+{% else %}
+{% for toleration in k8s_enterprise_security_kyverno_tolerations %}
+    - key: "{{ toleration.key }}"
+      operator: "{{ toleration.operator | default('Equal') }}"
+{% if toleration.value is defined %}
+      value: "{{ toleration.value }}"
+{% endif %}
+{% if toleration.effect is defined %}
+      effect: "{{ toleration.effect }}"
+{% endif %}
+{% endfor %}
+{% endif %}
+  resources:
+{{ k8s_enterprise_security_kyverno_admission_controller_resources | to_nice_yaml(indent=4) | indent(4, true) }}
+
+backgroundController:
+  replicas: {{ k8s_enterprise_security_kyverno_background_controller_replicas | int }}
+  nodeSelector:
+{% if (k8s_enterprise_security_kyverno_node_selector | default({}) | length) == 0 %}
+    {}
+{% else %}
+{% for key, value in k8s_enterprise_security_kyverno_node_selector.items() %}
+    {{ key }}: "{{ value }}"
+{% endfor %}
+{% endif %}
+  tolerations:
+{% if (k8s_enterprise_security_kyverno_tolerations | default([]) | length) == 0 %}
+    []
+{% else %}
+{% for toleration in k8s_enterprise_security_kyverno_tolerations %}
+    - key: "{{ toleration.key }}"
+      operator: "{{ toleration.operator | default('Equal') }}"
+{% if toleration.value is defined %}
+      value: "{{ toleration.value }}"
+{% endif %}
+{% if toleration.effect is defined %}
+      effect: "{{ toleration.effect }}"
+{% endif %}
+{% endfor %}
+{% endif %}
+  resources:
+{{ k8s_enterprise_security_kyverno_background_controller_resources | to_nice_yaml(indent=4) | indent(4, true) }}
+
+cleanupController:
+  replicas: {{ k8s_enterprise_security_kyverno_cleanup_controller_replicas | int }}
+  nodeSelector:
+{% if (k8s_enterprise_security_kyverno_node_selector | default({}) | length) == 0 %}
+    {}
+{% else %}
+{% for key, value in k8s_enterprise_security_kyverno_node_selector.items() %}
+    {{ key }}: "{{ value }}"
+{% endfor %}
+{% endif %}
+  tolerations:
+{% if (k8s_enterprise_security_kyverno_tolerations | default([]) | length) == 0 %}
+    []
+{% else %}
+{% for toleration in k8s_enterprise_security_kyverno_tolerations %}
+    - key: "{{ toleration.key }}"
+      operator: "{{ toleration.operator | default('Equal') }}"
+{% if toleration.value is defined %}
+      value: "{{ toleration.value }}"
+{% endif %}
+{% if toleration.effect is defined %}
+      effect: "{{ toleration.effect }}"
+{% endif %}
+{% endfor %}
+{% endif %}
+  resources:
+{{ k8s_enterprise_security_kyverno_cleanup_controller_resources | to_nice_yaml(indent=4) | indent(4, true) }}
+
+reportsController:
+  replicas: {{ k8s_enterprise_security_kyverno_reports_controller_replicas | int }}
+  nodeSelector:
+{% if (k8s_enterprise_security_kyverno_node_selector | default({}) | length) == 0 %}
+    {}
+{% else %}
+{% for key, value in k8s_enterprise_security_kyverno_node_selector.items() %}
+    {{ key }}: "{{ value }}"
+{% endfor %}
+{% endif %}
+  tolerations:
+{% if (k8s_enterprise_security_kyverno_tolerations | default([]) | length) == 0 %}
+    []
+{% else %}
+{% for toleration in k8s_enterprise_security_kyverno_tolerations %}
+    - key: "{{ toleration.key }}"
+      operator: "{{ toleration.operator | default('Equal') }}"
+{% if toleration.value is defined %}
+      value: "{{ toleration.value }}"
+{% endif %}
+{% if toleration.effect is defined %}
+      effect: "{{ toleration.effect }}"
+{% endif %}
+{% endfor %}
+{% endif %}
+  resources:
+{{ k8s_enterprise_security_kyverno_reports_controller_resources | to_nice_yaml(indent=4) | indent(4, true) }}

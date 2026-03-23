@@ -1,0 +1,50 @@
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet rtr_fabric {
+  chain input {
+    type filter hook input priority 0;
+    policy drop;
+{% if host_security_firewall_allow_loopback | default(true) | bool %}
+    iifname "lo" accept
+{% endif %}
+{% if host_security_firewall_allow_established | default(true) | bool %}
+    ct state established,related accept
+{% endif %}
+{% if host_security_firewall_allow_icmp | default(true) | bool %}
+    ip protocol icmp accept
+    ip6 nexthdr ipv6-icmp accept
+{% endif %}
+{% if host_security_firewall_allow_local_interfaces | default(true) | bool and (host_security_firewall_effective_wan_iface | default('') | length) > 0 %}
+    iifname != "{{ host_security_firewall_effective_wan_iface }}" accept
+{% endif %}
+{% if (host_security_firewall_effective_wan_tcp_ports | default([]) | length) > 0 %}
+    iifname "{{ host_security_firewall_effective_wan_iface }}" tcp dport { {{ host_security_firewall_effective_wan_tcp_ports | join(', ') }} } accept
+{% endif %}
+{% if (host_security_firewall_effective_wan_udp_ports | default([]) | length) > 0 %}
+    iifname "{{ host_security_firewall_effective_wan_iface }}" udp dport { {{ host_security_firewall_effective_wan_udp_ports | join(', ') }} } accept
+{% endif %}
+  }
+
+  chain forward {
+    type filter hook forward priority 0;
+    policy accept;
+  }
+
+  chain output {
+    type filter hook output priority 0;
+    policy accept;
+  }
+}
+
+{% if host_security_egress_gateway_enabled | default(false) | bool %}
+table ip rtr_fabric_nat {
+  chain postrouting {
+    type nat hook postrouting priority 100;
+{% for subnet in (host_security_egress_gateway_source_subnets | default([])) %}
+    ip saddr {{ subnet }} oifname "{{ host_security_egress_gateway_wan_iface | default(host_security_firewall_effective_wan_iface) }}" masquerade
+{% endfor %}
+  }
+}
+{% endif %}

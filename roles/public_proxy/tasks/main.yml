@@ -1,0 +1,77 @@
+- name: Optionally skip public proxy in dry-run mode
+  when: public_proxy_dry_run | bool
+  block:
+    - name: Show public proxy dry-run summary
+      ansible.builtin.debug:
+        msg:
+          k3s_api_enabled: "{{ public_proxy_k3s_api_enabled | bool }}"
+          k3s_api_bind: "{{ public_proxy_k3s_api_bind_host }}:{{ public_proxy_k3s_api_bind_port }}"
+          expose_public_ports: "{{ public_proxy_expose_public_ports | bool }}"
+      changed_when: false
+
+    - name: End host when public proxy dry-run is enabled
+      ansible.builtin.meta: end_host
+
+- name: Build public proxy K3s backend list
+  ansible.builtin.set_fact:
+    public_proxy_k3s_backends: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for host in (k3s_api_lb_target_hosts | default(groups.get('k3s_server', []), true) | list) -%}
+      {%-   set ip = (
+              hostvars[host].k3s_wireguard_ip
+              | default(
+                  (hostvars[host].wireguard_address | default('') | regex_replace('/.*$', '')),
+                  true
+                )
+            ) -%}
+      {%-   if (ip | string | trim | length) > 0 -%}
+      {%-     set _ = ns.items.append({'name': host, 'address': ip}) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  changed_when: false
+
+- name: Ensure public proxy prerequisites are valid
+  ansible.builtin.assert:
+    that:
+      - public_proxy_enabled | bool
+      - not (public_proxy_k3s_api_enabled | bool) or (public_proxy_k3s_backends | length) > 0
+    fail_msg: >-
+      public_proxy prerequisites are invalid on {{ inventory_hostname }}.
+      k3s_api_enabled={{ public_proxy_k3s_api_enabled | bool }},
+      backends={{ public_proxy_k3s_backends | default([]) }}.
+
+- name: Ensure HAProxy package is installed
+  ansible.builtin.apt:
+    name: "{{ public_proxy_package_name }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Render HAProxy configuration
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "haproxy -c -f %s"
+  notify: Restart public proxy
+
+- name: Ensure HAProxy service is enabled and started
+  ansible.builtin.systemd_service:
+    name: "{{ public_proxy_service_name }}"
+    enabled: true
+    state: started
+
+- name: Flush HAProxy handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Show public proxy summary
+  ansible.builtin.debug:
+    msg:
+      stats_bind: "{{ public_proxy_stats_bind_host }}:{{ public_proxy_stats_port }}"
+      k3s_api_enabled: "{{ public_proxy_k3s_api_enabled | bool }}"
+      k3s_api_bind: "{{ public_proxy_k3s_api_bind_host }}:{{ public_proxy_k3s_api_bind_port }}"
+      k3s_backends: "{{ public_proxy_k3s_backends }}"
+  changed_when: false

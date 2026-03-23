@@ -1,0 +1,25 @@
+---
+- name: Gather WireGuard peer handshake status
+  ansible.builtin.command: wg show {{ wireguard_interface | default('wg0') }}
+  register: observability_agent_wg_status
+  changed_when: false
+  failed_when: false
+
+- name: Check for stale handshakes (> 3 minutes)
+  ansible.builtin.shell: |
+    wg show {{ wireguard_interface | default('wg0') }} latest-handshakes | \
+    awk -v now=$(date +%s) '{age=now-$2; if (age > 180) print $1, "stale:", age "s ago"}'
+  register: observability_agent_wg_stale
+  changed_when: false
+  failed_when: false
+
+- name: Display WireGuard status
+  ansible.builtin.debug:
+    msg: "{{ observability_agent_wg_status.stdout_lines | default([]) }}"
+
+- name: Fail if stale peers detected and fail_on_anomaly
+  ansible.builtin.fail:
+    msg: "Stale WireGuard peers detected: {{ observability_agent_wg_stale.stdout }}"
+  when:
+    - observability_agent_fail_on_anomaly | bool
+    - (observability_agent_wg_stale.stdout | default('') | length) > 0

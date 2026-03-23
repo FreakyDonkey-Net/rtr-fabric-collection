@@ -1,0 +1,89 @@
+---
+k8s_github_actions_runner_controller_namespace: arc-system
+k8s_github_actions_runner_namespace: github-actions-runner
+k8s_github_actions_runner_controller_release_name: arc-controller
+k8s_github_actions_runner_controller_chart_ref: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+k8s_github_actions_runner_controller_chart_version: ""
+k8s_github_actions_runner_controller_fullname_override: arc-gha-runner-scale-set-controller
+k8s_github_actions_runner_controller_service_account_name: arc-gha-runner-scale-set-controller
+k8s_github_actions_runner_controller_namespace_pod_security_enforce: restricted
+k8s_github_actions_runner_controller_namespace_pod_security_warn: restricted
+k8s_github_actions_runner_controller_namespace_pod_security_audit: restricted
+k8s_github_actions_runner_controller_replicas: 1
+k8s_github_actions_runner_controller_log_level: info
+k8s_github_actions_runner_controller_log_format: json
+k8s_github_actions_runner_controller_runner_max_concurrent_reconciles: 2
+k8s_github_actions_runner_controller_update_strategy: eventual
+k8s_github_actions_runner_controller_resources: {}
+k8s_github_actions_runner_controller_node_selector: {}
+k8s_github_actions_runner_controller_affinity: {}
+k8s_github_actions_runner_scale_set_release_name: rtr-fabric-runner
+k8s_github_actions_runner_scale_set_chart_ref: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+k8s_github_actions_runner_scale_set_chart_version: ""
+k8s_github_actions_runner_scale_set_name: rtr-fabric
+k8s_github_actions_runner_namespace_pod_security_enforce: baseline
+k8s_github_actions_runner_namespace_pod_security_warn: restricted
+k8s_github_actions_runner_namespace_pod_security_audit: restricted
+k8s_github_actions_runner_github_config_url: ""
+k8s_github_actions_runner_github_auth_secret_name: gha-runner-github-auth
+k8s_github_actions_runner_github_auth_token: ""
+k8s_github_actions_runner_support_secret_name: rtr-fabric-runner-files
+k8s_github_actions_runner_runner_group: default
+k8s_github_actions_runner_min_runners: 0
+k8s_github_actions_runner_max_runners: 1
+k8s_github_actions_runner_runner_image: ghcr.io/actions/actions-runner:latest
+k8s_github_actions_runner_runner_resources: {}
+k8s_github_actions_runner_listener_resources: {}
+k8s_github_actions_runner_node_selector: {}
+k8s_github_actions_runner_listener_node_selector: {}
+k8s_github_actions_runner_tolerations: []
+k8s_github_actions_runner_mount_support_dir: /home/runner/rtr-fabric-secrets
+k8s_github_actions_runner_mount_ssh_dir: /home/runner/.ssh
+k8s_github_actions_runner_runner_env: []
+k8s_github_actions_runner_runner_uid: 1001
+k8s_github_actions_runner_runner_gid: 1001
+k8s_github_actions_runner_copy_local_helm_binary: true
+k8s_github_actions_runner_local_helm_binary: "{{ lookup('ansible.builtin.pipe', 'command -v helm') }}"
+k8s_github_actions_runner_helm_bin: /usr/local/bin/helm
+k8s_github_actions_runner_kubeconfig: /etc/rancher/k3s/k3s.yaml
+k8s_github_actions_runner_kubectl_bin: /usr/local/bin/kubectl
+k8s_github_actions_runner_helm_environment:
+  HELM_CACHE_HOME: /tmp/helm-cache
+  HELM_CONFIG_HOME: /tmp/helm-config
+  HELM_DATA_HOME: /tmp/helm-data
+k8s_github_actions_runner_helm_wait_timeout: 10m0s
+k8s_github_actions_runner_runner_pod_security_context:
+  fsGroup: 1001
+k8s_github_actions_runner_listener_container_security_context:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+k8s_github_actions_runner_runner_container_security_context:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+k8s_github_actions_runner_controller_pod_security_context:
+  fsGroup: 1001
+k8s_github_actions_runner_controller_security_context:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+k8s_github_actions_runner_local_secrets_source_file: ""
+k8s_github_actions_runner_local_k3s_token_source_file: ""
+k8s_github_actions_runner_local_ssh_private_key_file: ""
+k8s_github_actions_runner_local_ssh_known_hosts_file: ""

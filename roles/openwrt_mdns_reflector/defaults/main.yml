@@ -1,0 +1,12 @@
+---
+openwrt_mdns_reflector_dry_run: true
+openwrt_mdns_reflector_force_apply: false
+
+openwrt_mdns_reflector_packages:
+  - avahi-dbus-daemon
+
+openwrt_mdns_reflector_service_name: avahi-daemon
+openwrt_mdns_reflector_config_path: /etc/avahi/avahi-daemon.conf
+
+openwrt_mdns_reflector_allow_interfaces: []
+openwrt_mdns_reflector_use_ipv6: false

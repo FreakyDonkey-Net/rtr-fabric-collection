@@ -1,0 +1,346 @@
+---
+- name: Assert OpenWrt Wi-Fi site context is available
+  ansible.builtin.assert:
+    that:
+      - (openwrt_wifi_profiles_site_name | default('') | string | trim | length) > 0
+    fail_msg: openwrt_wifi_profiles_site_name must resolve to a non-empty site name.
+
+- name: Assert OpenWrt Wi-Fi profile inputs are coherent
+  ansible.builtin.assert:
+    that:
+      - not (openwrt_wifi_profiles_trusted_enabled | default(true) | bool) or
+        (openwrt_wifi_profiles_trusted_radius_enabled | default(false) | bool) or
+        ((openwrt_wifi_profiles_trusted_psk | default('') | string | trim | length) > 0)
+      - not (openwrt_wifi_profiles_trusted_radius_enabled | default(false) | bool) or
+        ((openwrt_wifi_profiles_trusted_radius_auth_server | default('') | string | trim | length) > 0)
+      - not (openwrt_wifi_profiles_trusted_radius_enabled | default(false) | bool) or
+        ((openwrt_wifi_profiles_trusted_radius_auth_secret | default('') | string | trim | length) > 0)
+      - not (openwrt_wifi_profiles_trusted_radius_enabled | default(false) | bool) or
+        ((openwrt_wifi_profiles_trusted_radius_acct_server | default('') | string | trim | length) > 0)
+      - not (openwrt_wifi_profiles_trusted_radius_enabled | default(false) | bool) or
+        ((openwrt_wifi_profiles_trusted_radius_acct_secret | default('') | string | trim | length) > 0)
+      - not (openwrt_wifi_profiles_admin_enabled | default(false) | bool) or
+        ((openwrt_wifi_profiles_admin_psk | default('') | string | trim | length) > 0)
+      - not (openwrt_wifi_profiles_admin_enabled | default(false) | bool) or
+        (openwrt_wifi_profiles_admin_on_2g | default(false) | bool) or
+        (openwrt_wifi_profiles_admin_on_5g | default(true) | bool)
+      - not (openwrt_wifi_profiles_iot_enabled | default(true) | bool) or
+        ((openwrt_wifi_profiles_iot_psk | default('') | string | trim | length) > 0)
+    fail_msg: >-
+      OpenWrt Wi-Fi profile inputs are incomplete or inconsistent. Check PSK
+      and RADIUS variables for the enabled SSIDs.
+
+- name: Build OpenWrt Wi-Fi network section names
+  ansible.builtin.set_fact:
+    openwrt_wifi_profiles_admin_network: >-
+      {{ openwrt_wifi_profiles_network_section_prefix }}_v{{ openwrt_wifi_profiles_admin_vlan_id }}
+    openwrt_wifi_profiles_users_network: >-
+      {{ openwrt_wifi_profiles_network_section_prefix }}_v{{ openwrt_wifi_profiles_users_vlan_id }}
+    openwrt_wifi_profiles_guest_network: >-
+      {{ openwrt_wifi_profiles_network_section_prefix }}_v{{ openwrt_wifi_profiles_guest_vlan_id }}
+
+- name: Build desired managed OpenWrt Wi-Fi profile plan
+  ansible.builtin.set_fact:
+    openwrt_wifi_profiles_plan: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- if openwrt_wifi_profiles_trusted_enabled | default(true) | bool -%}
+      {%-   set _ = ns.items.append({
+              'section_name': 'rtr_fabric_trusted_2g',
+              'device': openwrt_wifi_profiles_radio_2g,
+              'ssid': openwrt_wifi_profiles_trusted_ssid_2g,
+              'network': openwrt_wifi_profiles_users_network,
+              'encryption': openwrt_wifi_profiles_trusted_encryption,
+              'hidden': '1' if (openwrt_wifi_profiles_trusted_hidden | default(false) | bool) else '0',
+              'isolate': '0',
+              'ieee80211w': openwrt_wifi_profiles_trusted_ieee80211w | string,
+              'psk': openwrt_wifi_profiles_trusted_psk | default(''),
+              'radius_enabled': openwrt_wifi_profiles_trusted_radius_enabled | default(false) | bool,
+              'radius': {
+                'auth_server': openwrt_wifi_profiles_trusted_radius_auth_server | default(''),
+                'auth_port': openwrt_wifi_profiles_trusted_radius_auth_port | string,
+                'auth_secret': openwrt_wifi_profiles_trusted_radius_auth_secret | default(''),
+                'auth_server_2': openwrt_wifi_profiles_trusted_radius_auth_server_secondary | default(''),
+                'auth_port_2': openwrt_wifi_profiles_trusted_radius_auth_port_secondary | string,
+                'auth_secret_2': openwrt_wifi_profiles_trusted_radius_auth_secret_secondary | default(''),
+                'acct_server': openwrt_wifi_profiles_trusted_radius_acct_server | default(''),
+                'acct_port': openwrt_wifi_profiles_trusted_radius_acct_port | string,
+                'acct_secret': openwrt_wifi_profiles_trusted_radius_acct_secret | default(''),
+                'acct_server_2': openwrt_wifi_profiles_trusted_radius_acct_server_secondary | default(''),
+                'acct_port_2': openwrt_wifi_profiles_trusted_radius_acct_port_secondary | string,
+                'acct_secret_2': openwrt_wifi_profiles_trusted_radius_acct_secret_secondary | default('')
+              }
+            }) -%}
+      {%-   set _ = ns.items.append({
+              'section_name': 'rtr_fabric_trusted_5g',
+              'device': openwrt_wifi_profiles_radio_5g,
+              'ssid': openwrt_wifi_profiles_trusted_ssid_5g,
+              'network': openwrt_wifi_profiles_users_network,
+              'encryption': openwrt_wifi_profiles_trusted_encryption,
+              'hidden': '1' if (openwrt_wifi_profiles_trusted_hidden | default(false) | bool) else '0',
+              'isolate': '0',
+              'ieee80211w': openwrt_wifi_profiles_trusted_ieee80211w | string,
+              'psk': openwrt_wifi_profiles_trusted_psk | default(''),
+              'radius_enabled': openwrt_wifi_profiles_trusted_radius_enabled | default(false) | bool,
+              'radius': {
+                'auth_server': openwrt_wifi_profiles_trusted_radius_auth_server | default(''),
+                'auth_port': openwrt_wifi_profiles_trusted_radius_auth_port | string,
+                'auth_secret': openwrt_wifi_profiles_trusted_radius_auth_secret | default(''),
+                'auth_server_2': openwrt_wifi_profiles_trusted_radius_auth_server_secondary | default(''),
+                'auth_port_2': openwrt_wifi_profiles_trusted_radius_auth_port_secondary | string,
+                'auth_secret_2': openwrt_wifi_profiles_trusted_radius_auth_secret_secondary | default(''),
+                'acct_server': openwrt_wifi_profiles_trusted_radius_acct_server | default(''),
+                'acct_port': openwrt_wifi_profiles_trusted_radius_acct_port | string,
+                'acct_secret': openwrt_wifi_profiles_trusted_radius_acct_secret | default(''),
+                'acct_server_2': openwrt_wifi_profiles_trusted_radius_acct_server_secondary | default(''),
+                'acct_port_2': openwrt_wifi_profiles_trusted_radius_acct_port_secondary | string,
+                'acct_secret_2': openwrt_wifi_profiles_trusted_radius_acct_secret_secondary | default('')
+              }
+            }) -%}
+      {%- endif -%}
+      {%- if (openwrt_wifi_profiles_admin_enabled | default(false) | bool) and (openwrt_wifi_profiles_admin_on_2g | default(false) | bool) -%}
+      {%-   set _ = ns.items.append({
+              'section_name': 'rtr_fabric_admin_2g',
+              'device': openwrt_wifi_profiles_radio_2g,
+              'ssid': openwrt_wifi_profiles_admin_ssid_2g,
+              'network': openwrt_wifi_profiles_admin_network,
+              'encryption': openwrt_wifi_profiles_admin_encryption,
+              'hidden': '1' if (openwrt_wifi_profiles_admin_hidden | default(false) | bool) else '0',
+              'isolate': '0',
+              'ieee80211w': openwrt_wifi_profiles_admin_ieee80211w | string,
+              'psk': openwrt_wifi_profiles_admin_psk | default(''),
+              'radius_enabled': false,
+              'radius': {}
+            }) -%}
+      {%- endif -%}
+      {%- if (openwrt_wifi_profiles_admin_enabled | default(false) | bool) and (openwrt_wifi_profiles_admin_on_5g | default(true) | bool) -%}
+      {%-   set _ = ns.items.append({
+              'section_name': 'rtr_fabric_admin_5g',
+              'device': openwrt_wifi_profiles_radio_5g,
+              'ssid': openwrt_wifi_profiles_admin_ssid_5g,
+              'network': openwrt_wifi_profiles_admin_network,
+              'encryption': openwrt_wifi_profiles_admin_encryption,
+              'hidden': '1' if (openwrt_wifi_profiles_admin_hidden | default(false) | bool) else '0',
+              'isolate': '0',
+              'ieee80211w': openwrt_wifi_profiles_admin_ieee80211w | string,
+              'psk': openwrt_wifi_profiles_admin_psk | default(''),
+              'radius_enabled': false,
+              'radius': {}
+            }) -%}
+      {%- endif -%}
+      {%- if openwrt_wifi_profiles_iot_enabled | default(true) | bool -%}
+      {%-   set _ = ns.items.append({
+              'section_name': 'rtr_fabric_iot_2g',
+              'device': openwrt_wifi_profiles_radio_2g,
+              'ssid': openwrt_wifi_profiles_iot_ssid_2g,
+              'network': openwrt_wifi_profiles_guest_network,
+              'encryption': openwrt_wifi_profiles_iot_encryption,
+              'hidden': '1' if (openwrt_wifi_profiles_iot_hidden | default(false) | bool) else '0',
+              'isolate': '1' if (openwrt_wifi_profiles_iot_isolate_clients | default(true) | bool) else '0',
+              'ieee80211w': openwrt_wifi_profiles_iot_ieee80211w | string,
+              'psk': openwrt_wifi_profiles_iot_psk | default(''),
+              'radius_enabled': false,
+              'radius': {}
+            }) -%}
+      {%- endif -%}
+      {{ ns.items }}
+
+- name: Build absent OpenWrt Wi-Fi sections
+  ansible.builtin.set_fact:
+    openwrt_wifi_profiles_absent_sections: >-
+      {{
+        (
+          [
+            'rtr_fabric_trusted_2g',
+            'rtr_fabric_trusted_5g',
+            'rtr_fabric_admin_2g',
+            'rtr_fabric_admin_5g',
+            'rtr_fabric_iot_2g'
+          ]
+          | difference(
+              (openwrt_wifi_profiles_plan | default([]))
+              | map(attribute='section_name')
+              | list
+            )
+        )
+        + (openwrt_wifi_profiles_legacy_wifi_ifaces_absent | default([]))
+      }}
+
+- name: Show OpenWrt Wi-Fi dry-run plan
+  ansible.builtin.debug:
+    msg:
+      managed_sections: >-
+        {{
+          (openwrt_wifi_profiles_plan | default([]))
+          | map(attribute='section_name')
+          | list
+        }}
+      section_details: >-
+        {{
+          (openwrt_wifi_profiles_plan | default([]))
+          | map('combine', {'psk': '***'}, recursive=True)
+          | list
+        }}
+      absent_sections: "{{ openwrt_wifi_profiles_absent_sections | default([]) }}"
+      country: "{{ openwrt_wifi_profiles_country | default('') }}"
+  changed_when: false
+  when:
+    - openwrt_wifi_profiles_dry_run | default(true) | bool
+    - not (openwrt_wifi_profiles_force_apply | default(false) | bool)
+
+- name: Apply OpenWrt Wi-Fi profile configuration
+  when:
+    - not (openwrt_wifi_profiles_dry_run | default(true) | bool)
+      or (openwrt_wifi_profiles_force_apply | default(false) | bool)
+  block:
+    - name: Ensure configured radios are enabled
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          changed=0
+          for radio in {{ [openwrt_wifi_profiles_radio_2g, openwrt_wifi_profiles_radio_5g] | unique | join(' ') }}; do
+            current="$(uci -q get "wireless.${radio}.disabled" 2>/dev/null || echo 0)"
+            [ "${current}" = "0" ] || {
+              uci set "wireless.${radio}.disabled=0"
+              changed=1
+            }
+            {% if (openwrt_wifi_profiles_country | default('') | string | trim | length) > 0 %}
+            current="$(uci -q get "wireless.${radio}.country" 2>/dev/null || true)"
+            [ "${current}" = "{{ openwrt_wifi_profiles_country }}" ] || {
+              uci set "wireless.${radio}.country={{ openwrt_wifi_profiles_country }}"
+              changed=1
+            }
+            {% endif %}
+          done
+          [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_wifi_profiles_radios_result
+      changed_when: "'CHANGED' in (openwrt_wifi_profiles_radios_result.stdout | default(''))"
+
+    - name: Remove absent/legacy OpenWrt Wi-Fi iface sections
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          changed=0
+          for section in {{ (openwrt_wifi_profiles_absent_sections | default([]) | unique) | join(' ') }}; do
+            if uci -q show "wireless.${section}" >/dev/null 2>&1; then
+              uci -q delete "wireless.${section}" && changed=1 || true
+            fi
+          done
+          [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_wifi_profiles_remove_result
+      changed_when: "'CHANGED' in (openwrt_wifi_profiles_remove_result.stdout | default(''))"
+
+    - name: Ensure managed OpenWrt Wi-Fi iface sections exist and match desired state
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          changed=0
+          section="{{ item.section_name }}"
+          [ "$(uci -q show "wireless.${section}" 2>/dev/null | sed -n '1s/^wireless\.[^.]*=//p')" = "wifi-iface" ] || {
+            uci set "wireless.${section}=wifi-iface"
+            changed=1
+          }
+
+          ensure_opt() {
+            key="$1"
+            val="$2"
+            current="$(uci -q get "wireless.${section}.${key}" 2>/dev/null || true)"
+            [ "${current}" = "${val}" ] || {
+              uci set "wireless.${section}.${key}=${val}"
+              changed=1
+            }
+          }
+
+          drop_opt() {
+            key="$1"
+            if uci -q get "wireless.${section}.${key}" >/dev/null 2>&1; then
+              uci -q delete "wireless.${section}.${key}"
+              changed=1
+            fi
+          }
+
+          ensure_opt device '{{ item.device }}'
+          ensure_opt mode 'ap'
+          ensure_opt ssid '{{ item.ssid }}'
+          ensure_opt network '{{ item.network }}'
+          ensure_opt encryption '{{ item.encryption }}'
+          ensure_opt hidden '{{ item.hidden }}'
+          ensure_opt isolate '{{ item.isolate }}'
+          ensure_opt ieee80211w '{{ item.ieee80211w }}'
+          ensure_opt disabled '0'
+
+          {% if item.radius_enabled %}
+          ensure_opt ieee8021x '1'
+          ensure_opt auth_server '{{ item.radius.auth_server | default("") }}'
+          ensure_opt auth_port '{{ item.radius.auth_port | default("") }}'
+          ensure_opt auth_secret '{{ item.radius.auth_secret | default("") }}'
+          {% if (item.radius.auth_server_2 | default('') | string | trim | length) > 0 %}
+          ensure_opt auth_server_2 '{{ item.radius.auth_server_2 }}'
+          ensure_opt auth_port_2 '{{ item.radius.auth_port_2 | default("") }}'
+          ensure_opt auth_secret_2 '{{ item.radius.auth_secret_2 | default("") }}'
+          {% else %}
+          drop_opt auth_server_2
+          drop_opt auth_port_2
+          drop_opt auth_secret_2
+          {% endif %}
+          ensure_opt acct_server '{{ item.radius.acct_server | default("") }}'
+          ensure_opt acct_port '{{ item.radius.acct_port | default("") }}'
+          ensure_opt acct_secret '{{ item.radius.acct_secret | default("") }}'
+          {% if (item.radius.acct_server_2 | default('') | string | trim | length) > 0 %}
+          ensure_opt acct_server_2 '{{ item.radius.acct_server_2 }}'
+          ensure_opt acct_port_2 '{{ item.radius.acct_port_2 | default("") }}'
+          ensure_opt acct_secret_2 '{{ item.radius.acct_secret_2 | default("") }}'
+          {% else %}
+          drop_opt acct_server_2
+          drop_opt acct_port_2
+          drop_opt acct_secret_2
+          {% endif %}
+          drop_opt key
+          {% else %}
+          drop_opt ieee8021x
+          drop_opt auth_server
+          drop_opt auth_port
+          drop_opt auth_secret
+          drop_opt auth_server_2
+          drop_opt auth_port_2
+          drop_opt auth_secret_2
+          drop_opt acct_server
+          drop_opt acct_port
+          drop_opt acct_secret
+          drop_opt acct_server_2
+          drop_opt acct_port_2
+          drop_opt acct_secret_2
+          ensure_opt key '{{ item.psk | default("") }}'
+          {% endif %}
+
+          [ "$changed" -eq 1 ] && echo CHANGED || true
+      loop: "{{ openwrt_wifi_profiles_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.section_name }}"
+      register: openwrt_wifi_profiles_sections_result
+      changed_when: "'CHANGED' in (stdout | default(''))"
+      no_log: true
+
+    - name: Check pending OpenWrt wireless UCI changes
+      community.openwrt.uci:
+        command: changes
+        config: wireless
+      register: openwrt_wifi_profiles_wireless_changes
+      changed_when: false
+
+    - name: Commit OpenWrt wireless UCI changes
+      community.openwrt.uci:
+        command: commit
+        config: wireless
+      when: (openwrt_wifi_profiles_wireless_changes.result | default('') | trim | length) > 0
+
+    - name: Restart wpad when wireless configuration changed
+      community.openwrt.command:
+        cmd: /etc/init.d/wpad restart
+      changed_when: true
+      when: (openwrt_wifi_profiles_wireless_changes.result | default('') | trim | length) > 0
+
+    - name: Reload Wi-Fi when wireless configuration changed
+      community.openwrt.command:
+        cmd: wifi reload
+      changed_when: true
+      when: (openwrt_wifi_profiles_wireless_changes.result | default('') | trim | length) > 0

@@ -1,0 +1,16 @@
+---
+security_agent_supported_actions:
+  - audit_security
+  - harden_ssh
+  - configure_ssh
+  - configure_firewall
+  - update_firewall_rules
+  - list_firewall_rules
+  - apply_security_baseline
+  - audit_apparmor
+  - configure_openwrt_security
+  - update_openwrt_firewall
+
+security_agent_ssh_dropin_path: /etc/ssh/sshd_config.d/99-rtr-fabric.conf
+security_agent_ssh_allow_users:
+  - "{{ security_agent_ssh_user | default('admin') }}"

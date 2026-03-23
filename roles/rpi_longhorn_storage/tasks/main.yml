@@ -1,0 +1,266 @@
+---
+- name: Validate rpi_longhorn_storage inputs
+  ansible.builtin.assert:
+    that:
+      - rpi_longhorn_storage_enabled | bool
+      - (rpi_longhorn_storage_disks | default([]) | length) >= 1
+      - rpi_longhorn_storage_confirmation == rpi_longhorn_storage_confirmation_token
+      - rpi_longhorn_storage_filesystem in ['ext4', 'xfs']
+      - rpi_longhorn_storage_base_dir | string | trim | length > 0
+      - item.device | string | trim | length > 0
+      - item.mountpoint | string | trim | length > 0
+      - item.mountpoint is match('^' ~ (rpi_longhorn_storage_base_dir | regex_escape()) ~ '(/|$)')
+      - item.label | default('') | string | trim | length > 0
+      - item.tags | default([]) is iterable
+    fail_msg: >-
+      rpi_longhorn_storage requires explicit disk objects, mountpoints under
+      {{ rpi_longhorn_storage_base_dir }}, labels, and the confirmation token
+      {{ rpi_longhorn_storage_confirmation_token }}.
+  loop: "{{ rpi_longhorn_storage_disks }}"
+  loop_control:
+    label: "{{ item.device | default('missing-device') }}"
+
+- name: Ensure Longhorn storage prerequisite packages are installed
+  ansible.builtin.apt:
+    name: "{{ rpi_longhorn_storage_required_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure Longhorn storage base directory exists
+  ansible.builtin.file:
+    path: "{{ rpi_longhorn_storage_base_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Validate Longhorn disk source devices exist
+  ansible.builtin.stat:
+    path: "{{ item.device }}"
+  loop: "{{ rpi_longhorn_storage_disks }}"
+  loop_control:
+    label: "{{ item.device }}"
+  register: rpi_longhorn_storage_device_stats
+  changed_when: false
+
+- name: Assert Longhorn disk source devices are present
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.islnk or item.stat.isblk
+    fail_msg: "Longhorn disk source is missing: {{ item.item.device }}"
+  loop: "{{ rpi_longhorn_storage_device_stats.results }}"
+  loop_control:
+    label: "{{ item.item.device }}"
+
+- name: Probe Longhorn partition paths
+  ansible.builtin.stat:
+    path: "{{ item.device }}{{ rpi_longhorn_storage_partition_suffix }}"
+  loop: "{{ rpi_longhorn_storage_disks }}"
+  loop_control:
+    label: "{{ item.device }}{{ rpi_longhorn_storage_partition_suffix }}"
+  register: rpi_longhorn_storage_partition_path_stats
+  changed_when: false
+
+- name: Probe current Longhorn filesystem metadata
+  ansible.builtin.command:
+    argv:
+      - blkid
+      - -o
+      - export
+      - "{{ item.device }}{{ rpi_longhorn_storage_partition_suffix }}"
+  loop: "{{ rpi_longhorn_storage_disks }}"
+  loop_control:
+    label: "{{ item.device }}{{ rpi_longhorn_storage_partition_suffix }}"
+  register: rpi_longhorn_storage_blkid_exports
+  failed_when: false
+  changed_when: false
+
+- name: Probe current Longhorn mount state
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - -n
+      - -o
+      - SOURCE
+      - --target
+      - "{{ item.mountpoint }}"
+  loop: "{{ rpi_longhorn_storage_disks }}"
+  loop_control:
+    label: "{{ item.mountpoint }}"
+  register: rpi_longhorn_storage_mount_sources
+  failed_when: false
+  changed_when: false
+
+- name: Build effective Longhorn disk plan
+  ansible.builtin.set_fact:
+    rpi_longhorn_storage_disk_plan: "{{ rpi_longhorn_storage_disk_plan | default([]) + [disk_plan] }}"
+  loop: "{{ range(0, rpi_longhorn_storage_disks | length) | list }}"
+  loop_control:
+    label: "{{ rpi_longhorn_storage_disks[item].device }}"
+  vars:
+    disk_item: "{{ rpi_longhorn_storage_disks[item] }}"
+    partition_stat: "{{ rpi_longhorn_storage_partition_path_stats.results[item] }}"
+    blkid_export: "{{ rpi_longhorn_storage_blkid_exports.results[item] }}"
+    mount_source: "{{ rpi_longhorn_storage_mount_sources.results[item] }}"
+    blkid_map: >-
+      {{
+        dict(
+          (blkid_export.stdout_lines | default([]))
+          | select('search', '=')
+          | map('split', '=', 1)
+        )
+      }}
+    disk_plan:
+      device: "{{ disk_item.device }}"
+      partition: "{{ disk_item.device }}{{ rpi_longhorn_storage_partition_suffix }}"
+      mountpoint: "{{ disk_item.mountpoint }}"
+      label: "{{ disk_item.label }}"
+      tags: "{{ disk_item.tags | default([]) }}"
+      storage_reserved: "{{ disk_item.storage_reserved | default(0) | int }}"
+      partition_exists: "{{ partition_stat.stat.exists | default(false) | bool }}"
+      blkid_rc: "{{ blkid_export.rc | default(1) | int }}"
+      current_fs_type: "{{ blkid_map.TYPE | default('') }}"
+      current_label: "{{ blkid_map.LABEL | default('') }}"
+      current_uuid: "{{ blkid_map.UUID | default('') }}"
+      mounted: "{{ (mount_source.rc | default(1) | int) == 0 }}"
+      mount_source: "{{ mount_source.stdout | default('') | trim }}"
+      prepared: >-
+        {{
+          (partition_stat.stat.exists | default(false) | bool)
+          and ((blkid_export.rc | default(1) | int) == 0)
+          and ((blkid_map.TYPE | default('')) == rpi_longhorn_storage_filesystem)
+          and ((blkid_map.LABEL | default('')) == disk_item.label)
+          and ((mount_source.rc | default(1) | int) == 0)
+        }}
+  changed_when: false
+
+- name: Wipe existing signatures on Longhorn disks
+  ansible.builtin.command:
+    argv:
+      - wipefs
+      - --all
+      - --force
+      - "{{ item.device }}"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.device }}"
+  when:
+    - rpi_longhorn_storage_wipe_existing_signatures | bool
+    - not (item.prepared | bool)
+
+- name: Create GPT partition table on Longhorn disks
+  ansible.builtin.command:
+    argv:
+      - parted
+      - --script
+      - "{{ item.device }}"
+      - mklabel
+      - "{{ rpi_longhorn_storage_partition_label }}"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.device }}"
+  when: not (item.prepared | bool)
+
+- name: Create single Longhorn data partition on each disk
+  ansible.builtin.command:
+    argv:
+      - parted
+      - --script
+      - --align
+      - optimal
+      - "{{ item.device }}"
+      - mkpart
+      - primary
+      - "{{ rpi_longhorn_storage_partition_start }}"
+      - "{{ rpi_longhorn_storage_partition_end }}"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.device }}"
+  when: not (item.prepared | bool)
+
+- name: Trigger kernel partition table reload
+  ansible.builtin.command:
+    argv:
+      - partprobe
+      - "{{ item.device }}"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.device }}"
+  when: not (item.prepared | bool)
+  changed_when: false
+
+- name: Wait for Longhorn disk partitions to appear
+  ansible.builtin.stat:
+    path: "{{ item.partition }}"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.partition }}"
+  register: rpi_longhorn_storage_partition_stats
+  retries: 10
+  delay: 2
+  until: rpi_longhorn_storage_partition_stats.stat.exists
+  changed_when: false
+  when: not (item.prepared | bool)
+
+- name: Create filesystem on Longhorn disk partitions
+  ansible.builtin.command:
+    argv:
+      - "mkfs.{{ rpi_longhorn_storage_filesystem }}"
+      - -F
+      - -L
+      - "{{ item.label }}"
+      - "{{ item.partition }}"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.label }}"
+  when: not (item.prepared | bool)
+
+- name: Ensure Longhorn mountpoint directories exist
+  ansible.builtin.file:
+    path: "{{ item.mountpoint }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.mountpoint }}"
+
+- name: Read filesystem UUIDs for Longhorn disk partitions
+  ansible.builtin.command:
+    argv:
+      - blkid
+      - -s
+      - UUID
+      - -o
+      - value
+      - "{{ item.partition }}"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.partition }}"
+  register: rpi_longhorn_storage_partition_uuids
+  changed_when: false
+
+- name: Mount Longhorn disk partitions persistently
+  ansible.posix.mount:
+    path: "{{ item.item.mountpoint }}"
+    src: "UUID={{ item.stdout | trim }}"
+    fstype: "{{ rpi_longhorn_storage_filesystem }}"
+    opts: "{{ rpi_longhorn_storage_mount_options }}"
+    state: mounted
+  loop: "{{ rpi_longhorn_storage_partition_uuids.results }}"
+  loop_control:
+    label: "{{ item.item.mountpoint }}"
+
+- name: Ensure mounted Longhorn disks contain the marker directory
+  ansible.builtin.file:
+    path: "{{ item.mountpoint }}/longhorn-disk.cfg"
+    state: touch
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ rpi_longhorn_storage_disk_plan }}"
+  loop_control:
+    label: "{{ item.mountpoint }}/longhorn-disk.cfg"

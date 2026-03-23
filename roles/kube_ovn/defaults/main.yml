@@ -1,0 +1,28 @@
+---
+kube_ovn_namespace: kube-system
+kube_ovn_kubectl_bin: kubectl
+kube_ovn_controller_deployment_name: kube-ovn-controller
+kube_ovn_controller_container_name: kube-ovn-controller
+kube_ovn_cni_daemonset_name: kube-ovn-cni
+kube_ovn_cni_container_name: cni-server
+kube_ovn_ovs_daemonset_name: ovs-ovn
+kube_ovn_ovs_container_name: openvswitch
+kube_ovn_rollout_timeout: 600s
+kube_ovn_expected_daemonsets:
+  - kube-ovn-cni
+  - ovs-ovn
+kube_ovn_expected_deployments:
+  - kube-ovn-controller
+  - kube-ovn-monitor
+  - ovn-central
+# Raspberry Pi workers are sensitive to aggressive ovs-vsctl fan-out and short
+# probe deadlines. Keep CNI responsive by reducing concurrency and extending
+# probe tolerance for transient API/control-plane stalls.
+kube_ovn_cni_ovs_vsctl_concurrency: 40
+kube_ovn_cni_liveness_initial_delay_seconds: 60
+kube_ovn_cni_liveness_period_seconds: 7
+kube_ovn_cni_liveness_timeout_seconds: 10
+kube_ovn_cni_liveness_failure_threshold: 6
+kube_ovn_cni_readiness_period_seconds: 7
+kube_ovn_cni_readiness_timeout_seconds: 10
+kube_ovn_cni_readiness_failure_threshold: 6

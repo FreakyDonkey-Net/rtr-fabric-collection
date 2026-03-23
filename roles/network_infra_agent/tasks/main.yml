@@ -1,0 +1,93 @@
+---
+- name: Validate requested network infrastructure action
+  ansible.builtin.assert:
+    that:
+      - network_infra_agent_action in network_infra_agent_supported_actions
+    fail_msg: >-
+      Unsupported network_infra_agent_action='{{ network_infra_agent_action }}'.
+      Supported actions: {{ network_infra_agent_supported_actions | join(', ') }}
+
+- name: Build SSOT VLAN plan for current host site
+  ansible.builtin.set_fact:
+    network_infra_agent_site_name_effective: "{{ site_name | default(openwrt_site_key | default('n/a')) }}"
+    network_infra_agent_site_vlans: >-
+      {{
+        (
+          site_vlans
+          if (site_vlans is defined)
+          else (
+            sites
+            | default({})
+          ).get(site_name | default(openwrt_site_key | default('')), {}).get('vlans', {})
+        )
+      }}
+  changed_when: false
+
+- name: Collect VLAN interfaces
+  ansible.builtin.command:
+    cmd: ip -d -o link show type vlan
+  register: network_infra_agent_vlan_links
+  changed_when: false
+  failed_when: false
+
+- name: Collect interface summary
+  ansible.builtin.command:
+    cmd: ip -br link
+  register: network_infra_agent_ifaces
+  changed_when: false
+
+- name: Collect route summary
+  ansible.builtin.command:
+    cmd: ip route show
+  register: network_infra_agent_routes
+  changed_when: false
+
+- name: Require connectivity targets when requested
+  ansible.builtin.assert:
+    that:
+      - (network_infra_agent_ping_targets | default([]) | length) > 0
+    fail_msg: "network_infra_agent_ping_targets must be provided for verify_connectivity."
+  when: network_infra_agent_action == "verify_connectivity"
+
+- name: Run connectivity checks
+  ansible.builtin.command:
+    cmd: "ping -c {{ network_infra_agent_ping_count }} -W 2 {{ item }}"
+  register: network_infra_agent_ping_results
+  changed_when: false
+  loop: "{{ network_infra_agent_ping_targets | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: network_infra_agent_action == "verify_connectivity"
+
+- name: Assert interfaces are present for current SSOT site
+  ansible.builtin.assert:
+    that:
+      - (network_infra_agent_ifaces.stdout | default('')) | length > 0
+      - (network_infra_agent_site_vlans | default({}) | length) == 0 or (network_infra_agent_vlan_links.stdout | default('')) | length > 0
+    fail_msg: >-
+      Interface verification failed on {{ inventory_hostname }}.
+      Expected VLAN-aware interfaces for site {{ network_infra_agent_site_name_effective }}.
+  when: network_infra_agent_action == "verify_interfaces"
+
+- name: Show SSOT and runtime VLAN view
+  ansible.builtin.debug:
+    msg:
+      site_name: "{{ network_infra_agent_site_name_effective }}"
+      ssot_vlans: "{{ network_infra_agent_site_vlans }}"
+      runtime_vlan_links: "{{ network_infra_agent_vlan_links.stdout_lines | default([]) }}"
+  when: network_infra_agent_action == "list_vlans"
+
+- name: Show interface summary
+  ansible.builtin.debug:
+    msg: "{{ network_infra_agent_ifaces.stdout_lines }}"
+  when: network_infra_agent_action == "verify_interfaces"
+
+- name: Show route summary
+  ansible.builtin.debug:
+    msg: "{{ network_infra_agent_routes.stdout_lines }}"
+  when: network_infra_agent_action == "list_routes"
+
+- name: Show connectivity results
+  ansible.builtin.debug:
+    msg: "{{ network_infra_agent_ping_results.results | map(attribute='stdout') | list }}"
+  when: network_infra_agent_action == "verify_connectivity"

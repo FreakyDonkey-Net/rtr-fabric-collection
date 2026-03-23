@@ -1,0 +1,1669 @@
+- name: Resolve effective OpenBao LDAP bind password
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_ldap_bindpass_effective: >-
+      {{
+        [
+          k8s_openbao_runtime_ldap_bindpass | default('', true) | string | trim,
+          lookup('ansible.builtin.file', inventory_dir ~ '/.secrets/ldap-admin-password', errors='ignore') | default('', true) | string | trim,
+          vault_k8s_network_services_ldap_admin_password | default('', true) | string | trim
+        ]
+        | reject('equalto', '')
+        | first
+        | default('')
+      }}
+  no_log: true
+  changed_when: false
+  when: k8s_openbao_runtime_ldap_auth_enabled | bool
+
+- name: Derive OpenBao runtime context
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_is_dev: "{{ (k8s_openbao_runtime_mode | string | lower) == 'dev' }}"
+    k8s_openbao_runtime_is_raft: "{{ (k8s_openbao_runtime_mode | string | lower) == 'raft' }}"
+    k8s_openbao_runtime_manifest_rollout_kind: "{{ 'statefulset' if ((k8s_openbao_runtime_mode | string | lower) == 'raft') else 'deployment' }}"
+    k8s_openbao_runtime_manifest_rollout_name: "{{ k8s_openbao_runtime_service_name }}"
+    k8s_openbao_runtime_legacy_deployment_name: "{{ k8s_openbao_runtime_service_name }}"
+    k8s_openbao_runtime_statefulset_name: "{{ k8s_openbao_runtime_service_name }}"
+    k8s_openbao_runtime_primary_pod: "{{ k8s_openbao_runtime_service_name }}-0"
+    k8s_openbao_runtime_secret_dir: "{{ k8s_openbao_runtime_root_token_file | dirname }}"
+    k8s_openbao_runtime_management_port_forward_target: >-
+      {{
+        (
+          'pod/' ~ k8s_openbao_runtime_service_name ~ '-0'
+        )
+        if ((k8s_openbao_runtime_mode | string | lower) == 'raft')
+        else (
+          'service/' ~ k8s_openbao_runtime_service_name
+        )
+      }}
+    k8s_openbao_runtime_openbao_url_scheme: >-
+      {{
+        openbao_url
+        | ansible.builtin.urlsplit('scheme')
+        | default('', true)
+        | string
+        | lower
+      }}
+    k8s_openbao_runtime_ldap_url_scheme: >-
+      {{
+        k8s_openbao_runtime_ldap_url
+        | ansible.builtin.urlsplit('scheme')
+        | default('', true)
+        | string
+        | lower
+      }}
+    k8s_openbao_runtime_pod_names: >-
+      {{
+        query(
+          'ansible.builtin.sequence',
+          'start=0 count=' ~ (k8s_openbao_runtime_replicas | int) ~
+          ' format=' ~ k8s_openbao_runtime_service_name ~ '-%d'
+        )
+      }}
+  changed_when: false
+
+- name: Validate OpenBao runtime inputs
+  ansible.builtin.assert:
+    that:
+      - k8s_openbao_runtime_namespace | string | length > 0
+      - k8s_openbao_runtime_image | string | length > 0
+      - (k8s_openbao_runtime_mode | string | lower) in ['dev', 'raft']
+      - not (k8s_openbao_runtime_is_dev | bool) or (k8s_openbao_runtime_node_name | string | length) > 0
+      - not (k8s_openbao_runtime_is_dev | bool) or (k8s_openbao_runtime_bind_address | string | length) > 0
+      - k8s_openbao_runtime_kubectl_bin | string | length > 0
+      - openbao_url | string | length > 0
+      - >-
+        not (rtr_fabric_is_prod | default(false) | bool)
+        or (k8s_openbao_runtime_allow_prod | bool)
+      - not (rtr_fabric_is_prod | default(false) | bool) or (k8s_openbao_runtime_is_raft | bool)
+      - >-
+        not (k8s_openbao_runtime_is_raft | bool)
+        or (
+          (k8s_openbao_runtime_replicas | int) >= 3
+          or (
+            (k8s_openbao_runtime_allow_single_node_prod | bool)
+            and ((k8s_openbao_runtime_replicas | int) == 1)
+          )
+        )
+      - >-
+        not (k8s_openbao_runtime_is_raft | bool)
+        or (k8s_openbao_runtime_raft_node_names | default([]) | length) >= (k8s_openbao_runtime_replicas | int)
+      - >-
+        not (k8s_openbao_runtime_is_raft | bool)
+        or (k8s_openbao_runtime_storage_class | string | trim | length) > 0
+      - >-
+        not (k8s_openbao_runtime_is_raft | bool)
+        or (k8s_openbao_runtime_data_size | string | trim | length) > 0
+      - >-
+        not (k8s_openbao_runtime_is_raft | bool)
+        or not (k8s_openbao_runtime_host_network | bool)
+        or (k8s_openbao_runtime_api_addr | string | trim | length) > 0
+      - k8s_openbao_runtime_openbao_url_scheme in ['http', 'https']
+      - >-
+        not (openbao_validate_certs | bool)
+        or (k8s_openbao_runtime_openbao_url_scheme == 'https')
+      - >-
+        (k8s_openbao_runtime_image_allow_latest | bool)
+        or not (
+          (k8s_openbao_runtime_image | string | trim)
+          is match('^.+:latest(?:@sha256:[0-9a-f]{64})?$')
+        )
+      - >-
+        not (k8s_openbao_runtime_https_ingress_enabled | bool)
+        or (k8s_openbao_runtime_https_hostname | string | trim | length) > 0
+      - >-
+        not (k8s_openbao_runtime_https_ingress_enabled | bool)
+        or (k8s_openbao_runtime_https_ingress_class_name | string | trim | length) > 0
+      - >-
+        not (k8s_openbao_runtime_https_ingress_enabled | bool)
+        or not (k8s_openbao_runtime_https_tls_enabled | bool)
+        or (k8s_openbao_runtime_https_tls_secret_name | string | trim | length) > 0
+      - >-
+        not (k8s_openbao_runtime_https_ingress_enabled | bool)
+        or not (k8s_openbao_runtime_https_tls_enabled | bool)
+        or (k8s_openbao_runtime_https_clusterissuer_name | string | trim | length) > 0
+      - >-
+        not (k8s_openbao_runtime_ldap_auth_enabled | bool)
+        or (k8s_network_services_ldap_enabled | bool)
+      - >-
+        not (k8s_openbao_runtime_ldap_auth_enabled | bool)
+        or (k8s_openbao_runtime_ldap_bindpass_effective | default('') | string | trim | length) > 0
+      - >-
+        not (k8s_openbao_runtime_ldap_auth_enabled | bool)
+        or (k8s_network_services_ldap_seed_users | length) > 0
+      - >-
+        not (k8s_openbao_runtime_ldap_auth_enabled | bool)
+        or k8s_openbao_runtime_ldap_url_scheme in ['ldap', 'ldaps']
+      - >-
+        not (
+          (k8s_openbao_runtime_ldap_url_scheme == 'ldaps')
+          and (k8s_openbao_runtime_ldap_starttls | bool)
+        )
+      - >-
+        not (
+          (rtr_fabric_is_prod | default(false) | bool)
+          and (k8s_openbao_runtime_ldap_auth_enabled | bool)
+        )
+        or (
+          (
+            (k8s_openbao_runtime_ldap_url_scheme == 'ldaps')
+            and not (k8s_openbao_runtime_ldap_insecure_tls | bool)
+          )
+          or (
+            (k8s_openbao_runtime_ldap_url_scheme == 'ldap')
+            and (k8s_openbao_runtime_ldap_starttls | bool)
+            and not (k8s_openbao_runtime_ldap_insecure_tls | bool)
+          )
+        )
+
+- name: Ensure local OpenBao secret directory exists
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ k8s_openbao_runtime_secret_dir }}"
+    - "{{ k8s_openbao_runtime_init_file | dirname }}"
+    - "{{ openbao_approle_role_id_file | dirname }}"
+    - "{{ openbao_approle_secret_id_file | dirname }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+
+- name: Ensure local OpenBao root token file exists in dev mode
+  ansible.builtin.copy:
+    dest: "{{ k8s_openbao_runtime_root_token_file }}"
+    content: "{{ lookup('ansible.builtin.password', '/dev/null length=48 chars=hexdigits') }}"
+    mode: "0600"
+    force: false
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  no_log: true
+  when: k8s_openbao_runtime_is_dev | bool
+
+- name: Load OpenBao root token from local file in dev mode
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_root_token_effective: >-
+      {{
+        lookup('ansible.builtin.file', k8s_openbao_runtime_root_token_file)
+        | string
+        | trim
+      }}
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  no_log: true
+  when: k8s_openbao_runtime_is_dev | bool
+
+- name: Build OpenBao seed payload for net-services
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_net_services: |
+      {%- set ns = namespace(payload={}) -%}
+      {%- if (k8s_network_services_radius_openwrt_client_secret | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'radius_openwrt_client_secret': k8s_network_services_radius_openwrt_client_secret}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_radius_users | default([]) | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'radius_users': k8s_network_services_radius_users}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_radius_tls_server_pem | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'radius_tls_server_pem': k8s_network_services_radius_tls_server_pem}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_radius_tls_ca_pem | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'radius_tls_ca_pem': k8s_network_services_radius_tls_ca_pem}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_ldap_admin_password | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ldap_admin_password': k8s_network_services_ldap_admin_password}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_ldap_seed_users | default([]) | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ldap_seed_users': k8s_network_services_ldap_seed_users}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_ldap_seed_groups | default([]) | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ldap_seed_groups': k8s_network_services_ldap_seed_groups}) -%}
+      {%- endif -%}
+      {{ ns.payload }}
+  when: k8s_openbao_runtime_seed_net_services | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for OpenWrt Wi-Fi
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_openwrt_wifi_edge_pre: |
+      {%- set ns = namespace(payload={}) -%}
+      {%- set wifi_source_host = k8s_openbao_runtime_openwrt_wifi_source_host | string | trim -%}
+      {%- set wifi_source = hostvars[wifi_source_host] | default({}) -%}
+      {%- set admin_psk = [
+            wifi_source.vault_openwrt_wifi_admin_psk | default('', true) | string | trim,
+            wifi_source.openwrt_wifi_profiles_admin_psk_seed | default('', true) | string | trim
+          ]
+          | reject('equalto', '')
+          | first
+          | default('')
+      -%}
+      {%- set trusted_psk = [
+            wifi_source.vault_openwrt_wifi_trusted_psk | default('', true) | string | trim,
+            wifi_source.openwrt_wifi_profiles_trusted_psk_seed | default('', true) | string | trim
+          ]
+          | reject('equalto', '')
+          | first
+          | default('')
+      -%}
+      {%- set iot_psk = [
+            wifi_source.vault_openwrt_wifi_iot_psk | default('', true) | string | trim,
+            wifi_source.openwrt_wifi_profiles_iot_psk_seed | default('', true) | string | trim
+          ]
+          | reject('equalto', '')
+          | first
+          | default('')
+      -%}
+      {%- if admin_psk | length > 0 -%}
+      {%-   set _ = ns.payload.update({'admin_psk': admin_psk}) -%}
+      {%- endif -%}
+      {%- if trusted_psk | length > 0 -%}
+      {%-   set _ = ns.payload.update({'trusted_psk': trusted_psk}) -%}
+      {%- endif -%}
+      {%- if iot_psk | length > 0 -%}
+      {%-   set _ = ns.payload.update({'iot_psk': iot_psk}) -%}
+      {%- endif -%}
+      {{ ns.payload }}
+  when: k8s_openbao_runtime_seed_openwrt_wifi_edge_pre | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for ACME
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_acme: |
+      {%- set ns = namespace(payload={}) -%}
+      {%- if (vault_cloudflare_api_token | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'cloudflare_api_token': vault_cloudflare_api_token}) -%}
+      {%- endif -%}
+      {%- if (vault_acme_email | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'acme_email': vault_acme_email}) -%}
+      {%- endif -%}
+      {{ ns.payload }}
+  when: k8s_openbao_runtime_seed_acme | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for CA
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_ca: |
+      {%- set ns = namespace(payload={}) -%}
+      {%- if (k8s_network_services_ca_config_json | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ca_config_json': k8s_network_services_ca_config_json}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_ca_defaults_json | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ca_defaults_json': k8s_network_services_ca_defaults_json}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_ca_password | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ca_password': k8s_network_services_ca_password}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_ca_root_crt_pem | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ca_root_crt_pem': k8s_network_services_ca_root_crt_pem}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_ca_intermediate_crt_pem | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ca_intermediate_crt_pem': k8s_network_services_ca_intermediate_crt_pem}) -%}
+      {%- endif -%}
+      {%- if (k8s_network_services_ca_intermediate_key_pem | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'ca_intermediate_key_pem': k8s_network_services_ca_intermediate_key_pem}) -%}
+      {%- endif -%}
+      {{ ns.payload }}
+  when: k8s_openbao_runtime_seed_ca | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for etcd offsite credentials
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_ops_etcd_offsite: |
+      {%- set ns = namespace(payload={}) -%}
+      {%- if (vault_k3s_etcd_snapshot_offsite_r2_access_key_id | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'r2_access_key_id': vault_k3s_etcd_snapshot_offsite_r2_access_key_id}) -%}
+      {%- endif -%}
+      {%- if (vault_k3s_etcd_snapshot_offsite_r2_secret_access_key | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'r2_secret_access_key': vault_k3s_etcd_snapshot_offsite_r2_secret_access_key}) -%}
+      {%- endif -%}
+      {%- if (vault_k3s_etcd_snapshot_offsite_b2_access_key_id | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'b2_access_key_id': vault_k3s_etcd_snapshot_offsite_b2_access_key_id}) -%}
+      {%- endif -%}
+      {%- if (vault_k3s_etcd_snapshot_offsite_b2_secret_access_key | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'b2_secret_access_key': vault_k3s_etcd_snapshot_offsite_b2_secret_access_key}) -%}
+      {%- endif -%}
+      {{ ns.payload }}
+  when: k8s_openbao_runtime_seed_ops_etcd_offsite | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for GitHub Actions runner credentials
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_github_actions_runner: |
+      {%- set ns = namespace(payload={}) -%}
+      {%- set github_token = [
+            lookup('ansible.builtin.env', 'RTR_FABRIC_GITHUB_RUNNER_TOKEN') | default('', true) | string | trim,
+            lookup('ansible.builtin.file', inventory_dir ~ '/.secrets/github-actions-runner-token', errors='ignore') | default('', true) | string | trim,
+            vault_github_actions_runner_token | default('', true) | string | trim
+          ]
+          | reject('equalto', '')
+          | first
+          | default('')
+      -%}
+      {%- set role_repos_read_token = [
+            lookup('ansible.builtin.env', 'ROLE_REPOS_READ_TOKEN') | default('', true) | string | trim,
+            lookup('ansible.builtin.file', inventory_dir ~ '/.secrets/role-repos-read-token', errors='ignore') | default('', true) | string | trim,
+            vault_role_repos_read_token | default('', true) | string | trim,
+            github_token
+          ]
+          | reject('equalto', '')
+          | first
+          | default('')
+      -%}
+      {%- set repo_split_push_token = [
+            lookup('ansible.builtin.env', 'REPO_SPLIT_PUSH_TOKEN') | default('', true) | string | trim,
+            lookup('ansible.builtin.file', inventory_dir ~ '/.secrets/repo-split-push-token', errors='ignore') | default('', true) | string | trim,
+            vault_repo_split_push_token | default('', true) | string | trim
+          ]
+          | reject('equalto', '')
+          | first
+          | default('')
+      -%}
+      {%- if (github_token | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'github_auth_token': github_token}) -%}
+      {%- endif -%}
+      {%- if (role_repos_read_token | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'role_repos_read_token': role_repos_read_token}) -%}
+      {%- endif -%}
+      {%- if (repo_split_push_token | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'repo_split_push_token': repo_split_push_token}) -%}
+      {%- endif -%}
+      {{ ns.payload }}
+  when: k8s_openbao_runtime_seed_github_actions_runner | bool
+  no_log: true
+  changed_when: false
+
+- name: Resolve effective OpenBao BGP neighbor password seed input
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_bgp_neighbor_password_effective: >-
+      {{
+        [
+          vault_bgp_evpn_neighbor_password | default('', true) | string | trim,
+          lookup('ansible.builtin.file', k8s_openbao_runtime_bgp_neighbor_password_file, errors='ignore') | default('', true) | string | trim
+        ]
+        | reject('equalto', '')
+        | first
+        | default('')
+      }}
+  when: k8s_openbao_runtime_seed_bgp | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for BGP credentials
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_bgp: >-
+      {{
+        {
+          'neighbor_password': k8s_openbao_runtime_bgp_neighbor_password_effective
+        }
+        if (k8s_openbao_runtime_bgp_neighbor_password_effective | default('') | string | trim | length) > 0
+        else {}
+      }}
+  when: k8s_openbao_runtime_seed_bgp | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for monitoring credentials
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_monitoring: |
+      {%- set ns = namespace(payload={}) -%}
+      {%- if (k8s_monitoring_grafana_admin_password | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'grafana_admin_password': k8s_monitoring_grafana_admin_password}) -%}
+      {%- endif -%}
+      {%- if (k8s_monitoring_alerts_webhook_url | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'alerts_webhook_url': k8s_monitoring_alerts_webhook_url}) -%}
+      {%- endif -%}
+      {{ ns.payload }}
+  when: k8s_openbao_runtime_seed_monitoring | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for internal Keycloak credentials
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_auth_keycloak: |
+      {%- set ns = namespace(payload={}) -%}
+      {%- if (k8s_keycloak_admin_password | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'keycloak_admin_password': k8s_keycloak_admin_password}) -%}
+      {%- endif -%}
+      {%- if (k8s_keycloak_db_password | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'keycloak_db_password': k8s_keycloak_db_password}) -%}
+      {%- endif -%}
+      {%- if (k8s_keycloak_oauth2_client_secret | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'oauth2_proxy_client_secret': k8s_keycloak_oauth2_client_secret}) -%}
+      {%- endif -%}
+      {%- if (k8s_keycloak_oauth2_proxy_cookie_secret | default('') | string | trim | length) > 0 -%}
+      {%-   set _ = ns.payload.update({'oauth2_proxy_cookie_secret': k8s_keycloak_oauth2_proxy_cookie_secret}) -%}
+      {%- endif -%}
+      {{ ns.payload }}
+  when: k8s_openbao_runtime_seed_auth_keycloak | bool
+  no_log: true
+  changed_when: false
+
+- name: Build OpenBao seed payload for Salt control common pillar
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_payload_salt_control:
+      salt:
+        ext_pillar: true
+        source: openbao
+        control_plane: rtr-fabric-salt-control
+  when: openbao_enable_salt_control | default(false) | bool
+  no_log: true
+  changed_when: false
+
+- name: Ensure local Salt minion secret directory exists
+  ansible.builtin.file:
+    path: "{{ inventory_dir }}/.secrets/salt/minions"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  when: openbao_enable_salt_control | default(false) | bool
+
+- name: Build OpenBao seed payloads for Salt minions
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_items_salt_minions: >-
+      {{
+        (k8s_openbao_runtime_seed_items_salt_minions | default([]))
+        + [
+            {
+              'name': 'salt-minion-' ~ item,
+              'path': (
+                (
+                  openbao_secret_paths.salt_minions_prefix
+                  | replace('/*', '')
+                )
+                ~ '/' ~ item
+              ),
+              'enabled': True,
+              'payload': {
+                'salt': {
+                  'minion': {
+                    'id': item,
+                    'site': hostvars[item].fabric_site | default(''),
+                    'canary': (
+                      item in groups.get(
+                        salt_network_canary_group | default('salt_linux_minions_canary'),
+                        []
+                      )
+                    ),
+                    'role': (
+                      'master'
+                      if (
+                        item in groups.get(
+                          salt_control_master_group | default('salt_masters'),
+                          []
+                        )
+                      )
+                      else 'linux-minion'
+                    ),
+                    'masters': groups.get(
+                      salt_control_master_group | default('salt_masters'),
+                      []
+                    ),
+                    'master_addresses': (
+                      groups.get(
+                        salt_control_master_group | default('salt_masters'),
+                        []
+                      )
+                      | map('extract', hostvars)
+                      | map(attribute='bgp_evpn_loopback_ip')
+                      | list
+                    )
+                  },
+                  'secrets': {
+                    'reconcile_token': lookup(
+                      'ansible.builtin.password',
+                      inventory_dir ~ '/.secrets/salt/minions/'
+                      ~ item ~ '.reconcile-token '
+                      ~ 'length=48 chars=ascii_letters,digits'
+                    )
+                  }
+                }
+              }
+            }
+          ]
+      }}
+  loop: "{{ groups.get(salt_minion_group | default('salt_linux_minions'), []) }}"
+  no_log: true
+  changed_when: false
+  when: openbao_enable_salt_control | default(false) | bool
+
+- name: Build legacy OpenBao cleanup paths for Salt minions
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_legacy_cleanup_paths_salt_minions: >-
+      {{
+        (k8s_openbao_runtime_legacy_cleanup_paths_salt_minions | default([]))
+        + [openbao_secret_paths.salt_minions_prefix ~ '/' ~ item]
+      }}
+  loop: "{{ groups.get(salt_minion_group | default('salt_linux_minions'), []) }}"
+  no_log: true
+  changed_when: false
+  when: openbao_enable_salt_control | default(false) | bool
+
+- name: Detect legacy OpenBao deployment in raft mode
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      get deployment {{ k8s_openbao_runtime_legacy_deployment_name }}
+      -o jsonpath={.metadata.name}
+  register: k8s_openbao_runtime_legacy_deployment_get
+  failed_when: false
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Detect OpenBao statefulset in raft mode
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      get statefulset {{ k8s_openbao_runtime_statefulset_name }}
+      -o jsonpath={.metadata.name}
+  register: k8s_openbao_runtime_statefulset_get
+  failed_when: false
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Derive legacy OpenBao migration state
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_legacy_dev_migration_needed: >-
+      {{
+        (k8s_openbao_runtime_legacy_deployment_get.stdout | default('') | string | trim | length > 0)
+        and not (
+          k8s_openbao_runtime_statefulset_get.stdout | default('') | string | trim | length > 0
+        )
+      }}
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Refuse legacy OpenBao deployment migration when disabled
+  ansible.builtin.assert:
+    that:
+      - k8s_openbao_runtime_allow_legacy_dev_migration | bool
+    fail_msg: >-
+      Found a legacy OpenBao deployment in namespace {{ k8s_openbao_runtime_namespace }}
+      while switching to raft mode, but legacy migration is disabled.
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_legacy_dev_migration_needed | default(false) | bool
+
+- name: Remove legacy OpenBao deployment before raft rollout
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      delete deployment {{ k8s_openbao_runtime_legacy_deployment_name }}
+      --ignore-not-found=true --wait=true
+  register: k8s_openbao_runtime_legacy_deployment_delete
+  changed_when: >-
+    {{
+      'deleted' in (k8s_openbao_runtime_legacy_deployment_delete.stdout | default(''))
+    }}
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_legacy_dev_migration_needed | default(false) | bool
+
+- name: Wait for legacy OpenBao pods to disappear before raft rollout
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      get pods -l app.kubernetes.io/name=infra-openbao -o name
+  register: k8s_openbao_runtime_legacy_pods_remaining
+  changed_when: false
+  until: (k8s_openbao_runtime_legacy_pods_remaining.stdout | default('') | string | trim) == ''
+  retries: 60
+  delay: 5
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_legacy_dev_migration_needed | default(false) | bool
+
+- name: Render OpenBao manifest
+  ansible.builtin.template:
+    src: k8s-openbao.yaml.j2
+    dest: /tmp/k8s-openbao.yaml
+    mode: "0600"
+  no_log: true
+  changed_when: false
+
+- name: Compute OpenBao manifest diff
+  ansible.builtin.command:
+    cmd: "{{ k8s_openbao_runtime_kubectl_bin }} diff -f /tmp/k8s-openbao.yaml"
+  register: k8s_openbao_runtime_diff
+  failed_when: >-
+    k8s_openbao_runtime_diff.rc not in [0, 1]
+    and 'namespaces "' ~ k8s_openbao_runtime_namespace ~ '" not found'
+      not in (k8s_openbao_runtime_diff.stderr | default(''))
+  changed_when: false
+
+- name: Dry-run OpenBao manifest
+  ansible.builtin.debug:
+    msg: "openbao manifest drift detected"
+  changed_when: k8s_openbao_runtime_diff.rc == 1
+  when: k8s_openbao_runtime_dry_run | bool
+
+- name: Apply OpenBao manifest
+  ansible.builtin.command:
+    cmd: "{{ k8s_openbao_runtime_kubectl_bin }} apply -f /tmp/k8s-openbao.yaml"
+  register: k8s_openbao_runtime_apply
+  changed_when: >-
+    {{
+      ' created' in (k8s_openbao_runtime_apply.stdout | default(''))
+      or ' configured' in (k8s_openbao_runtime_apply.stdout | default(''))
+      or ' patched' in (k8s_openbao_runtime_apply.stdout | default(''))
+    }}
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - >-
+      (k8s_openbao_runtime_diff.rc == 1)
+      or (
+        'namespaces "' ~ k8s_openbao_runtime_namespace ~ '" not found'
+        in (k8s_openbao_runtime_diff.stderr | default(''))
+      )
+
+- name: Wait for OpenBao rollout
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      rollout status {{ k8s_openbao_runtime_manifest_rollout_kind }}/{{ k8s_openbao_runtime_manifest_rollout_name }}
+      --timeout=300s
+  changed_when: false
+  when: not k8s_openbao_runtime_dry_run | bool
+
+- name: Start local kubectl port-forward for OpenBao runtime management
+  ansible.builtin.shell: >-
+    set -eu &&
+    systemctl stop openbao-port-forward.service 2>/dev/null || true &&
+    systemctl reset-failed openbao-port-forward.service 2>/dev/null || true &&
+    fuser -k 18200/tcp 2>/dev/null || true &&
+    systemd-run --no-block --unit=openbao-port-forward
+    {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+    port-forward --address 127.0.0.1 {{ k8s_openbao_runtime_management_port_forward_target }} 18200:8200
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - (k8s_openbao_runtime_management_url_override | default('') | string | trim | length) == 0
+
+- name: Wait for local OpenBao runtime management port-forward
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 18200
+    timeout: 60
+  delegate_to: "{{ inventory_hostname }}"
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - (k8s_openbao_runtime_management_url_override | default('') | string | trim | length) == 0
+
+- name: Set effective OpenBao runtime management URL
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_management_url: >-
+      {{
+        (
+          k8s_openbao_runtime_management_url_override
+          | default('', true)
+          | string
+          | trim
+        )
+        if (
+          (
+            k8s_openbao_runtime_management_url_override
+            | default('', true)
+            | string
+            | trim
+            | length
+          ) > 0
+        )
+        else (
+          'http://127.0.0.1:18200'
+          if not (k8s_openbao_runtime_dry_run | bool)
+          else openbao_url
+        )
+      }}
+  changed_when: false
+
+- name: Wait for OpenBao pods to become Ready in raft mode
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      wait --for=condition=Ready pod/{{ item }} --timeout=300s
+  loop: "{{ k8s_openbao_runtime_pod_names }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Read OpenBao runtime PVC when Longhorn volume policy is enforced
+  kubernetes.core.k8s_info:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ k8s_openbao_runtime_namespace }}"
+    name: "data-{{ k8s_openbao_runtime_statefulset_name }}-0"
+  register: k8s_openbao_runtime_pvc
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_enforce_longhorn_volume_policy | bool
+
+- name: Derive OpenBao Longhorn volume name
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_longhorn_volume_name: >-
+      {{
+        (
+          k8s_openbao_runtime_pvc.resources
+          | default([])
+          | first
+          | default({})
+        ).spec.volumeName
+        | default('', true)
+        | string
+        | trim
+      }}
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_enforce_longhorn_volume_policy | bool
+
+- name: Reconcile OpenBao Longhorn volume placement policy
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: patched
+    definition:
+      apiVersion: longhorn.io/v1beta2
+      kind: Volume
+      metadata:
+        name: "{{ k8s_openbao_runtime_longhorn_volume_name }}"
+        namespace: "{{ k8s_openbao_runtime_longhorn_volume_namespace }}"
+      spec:
+        numberOfReplicas: "{{ k8s_openbao_runtime_longhorn_volume_number_of_replicas | int }}"
+        nodeSelector: "{{ k8s_openbao_runtime_longhorn_volume_node_selector | default([]) }}"
+        diskSelector: "{{ k8s_openbao_runtime_longhorn_volume_disk_selector | default([]) }}"
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_enforce_longhorn_volume_policy | bool
+    - (k8s_openbao_runtime_longhorn_volume_name | default('') | string | trim | length) > 0
+
+- name: Probe OpenBao primary pod status in raft mode
+  ansible.builtin.shell: >-
+    set -eu &&
+    {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+    exec {{ k8s_openbao_runtime_primary_pod }}
+    -- sh -lc 'export BAO_ADDR=http://127.0.0.1:8200;
+    status_output="$({{ k8s_openbao_runtime_binary }} status -format=json 2>/dev/null || true)";
+    if [ -n "${status_output}" ]; then
+      printf "%s" "${status_output}";
+    else
+      printf "%s" "{\"initialized\":false,\"sealed\":true}";
+    fi'
+  register: k8s_openbao_runtime_primary_status
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Decode OpenBao primary pod status in raft mode
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_primary_status_json: "{{ k8s_openbao_runtime_primary_status.stdout | trim | from_json }}"
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Stat OpenBao init file in raft mode
+  ansible.builtin.stat:
+    path: "{{ k8s_openbao_runtime_init_file }}"
+  register: k8s_openbao_runtime_init_file_stat
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Initialize OpenBao raft cluster when needed
+  ansible.builtin.shell: >-
+    set -eu &&
+    {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+    exec {{ k8s_openbao_runtime_primary_pod }}
+    -- sh -lc 'export BAO_ADDR=http://127.0.0.1:8200;
+    {{ k8s_openbao_runtime_binary }} operator init -format=json
+    -key-shares={{ k8s_openbao_runtime_raft_key_shares | int }}
+    -key-threshold={{ k8s_openbao_runtime_raft_key_threshold | int }}'
+  register: k8s_openbao_runtime_init_result
+  no_log: true
+  changed_when: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - not (k8s_openbao_runtime_primary_status_json.initialized | default(false) | bool)
+
+- name: Fail when OpenBao raft is already initialized but init file is missing
+  ansible.builtin.fail:
+    msg: >-
+      OpenBao raft is already initialized but {{ k8s_openbao_runtime_init_file }} is missing locally.
+      Restore the initialization bundle before continuing.
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_primary_status_json.initialized | default(false) | bool
+    - not (k8s_openbao_runtime_init_file_stat.stat.exists | default(false))
+
+- name: Persist OpenBao raft initialization bundle locally
+  ansible.builtin.copy:
+    dest: "{{ k8s_openbao_runtime_init_file }}"
+    content: "{{ k8s_openbao_runtime_init_result.stdout | trim }}\n"
+    mode: "0600"
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  no_log: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_init_result is changed
+
+- name: Load OpenBao raft initialization bundle
+  ansible.builtin.slurp:
+    path: "{{ k8s_openbao_runtime_init_file }}"
+  register: k8s_openbao_runtime_init_file_slurp
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  no_log: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Derive OpenBao raft root token and unseal keys
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_init_bundle: "{{ k8s_openbao_runtime_init_file_slurp.content | b64decode | from_json }}"
+    k8s_openbao_runtime_root_token_effective: >-
+      {{
+        (k8s_openbao_runtime_init_file_slurp.content | b64decode | from_json).root_token
+        | string
+        | trim
+      }}
+    k8s_openbao_runtime_unseal_keys_effective: >-
+      {{
+        (
+          (k8s_openbao_runtime_init_file_slurp.content | b64decode | from_json).unseal_keys_b64
+          | default(
+              (k8s_openbao_runtime_init_file_slurp.content | b64decode | from_json).unseal_keys_hex
+              | default([]),
+              true
+            )
+        )
+        | list
+      }}
+    k8s_openbao_runtime_unseal_keys_for_apply: >-
+      {{
+        (
+          (
+            (k8s_openbao_runtime_init_file_slurp.content | b64decode | from_json).unseal_keys_b64
+            | default(
+                (k8s_openbao_runtime_init_file_slurp.content | b64decode | from_json).unseal_keys_hex
+                | default([]),
+                true
+              )
+          )
+          | list
+        )[: (k8s_openbao_runtime_raft_key_threshold | int)]
+      }}
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Persist OpenBao root token locally from raft init bundle
+  ansible.builtin.copy:
+    dest: "{{ k8s_openbao_runtime_root_token_file }}"
+    content: "{{ k8s_openbao_runtime_root_token_effective }}\n"
+    mode: "0600"
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  no_log: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Unseal OpenBao raft pods when needed
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_openbao_runtime_kubectl_bin }}"
+      - -n
+      - "{{ k8s_openbao_runtime_namespace }}"
+      - exec
+      - "{{ item.0 }}"
+      - --
+      - env
+      - BAO_ADDR=http://127.0.0.1:8200
+      - "{{ k8s_openbao_runtime_binary }}"
+      - operator
+      - unseal
+      - "{{ item.1 }}"
+  loop: "{{ (k8s_openbao_runtime_pod_names | default([])) | product(k8s_openbao_runtime_unseal_keys_for_apply | default([])) | list }}"
+  loop_control:
+    label: "{{ item.0 }}"
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+    - k8s_openbao_runtime_primary_status_json.sealed | default(true) | bool
+
+- name: Assert OpenBao unseal keyset is complete in raft mode
+  ansible.builtin.assert:
+    that:
+      - (k8s_openbao_runtime_unseal_keys_effective | default([]) | length) >= (k8s_openbao_runtime_raft_key_threshold | int)
+    fail_msg: >-
+      OpenBao raft init bundle does not expose enough unseal keys
+      (threshold={{ k8s_openbao_runtime_raft_key_threshold | int }}).
+  no_log: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_is_raft | bool
+
+- name: Require non-empty OpenBao root token
+  ansible.builtin.assert:
+    that:
+      - k8s_openbao_runtime_root_token_effective | string | length > 0
+    fail_msg: "OpenBao root token is empty."
+  no_log: true
+
+- name: Wait for OpenBao API health
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/sys/health"
+    method: GET
+    status_code: [200, 429, 472, 473, 501, 503]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  register: k8s_openbao_runtime_health
+  until: >-
+    (k8s_openbao_runtime_health.json.initialized | default(false) | bool)
+    and not (k8s_openbao_runtime_health.json.sealed | default(true) | bool)
+  retries: 60
+  delay: 5
+  changed_when: false
+  when: not k8s_openbao_runtime_dry_run | bool
+
+- name: List OpenBao mounts
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/sys/mounts"
+    method: GET
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    status_code: 200
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  register: k8s_openbao_runtime_mounts
+  no_log: true
+  changed_when: false
+  when: not k8s_openbao_runtime_dry_run | bool
+
+- name: Enable KV v2 mount when missing
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/sys/mounts/{{ openbao_kv_mount }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body:
+      type: kv-v2
+      description: rtr-fabric transitional kv
+    status_code: [200, 204]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  no_log: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - "(openbao_kv_mount ~ '/') not in (k8s_openbao_runtime_mounts.json | default({}))"
+  changed_when: true
+
+- name: Ensure OpenBao read policy
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/sys/policies/acl/{{ k8s_openbao_runtime_read_policy_name }}"
+    method: PUT
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body:
+      policy: |
+        path "sys/internal/ui/mounts" {
+          capabilities = ["read"]
+        }
+        path "sys/internal/ui/mounts/*" {
+          capabilities = ["read"]
+        }
+        path "sys/internal/ui/resultant-acl" {
+          capabilities = ["read"]
+        }
+        path "auth/token/lookup-self" {
+          capabilities = ["read"]
+        }
+        path "sys/namespaces" {
+          capabilities = ["list"]
+        }
+        path "sys/namespaces/*" {
+          capabilities = ["read", "list"]
+        }
+        path "identity/entity/id" {
+          capabilities = ["list"]
+        }
+        path "identity/entity/id/*" {
+          capabilities = ["read"]
+        }
+        path "identity/entity/name" {
+          capabilities = ["list"]
+        }
+        path "identity/entity/name/*" {
+          capabilities = ["read"]
+        }
+        path "identity/entity-alias/id" {
+          capabilities = ["list"]
+        }
+        path "identity/entity-alias/id/*" {
+          capabilities = ["read"]
+        }
+        path "identity/entity-alias/name" {
+          capabilities = ["list"]
+        }
+        path "identity/entity-alias/name/*" {
+          capabilities = ["read"]
+        }
+        {% for path_item in (k8s_openbao_runtime_read_policy_paths | default([])) %}
+        path "{{ openbao_kv_mount }}/data/{{ path_item }}" {
+          capabilities = ["read"]
+        }
+        path "{{ openbao_kv_mount }}/metadata/{{ path_item }}" {
+          capabilities = ["read", "list"]
+        }
+        {% endfor %}
+    status_code: [200, 204]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  no_log: true
+  changed_when: false
+  when: not k8s_openbao_runtime_dry_run | bool
+
+- name: List OpenBao auth backends
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/sys/auth"
+    method: GET
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    status_code: 200
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  register: k8s_openbao_runtime_auth_backends
+  no_log: true
+  changed_when: false
+  when: not k8s_openbao_runtime_dry_run | bool
+
+- name: Enable OpenBao AppRole auth backend when missing
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/sys/auth/approle"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body:
+      type: approle
+      description: rtr-fabric GitHub runner auth
+    status_code: [200, 204]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  no_log: true
+  changed_when: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+    - "('approle/' not in (k8s_openbao_runtime_auth_backends.json | default({})))"
+
+- name: Configure OpenBao AppRole for GitHub runner
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/auth/approle/role/{{ k8s_openbao_runtime_approle_role_name }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body:
+      token_policies:
+        - "{{ k8s_openbao_runtime_read_policy_name }}"
+      token_ttl: "{{ k8s_openbao_runtime_approle_token_ttl }}"
+      token_max_ttl: "{{ k8s_openbao_runtime_approle_token_max_ttl }}"
+      token_no_default_policy: true
+      secret_id_ttl: "{{ k8s_openbao_runtime_approle_secret_id_ttl }}"
+      secret_id_num_uses: "{{ k8s_openbao_runtime_approle_secret_id_num_uses | int }}"
+    status_code: [200, 204]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+
+- name: Read OpenBao AppRole role_id
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/auth/approle/role/{{ k8s_openbao_runtime_approle_role_name }}/role-id"
+    method: GET
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    status_code: 200
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  register: k8s_openbao_runtime_approle_role_id
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+
+- name: Stat existing local OpenBao AppRole secret_id file
+  ansible.builtin.stat:
+    path: "{{ openbao_approle_secret_id_file }}"
+  register: k8s_openbao_runtime_approle_secret_id_file_stat
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+
+- name: Load existing local OpenBao AppRole secret_id when available
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_approle_secret_id_effective: >-
+      {{
+        lookup('ansible.builtin.file', openbao_approle_secret_id_file, errors='ignore')
+        | default('', true)
+        | string
+        | trim
+      }}
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+    - k8s_openbao_runtime_approle_secret_id_file_stat.stat.exists | default(false)
+    - not (k8s_openbao_runtime_rotate_approle_secret_id | bool)
+
+- name: Validate existing local OpenBao AppRole secret_id
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/auth/approle/login"
+    method: POST
+    body_format: json
+    body:
+      role_id: "{{ k8s_openbao_runtime_approle_role_id.json.data.role_id }}"
+      secret_id: "{{ k8s_openbao_runtime_approle_secret_id_effective }}"
+    status_code: [200, 400, 403]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  register: k8s_openbao_runtime_approle_secret_id_login_probe
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+    - (k8s_openbao_runtime_approle_secret_id_effective | default('') | string | trim | length) > 0
+    - not (k8s_openbao_runtime_rotate_approle_secret_id | bool)
+
+- name: Decide whether OpenBao AppRole secret_id must be rotated
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_rotate_approle_secret_id_needed: >-
+      {{
+        (k8s_openbao_runtime_rotate_approle_secret_id | bool)
+        or not (k8s_openbao_runtime_approle_secret_id_file_stat.stat.exists | default(false))
+        or (
+          (k8s_openbao_runtime_approle_secret_id_login_probe is defined)
+          and (k8s_openbao_runtime_approle_secret_id_login_probe.status | default(0) | int) != 200
+        )
+      }}
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+
+- name: Create fresh OpenBao AppRole secret_id when requested or missing
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/auth/approle/role/{{ k8s_openbao_runtime_approle_role_name }}/secret-id"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    status_code: 200
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  register: k8s_openbao_runtime_approle_secret_id
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+    - k8s_openbao_runtime_rotate_approle_secret_id_needed | default(false) | bool
+
+- name: Resolve effective OpenBao AppRole secret_id
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_approle_secret_id_effective: >-
+      {{
+        [
+          (
+            k8s_openbao_runtime_approle_secret_id.json.data.secret_id
+            | default('', true)
+            | string
+            | trim
+          ),
+          (
+            k8s_openbao_runtime_approle_secret_id_effective
+            | default('', true)
+            | string
+            | trim
+          )
+        ]
+        | reject('equalto', '')
+        | first
+        | default('')
+      }}
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+
+- name: Persist OpenBao AppRole credentials locally
+  ansible.builtin.copy:
+    dest: "{{ item.dest }}"
+    content: "{{ item.content }}\n"
+    mode: "0600"
+  loop:
+    - dest: "{{ openbao_approle_role_id_file }}"
+      content: "{{ k8s_openbao_runtime_approle_role_id.json.data.role_id }}"
+    - dest: "{{ openbao_approle_secret_id_file }}"
+      content: "{{ k8s_openbao_runtime_approle_secret_id_effective }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  no_log: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_auth_method == 'approle'
+
+- name: List OpenBao auth backends for LDAP configuration
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/sys/auth"
+    method: GET
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    status_code: 200
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  register: k8s_openbao_runtime_ldap_auth_backends
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_ldap_auth_enabled | bool
+
+- name: Enable OpenBao LDAP auth backend when missing
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/sys/auth/{{ k8s_openbao_runtime_ldap_auth_path }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body:
+      type: ldap
+      description: rtr-fabric LDAP auth
+    status_code: [200, 204]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  no_log: true
+  changed_when: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_ldap_auth_enabled | bool
+    - (k8s_openbao_runtime_ldap_auth_path ~ "/") not in (k8s_openbao_runtime_ldap_auth_backends.json | default({}))
+
+- name: Configure OpenBao LDAP auth backend
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/auth/{{ k8s_openbao_runtime_ldap_auth_path }}/config"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body: >-
+      {{
+        {
+          'url': k8s_openbao_runtime_ldap_url,
+          'binddn': k8s_openbao_runtime_ldap_binddn,
+          'bindpass': k8s_openbao_runtime_ldap_bindpass_effective,
+          'userdn': k8s_openbao_runtime_ldap_userdn,
+          'userattr': k8s_openbao_runtime_ldap_userattr,
+          'discoverdn': false,
+          'case_sensitive_names': false,
+          'starttls': (k8s_openbao_runtime_ldap_starttls | bool),
+          'insecure_tls': (k8s_openbao_runtime_ldap_insecure_tls | bool)
+        }
+        | combine(
+            {
+              'groupdn': k8s_openbao_runtime_ldap_groupdn,
+              'groupfilter': k8s_openbao_runtime_ldap_groupfilter,
+              'groupattr': k8s_openbao_runtime_ldap_groupattr
+            }
+            if (
+              k8s_openbao_runtime_ldap_groupdn | default('') | string | trim | length
+            ) > 0 else {}
+          )
+      }}
+    status_code: [200, 204]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_ldap_auth_enabled | bool
+
+- name: Remove direct LDAP user mappings when group mappings are enabled
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/auth/{{ k8s_openbao_runtime_ldap_auth_path }}/users/{{ item.username }}"
+    method: DELETE
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    status_code: [200, 204, 404]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  loop: "{{ k8s_network_services_ldap_seed_users | default([]) }}"
+  loop_control:
+    label: "{{ item.username }}"
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_ldap_auth_enabled | bool
+    - (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
+
+- name: Map LDAP groups to OpenBao read policy
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/auth/{{ k8s_openbao_runtime_ldap_auth_path }}/groups/{{ item.name }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body:
+      policies: "{{ k8s_openbao_runtime_read_policy_name }}"
+    status_code: [200, 204]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  loop: "{{ k8s_network_services_ldap_seed_groups | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_ldap_auth_enabled | bool
+    - (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
+
+- name: Create fresh OpenBao read token
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/auth/token/create"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body:
+      policies:
+        - "{{ k8s_openbao_runtime_read_policy_name }}"
+      display_name: rtr-fabric-ansible
+      renewable: false
+      orphan: true
+      no_default_policy: true
+    status_code: 200
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  register: k8s_openbao_runtime_read_token_create
+  no_log: true
+  changed_when: false
+  when: not k8s_openbao_runtime_dry_run | bool
+
+- name: Persist OpenBao read token locally
+  ansible.builtin.copy:
+    dest: "{{ k8s_openbao_runtime_read_token_file }}"
+    content: "{{ k8s_openbao_runtime_read_token_create.json.auth.client_token }}\n"
+    mode: "0600"
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  no_log: true
+  when: not k8s_openbao_runtime_dry_run | bool
+
+- name: Build OpenBao seed item list
+  ansible.builtin.set_fact:
+    k8s_openbao_runtime_seed_items: >-
+      {{
+        [
+          {
+            'name': 'net-services',
+            'path': openbao_secret_paths.net_services,
+            'enabled': (k8s_openbao_runtime_seed_net_services | bool),
+            'payload': k8s_openbao_runtime_seed_payload_net_services | default({})
+          },
+          {
+            'name': 'openwrt-wifi-edge-pre',
+            'path': openbao_secret_paths.openwrt_wifi_edge_pre,
+            'enabled': (k8s_openbao_runtime_seed_openwrt_wifi_edge_pre | bool),
+            'payload': k8s_openbao_runtime_seed_payload_openwrt_wifi_edge_pre | default({})
+          },
+          {
+            'name': 'acme',
+            'path': openbao_secret_paths.acme,
+            'enabled': (k8s_openbao_runtime_seed_acme | bool),
+            'payload': k8s_openbao_runtime_seed_payload_acme | default({})
+          },
+          {
+            'name': 'ca',
+            'path': openbao_secret_paths.ca,
+            'enabled': (k8s_openbao_runtime_seed_ca | bool),
+            'payload': k8s_openbao_runtime_seed_payload_ca | default({})
+          },
+          {
+            'name': 'ops-etcd-offsite',
+            'path': openbao_secret_paths.ops_etcd_offsite,
+            'enabled': (k8s_openbao_runtime_seed_ops_etcd_offsite | bool),
+            'payload': k8s_openbao_runtime_seed_payload_ops_etcd_offsite | default({})
+          },
+          {
+            'name': 'github-actions-runner',
+            'path': openbao_secret_paths.github_actions_runner,
+            'enabled': (k8s_openbao_runtime_seed_github_actions_runner | bool),
+            'payload': k8s_openbao_runtime_seed_payload_github_actions_runner | default({})
+          },
+          {
+            'name': 'bgp',
+            'path': openbao_secret_paths.bgp,
+            'enabled': (k8s_openbao_runtime_seed_bgp | bool),
+            'payload': k8s_openbao_runtime_seed_payload_bgp | default({})
+          },
+          {
+            'name': 'monitoring',
+            'path': openbao_secret_paths.monitoring,
+            'enabled': (k8s_openbao_runtime_seed_monitoring | bool),
+            'payload': k8s_openbao_runtime_seed_payload_monitoring | default({})
+          },
+          {
+            'name': 'auth-keycloak',
+            'path': openbao_secret_paths.auth_keycloak,
+            'enabled': (k8s_openbao_runtime_seed_auth_keycloak | bool),
+            'payload': k8s_openbao_runtime_seed_payload_auth_keycloak | default({})
+          },
+          {
+            'name': 'salt-control',
+            'path': openbao_secret_paths.salt_common,
+            'enabled': (openbao_enable_salt_control | default(false) | bool),
+            'payload': k8s_openbao_runtime_seed_payload_salt_control | default({})
+          }
+        ]
+        + (k8s_openbao_runtime_seed_items_salt_minions | default([]))
+      }}
+  no_log: true
+  changed_when: false
+  when: not k8s_openbao_runtime_dry_run | bool
+
+- name: Read current OpenBao seed payloads
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/{{ openbao_kv_mount }}/data/{{ item.path }}"
+    method: GET
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    status_code: [200, 404]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  loop: "{{ k8s_openbao_runtime_seed_items | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: k8s_openbao_runtime_current_seed_payloads
+  no_log: true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - item.enabled | bool
+
+- name: Seed payloads into OpenBao
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/{{ openbao_kv_mount }}/data/{{ item.item.path }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    body_format: json
+    body:
+      data: "{{ k8s_openbao_runtime_seed_payload_effective }}"
+    status_code: 200
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  loop: "{{ k8s_openbao_runtime_current_seed_payloads.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  vars:
+    k8s_openbao_runtime_seed_payload_effective: >-
+      {{
+        (
+          {
+            'neighbor_password': (
+              [
+                item.item.payload.neighbor_password | default('', true) | string | trim,
+                item.json.data.data.neighbor_password | default('', true) | string | trim,
+                lookup(
+                  'ansible.builtin.password',
+                  k8s_openbao_runtime_bgp_neighbor_password_file ~ ' length=48 chars=hexdigits'
+                ) | string | trim
+              ]
+              | reject('equalto', '')
+              | first
+              | default('')
+            )
+          }
+        )
+        if (item.item.name == 'bgp')
+        else (item.item.payload | default({}))
+      }}
+  no_log: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - item.item.enabled | bool
+    - (k8s_openbao_runtime_seed_payload_effective | default({}) | length) > 0
+    - >-
+      (item.status | default(404)) == 404
+      or (item.json.data.data | default({})) != (k8s_openbao_runtime_seed_payload_effective | default({}))
+  changed_when: true
+
+- name: Remove legacy OpenBao Salt minion paths
+  ansible.builtin.uri:
+    url: "{{ k8s_openbao_runtime_management_url }}/v1/{{ openbao_kv_mount }}/metadata/{{ item }}"
+    method: DELETE
+    headers:
+      X-Vault-Token: "{{ k8s_openbao_runtime_root_token_effective }}"
+    status_code: [204, 404]
+    validate_certs: "{{ openbao_validate_certs | bool }}"
+  loop: "{{ k8s_openbao_runtime_legacy_cleanup_paths_salt_minions | default([]) }}"
+  no_log: true
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - openbao_enable_salt_control | default(false) | bool
+
+- name: Wait for OpenBao HTTPS certificate when ingress is enabled
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      wait --for=condition=Ready
+      certificate/{{ k8s_openbao_runtime_https_tls_secret_name }}
+      --timeout=300s
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_https_ingress_enabled | bool
+    - k8s_openbao_runtime_https_tls_enabled | bool
+
+- name: Remove stale OpenBao HTTPS certificate when TLS ingress is disabled
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      delete certificate {{ k8s_openbao_runtime_https_tls_secret_name }}
+      --ignore-not-found=true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - k8s_openbao_runtime_https_ingress_enabled | bool
+    - not (k8s_openbao_runtime_https_tls_enabled | bool)
+
+- name: Remove stale OpenBao ingress when ingress is disabled
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      delete ingress infra-openbao --ignore-not-found=true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - not (k8s_openbao_runtime_https_ingress_enabled | bool)
+
+- name: Remove stale OpenBao HTTPS certificate when ingress is disabled
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_openbao_runtime_kubectl_bin }} -n {{ k8s_openbao_runtime_namespace }}
+      delete certificate {{ k8s_openbao_runtime_https_tls_secret_name }}
+      --ignore-not-found=true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - not (k8s_openbao_runtime_https_ingress_enabled | bool)
+
+- name: Remove rendered OpenBao manifest
+  ansible.builtin.file:
+    path: /tmp/k8s-openbao.yaml
+    state: absent
+  changed_when: false
+
+- name: Stop local kubectl port-forward for OpenBao runtime management
+  ansible.builtin.shell: >-
+    set -eu &&
+    systemctl stop openbao-port-forward.service 2>/dev/null || true
+  changed_when: false
+  when:
+    - not k8s_openbao_runtime_dry_run | bool
+    - (k8s_openbao_runtime_management_url_override | default('') | string | trim | length) == 0

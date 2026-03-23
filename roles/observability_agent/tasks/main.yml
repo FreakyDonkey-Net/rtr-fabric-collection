@@ -1,0 +1,35 @@
+---
+- name: Validate observability_agent_action is provided
+  ansible.builtin.assert:
+    that:
+      - (observability_agent_action | string | length) > 0
+      - observability_agent_action in observability_agent_supported_actions
+    fail_msg: >-
+      observability_agent_action must be one of: {{ observability_agent_supported_actions | join(', ') }}.
+      Got: '{{ observability_agent_action }}'
+
+- name: Ensure report directory exists
+  ansible.builtin.file:
+    path: "{{ observability_agent_report_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Run action — check_bgp_sessions
+  ansible.builtin.include_tasks: actions/check_bgp_sessions.yml
+  when: observability_agent_action == 'check_bgp_sessions'
+
+- name: Run action — check_wireguard_peers
+  ansible.builtin.include_tasks: actions/check_wireguard_peers.yml
+  when: observability_agent_action == 'check_wireguard_peers'
+
+- name: Run action — check_vlan_connectivity
+  ansible.builtin.include_tasks: actions/check_vlan_connectivity.yml
+  when: observability_agent_action == 'check_vlan_connectivity'
+
+- name: Run action — check_radius_health
+  ansible.builtin.include_tasks: actions/check_radius_health.yml
+  when: observability_agent_action == 'check_radius_health'
+
+- name: Run action — check_cluster_health
+  ansible.builtin.include_tasks: actions/check_cluster_health.yml
+  when: observability_agent_action == 'check_cluster_health'

@@ -1,0 +1,372 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ k8s_openbao_runtime_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-openbao
+    app.kubernetes.io/part-of: openbao
+    pod-security.kubernetes.io/enforce: {{ k8s_openbao_runtime_namespace_pod_security_enforce }}
+    pod-security.kubernetes.io/warn: {{ k8s_openbao_runtime_namespace_pod_security_warn }}
+    pod-security.kubernetes.io/audit: {{ k8s_openbao_runtime_namespace_pod_security_audit }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: infra-openbao
+  namespace: {{ k8s_openbao_runtime_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-openbao
+    app.kubernetes.io/part-of: openbao
+automountServiceAccountToken: false
+{% if (k8s_openbao_runtime_mode | default('dev')) == 'raft' %}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ k8s_openbao_runtime_headless_service_name }}
+  namespace: {{ k8s_openbao_runtime_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-openbao
+    app.kubernetes.io/part-of: openbao
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: infra-openbao
+  ports:
+    - name: api
+      port: 8200
+      protocol: TCP
+      targetPort: 8200
+    - name: cluster
+      port: {{ k8s_openbao_runtime_cluster_port }}
+      protocol: TCP
+      targetPort: {{ k8s_openbao_runtime_cluster_port }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ k8s_openbao_runtime_service_name }}
+  namespace: {{ k8s_openbao_runtime_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-openbao
+    app.kubernetes.io/part-of: openbao
+spec:
+  type: {{ k8s_openbao_runtime_service_type }}
+  selector:
+    app.kubernetes.io/name: infra-openbao
+  ports:
+    - name: api
+      port: 8200
+      protocol: TCP
+      targetPort: 8200
+{% if (k8s_openbao_runtime_service_node_port | string | trim | length) > 0 %}
+      nodePort: {{ k8s_openbao_runtime_service_node_port }}
+{% endif %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infra-openbao-config
+  namespace: {{ k8s_openbao_runtime_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-openbao
+    app.kubernetes.io/part-of: openbao
+data:
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    cat > /tmp/openbao.hcl <<EOF
+    ui = true
+    disable_mlock = true
+    api_addr = "{{ k8s_openbao_runtime_api_addr | default('http://' ~ '${POD_NAME}.' ~ k8s_openbao_runtime_headless_service_name ~ '.' ~ k8s_openbao_runtime_namespace ~ '.svc.cluster.local:8200', true) }}"
+    cluster_addr = "http://${POD_IP}:{{ k8s_openbao_runtime_cluster_port }}"
+
+    listener "tcp" {
+      address = "0.0.0.0:8200"
+      cluster_address = "0.0.0.0:{{ k8s_openbao_runtime_cluster_port }}"
+      tls_disable = 1
+    }
+
+    storage "raft" {
+      path = "{{ k8s_openbao_runtime_data_path }}"
+      node_id = "${POD_NAME}"
+{% for host_name in (k8s_openbao_runtime_raft_retry_join_hosts | default([])) %}
+      retry_join {
+        leader_api_addr = "http://infra-openbao-{{ loop.index0 }}.{{ k8s_openbao_runtime_headless_service_name }}.{{ k8s_openbao_runtime_namespace }}.svc.cluster.local:8200"
+      }
+{% endfor %}
+    }
+    EOF
+    exec /bin/bao server -config=/tmp/openbao.hcl
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: infra-openbao
+  namespace: {{ k8s_openbao_runtime_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-openbao
+    app.kubernetes.io/part-of: openbao
+spec:
+  serviceName: {{ k8s_openbao_runtime_headless_service_name }}
+  replicas: {{ k8s_openbao_runtime_replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infra-openbao
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infra-openbao
+        app.kubernetes.io/part-of: openbao
+      annotations:
+        freakydonkey.net/openbao-runtime-config: "{{ (
+          k8s_openbao_runtime_image
+          ~ '|' ~ k8s_openbao_runtime_mode
+          ~ '|' ~ k8s_openbao_runtime_storage_backend
+          ~ '|' ~ (k8s_openbao_runtime_raft_node_names | join(','))
+          ~ '|' ~ k8s_openbao_runtime_storage_class
+          ~ '|' ~ k8s_openbao_runtime_data_size
+        ) | hash('sha256') }}"
+    spec:
+      serviceAccountName: infra-openbao
+      automountServiceAccountToken: false
+{% if k8s_openbao_runtime_host_network | bool %}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+{% endif %}
+{% if (k8s_openbao_runtime_pod_tolerations | default([]) | length) > 0 %}
+      tolerations:
+{{ k8s_openbao_runtime_pod_tolerations | to_nice_yaml(indent=2) | indent(8, true) }}
+{% endif %}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+{% if (k8s_openbao_runtime_replicas | int) == 1 and (k8s_openbao_runtime_node_name | default('') | string | trim | length) > 0 %}
+                      - {{ k8s_openbao_runtime_node_name }}
+{% else %}
+{% for node_name in (k8s_openbao_runtime_raft_node_names | default([])) %}
+                      - {{ node_name }}
+{% endfor %}
+{% endif %}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: infra-openbao
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: openbao
+          image: {{ k8s_openbao_runtime_image }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - /config/run.sh
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          securityContext:
+            appArmorProfile:
+              type: RuntimeDefault
+          ports:
+            - name: api
+              containerPort: 8200
+              protocol: TCP
+            - name: cluster
+              containerPort: {{ k8s_openbao_runtime_cluster_port }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 8200
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: 8200
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: {{ k8s_openbao_runtime_data_path }}
+      volumes:
+        - name: config
+          configMap:
+            name: infra-openbao-config
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: infra-openbao
+          app.kubernetes.io/part-of: openbao
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: {{ k8s_openbao_runtime_storage_class }}
+        resources:
+          requests:
+            storage: {{ k8s_openbao_runtime_data_size }}
+{% else %}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ k8s_openbao_runtime_service_name }}
+  namespace: {{ k8s_openbao_runtime_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-openbao
+    app.kubernetes.io/part-of: openbao
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: infra-openbao
+  ports:
+    - name: http
+      port: 8200
+      protocol: TCP
+      targetPort: 8200
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infra-openbao
+  namespace: {{ k8s_openbao_runtime_namespace }}
+  labels:
+    app.kubernetes.io/name: infra-openbao
+    app.kubernetes.io/part-of: openbao
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infra-openbao
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infra-openbao
+        app.kubernetes.io/part-of: openbao
+      annotations:
+        freakydonkey.net/openbao-runtime-config: "{{ (
+          k8s_openbao_runtime_image
+          ~ '|' ~ k8s_openbao_runtime_bind_address
+          ~ '|' ~ k8s_openbao_runtime_node_name
+        ) | hash('sha256') }}"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeName: {{ k8s_openbao_runtime_node_name }}
+      serviceAccountName: infra-openbao
+      automountServiceAccountToken: false
+      containers:
+        - name: openbao
+          image: {{ k8s_openbao_runtime_image }}
+          imagePullPolicy: Always
+          args:
+            - server
+            - -dev
+            - -dev-root-token-id={{ k8s_openbao_runtime_root_token_effective }}
+            - -dev-listen-address={{ k8s_openbao_runtime_bind_address }}
+          securityContext:
+            appArmorProfile:
+              type: RuntimeDefault
+          ports:
+            - name: http
+              containerPort: 8200
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: 8200
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: 8200
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+{% endif %}
+{% if k8s_openbao_runtime_https_ingress_enabled | bool %}
+{% if k8s_openbao_runtime_https_tls_enabled | bool %}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ k8s_openbao_runtime_https_tls_secret_name }}
+  namespace: {{ k8s_openbao_runtime_namespace }}
+spec:
+  secretName: {{ k8s_openbao_runtime_https_tls_secret_name }}
+  dnsNames:
+    - {{ k8s_openbao_runtime_https_hostname }}
+  issuerRef:
+    name: {{ k8s_openbao_runtime_https_clusterissuer_name }}
+    kind: ClusterIssuer
+{% endif %}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: infra-openbao
+  namespace: {{ k8s_openbao_runtime_namespace }}
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/ssl-redirect: "{{ 'true' if (k8s_openbao_runtime_https_tls_enabled | bool) else 'false' }}"
+    nginx.ingress.kubernetes.io/whitelist-source-range: "{{ k8s_openbao_runtime_https_whitelist_source_ranges | join(',') }}"
+spec:
+  ingressClassName: {{ k8s_openbao_runtime_https_ingress_class_name }}
+{% if k8s_openbao_runtime_https_tls_enabled | bool %}
+  tls:
+    - hosts:
+        - {{ k8s_openbao_runtime_https_hostname }}
+      secretName: {{ k8s_openbao_runtime_https_tls_secret_name }}
+{% endif %}
+  rules:
+    - host: {{ k8s_openbao_runtime_https_hostname }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ k8s_openbao_runtime_service_name }}
+                port:
+                  number: 8200
+{% endif %}

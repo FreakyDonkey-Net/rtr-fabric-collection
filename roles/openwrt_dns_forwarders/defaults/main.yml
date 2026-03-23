@@ -1,0 +1,23 @@
+---
+openwrt_dns_forwarders_dry_run: true
+openwrt_dns_forwarders_force_apply: false
+
+openwrt_dns_forwarders_dnsmasq_section: "@dnsmasq[0]"
+openwrt_dns_forwarders_server_port: 53
+
+openwrt_dns_forwarders_servers: []
+openwrt_dns_forwarders_allow_fallback: false
+openwrt_dns_forwarders_fallback_servers:
+  - 1.1.1.1
+  - 9.9.9.9
+
+openwrt_dns_forwarders_noresolv: true
+openwrt_dns_forwarders_strict_order: true
+openwrt_dns_forwarders_allservers: false
+openwrt_dns_forwarders_cache_size: 1000
+openwrt_dns_forwarders_dnsforwardmax: 300
+openwrt_dns_forwarders_rebind_protection: true
+openwrt_dns_forwarders_rebind_domain_allowlist: []
+openwrt_dns_forwarders_address_overrides: []
+
+openwrt_dns_forwarders_dnsmasq_service_name: dnsmasq

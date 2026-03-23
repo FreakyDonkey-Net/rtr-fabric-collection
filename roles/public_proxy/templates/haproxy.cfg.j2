@@ -1,0 +1,33 @@
+global
+  log /dev/log local0
+  log /dev/log local1 notice
+  daemon
+  maxconn 2048
+
+defaults
+  log global
+  mode tcp
+  option dontlognull
+  timeout connect 5s
+  timeout client 30s
+  timeout server 30s
+
+listen stats
+  mode http
+  bind {{ public_proxy_stats_bind_host }}:{{ public_proxy_stats_port }}
+  stats enable
+  stats uri /stats
+  stats refresh 10s
+
+{% if public_proxy_k3s_api_enabled | bool %}
+frontend k3s_api
+  bind {{ public_proxy_k3s_api_bind_host }}:{{ public_proxy_k3s_api_bind_port }}
+  default_backend k3s_api_backends
+
+backend k3s_api_backends
+  balance roundrobin
+  option tcp-check
+{% for backend in public_proxy_k3s_backends %}
+  server {{ backend.name }} {{ backend.address }}:{{ public_proxy_k3s_api_backend_port }} check
+{% endfor %}
+{% endif %}

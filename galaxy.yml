@@ -1,0 +1,26 @@
+namespace: freakydonkey
+name: rtr_fabric
+version: 1.0.0
+readme: README.md
+authors:
+  - FreakyDonkey-Net <contact@freakydonkey.net>
+description: Unified Ansible collection for RTR Fabric infrastructure (K3s, networking, security, OpenWrt)
+license:
+  - GPL-3.0-or-later
+license_file: ''
+tags:
+  - infrastructure
+  - kubernetes
+  - k3s
+  - networking
+  - wireguard
+  - bgp
+  - evpn
+  - security
+  - openwrt
+repository: https://github.com/FreakyDonkey-Net/rtr-fabric-collection
+documentation: https://github.com/FreakyDonkey-Net/rtr-fabric-collection
+homepage: https://github.com/FreakyDonkey-Net/rtr-fabric
+issues: https://github.com/FreakyDonkey-Net/rtr-fabric-collection/issues
+build_ignore: []
+dependencies: {}

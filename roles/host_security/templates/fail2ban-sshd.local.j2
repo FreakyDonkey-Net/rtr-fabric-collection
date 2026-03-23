@@ -1,0 +1,9 @@
+[{{ host_security_fail2ban_jail_name }}]
+enabled = true
+backend = {{ host_security_fail2ban_backend }}
+bantime = {{ host_security_fail2ban_bantime }}
+findtime = {{ host_security_fail2ban_findtime }}
+maxretry = {{ host_security_fail2ban_maxretry }}
+{% if host_security_fail2ban_ignoreip | default([]) | length > 0 %}
+ignoreip = 127.0.0.1/8 ::1 {{ host_security_fail2ban_ignoreip | join(' ') }}
+{% endif %}

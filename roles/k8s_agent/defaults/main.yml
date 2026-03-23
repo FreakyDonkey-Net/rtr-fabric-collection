@@ -1,0 +1,7 @@
+---
+k8s_agent_supported_actions:
+  - check_k3s_status
+  - label_node
+  - taint_node
+  - drain_node
+  - etcd_snapshot

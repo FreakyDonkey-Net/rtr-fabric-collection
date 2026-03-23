@@ -1,0 +1,33 @@
+---
+rpi_longhorn_storage_enabled: false
+rpi_longhorn_storage_confirmation_token: ERASE_WORKER_DISKS
+rpi_longhorn_storage_confirmation: ""
+rpi_longhorn_storage_base_dir: /var/lib/longhorn/disks
+rpi_longhorn_storage_filesystem: ext4
+rpi_longhorn_storage_mount_options: defaults,noatime
+rpi_longhorn_storage_partition_suffix: "-part{{ rpi_longhorn_storage_partition_number }}"
+rpi_longhorn_storage_partition_label: gpt
+rpi_longhorn_storage_partition_number: 1
+rpi_longhorn_storage_partition_start: 1MiB
+rpi_longhorn_storage_partition_end: 100%
+rpi_longhorn_storage_wipe_existing_signatures: true
+rpi_longhorn_storage_required_packages_common:
+  - parted
+  - e2fsprogs
+  - util-linux
+rpi_longhorn_storage_required_packages_by_filesystem:
+  ext4: []
+  xfs:
+    - xfsprogs
+rpi_longhorn_storage_required_packages: >-
+  {{
+    (
+      rpi_longhorn_storage_required_packages_common
+      + rpi_longhorn_storage_required_packages_by_filesystem.get(
+          rpi_longhorn_storage_filesystem,
+          []
+        )
+    )
+    | unique
+  }}
+rpi_longhorn_storage_disks: []

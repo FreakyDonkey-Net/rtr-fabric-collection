@@ -1,0 +1,694 @@
+---
+- name: Validate namespace
+  ansible.builtin.assert:
+    that:
+      - k8s_network_services_namespace | string | length > 0
+      - k8s_network_services_kubectl_bin | string | length > 0
+
+- name: Refuse implicit environment fallback for network services
+  ansible.builtin.assert:
+    that:
+      - rtr_fabric_target_environment_is_explicit | default(false) | bool
+    fail_msg: >-
+      k8s_network_services requires an explicit target environment before evaluating secret-backed settings.
+      Set RTR_FABRIC_TARGET_ENVIRONMENT or create inventory/.secrets/target-environment.
+  when:
+    - >-
+      (k8s_network_services_dns_enabled | default(false) | bool)
+      or (k8s_network_services_radius_enabled | default(false) | bool)
+      or (k8s_network_services_ca_enabled | default(false) | bool)
+      or (k8s_network_services_ldap_enabled | default(false) | bool)
+
+- name: Validate DNS settings
+  ansible.builtin.assert:
+    that:
+      - k8s_network_services_dns_forwarders | length > 0
+      - k8s_network_services_dns_internal_domain | string | length > 0
+    fail_msg: DNS stateless requires upstream forwarders and an internal domain.
+  when: k8s_network_services_dns_enabled | bool
+
+- name: Validate RADIUS settings
+  ansible.builtin.assert:
+    that:
+      - k8s_network_services_radius_clients | length > 0
+      - (not k8s_network_services_radius_require_users | bool) or (k8s_network_services_radius_users | length > 0)
+      - (not k8s_network_services_radius_cert_manager_enabled | bool) or (k8s_network_services_radius_cert_manager_dns_names | length > 0)
+      - (not k8s_network_services_radius_cert_manager_enabled | bool) or (k8s_network_services_cert_manager_enabled | bool)
+      - (not k8s_network_services_radius_custom_tls_assets_enabled | bool) or (k8s_network_services_radius_tls_server_pem | string | length > 0)
+      - (not k8s_network_services_radius_eap_tls_enabled | bool) or (k8s_network_services_radius_eap_tls_client_ca_pem | string | length > 0)
+      - k8s_network_services_radius_eap_default_type in ['peap', 'tls']
+    fail_msg: RADIUS requires clients, users, and a valid TLS source.
+  when: k8s_network_services_radius_enabled | bool
+
+- name: Validate cert-manager settings
+  ansible.builtin.assert:
+    that:
+      - k8s_network_services_cert_manager_acme_email | string | length > 0
+      - k8s_network_services_cert_manager_cloudflare_api_token | string | length > 0
+    fail_msg: cert-manager ACME with Cloudflare requires email and API token.
+  when:
+    - k8s_network_services_cert_manager_enabled | bool
+    - k8s_network_services_radius_enabled | bool
+    - k8s_network_services_radius_cert_manager_enabled | bool
+
+- name: Validate prod hostNetwork exception register
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (rtr_fabric_is_prod | default(false) | bool)
+        or not (item.enabled | bool)
+        or (
+          (
+            k8s_network_services_prod_hostnetwork_exceptions
+            | default({})
+          ).get(item.name, {}).get('owner', '')
+          | string
+          | trim
+          | length
+        ) > 0
+      - >-
+        not (rtr_fabric_is_prod | default(false) | bool)
+        or not (item.enabled | bool)
+        or (
+          (
+            k8s_network_services_prod_hostnetwork_exceptions
+            | default({})
+          ).get(item.name, {}).get('rationale', '')
+          | string
+          | trim
+          | length
+        ) > 0
+    fail_msg: >-
+      Production requires an explicit hostNetwork exception owner/rationale for
+      net-services component '{{ item.name }}'.
+  loop:
+    - name: dns
+      enabled: "{{ k8s_network_services_dns_enabled | default(false) | bool }}"
+    - name: radius
+      enabled: "{{ k8s_network_services_radius_enabled | default(false) | bool }}"
+    - name: ldap
+      enabled: >-
+        {{
+          (k8s_network_services_ldap_enabled | default(false) | bool)
+          and (k8s_network_services_ldap_host_network | default(false) | bool)
+        }}
+    - name: ca
+      enabled: >-
+        {{
+          (k8s_network_services_ca_enabled | default(false) | bool)
+          and (k8s_network_services_ca_host_network | default(false) | bool)
+        }}
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Validate CA settings
+  ansible.builtin.assert:
+    that:
+      - k8s_network_services_ca_config_json | string | length > 0
+      - k8s_network_services_ca_password | string | length > 0
+      - k8s_network_services_ca_root_crt_pem | string | length > 0
+      - k8s_network_services_ca_intermediate_crt_pem | string | length > 0
+      - k8s_network_services_ca_intermediate_key_pem | string | length > 0
+      - k8s_network_services_ca_service_port | int > 0
+      - (not k8s_network_services_ca_host_network | bool) or (k8s_network_services_ca_node_name | string | length > 0)
+    fail_msg: step-ca stateless requires the bootstrap material in vault.
+  when: k8s_network_services_ca_enabled | bool
+
+- name: Validate LDAP settings
+  ansible.builtin.assert:
+    that:
+      - k8s_network_services_ldap_bind_port | int > 0
+      - k8s_network_services_ldap_service_port | int > 0
+      - not (rtr_fabric_is_prod | default(false) | bool) or not (k8s_network_services_ldap_host_network | bool)
+      - not (rtr_fabric_is_prod | default(false) | bool) or not (k8s_network_services_ca_host_network | bool)
+    fail_msg: LDAP and CA must stay on ClusterIP service exposure in production.
+  when:
+    - (k8s_network_services_ldap_enabled | bool) or (k8s_network_services_ca_enabled | bool)
+
+- name: Initialize effective DNS records
+  ansible.builtin.set_fact:
+    k8s_network_services_dns_records_effective: "{{ k8s_network_services_dns_internal_records | list }}"
+  when: k8s_network_services_dns_enabled | bool
+  changed_when: false
+
+- name: Build autodiscovered host list
+  ansible.builtin.set_fact:
+    k8s_network_services_dns_autodiscovered_hosts: >-
+      {{
+        k8s_network_services_dns_internal_autodiscover_groups
+        | map('extract', groups)
+        | select('defined')
+        | flatten
+        | unique
+        | list
+      }}
+  when:
+    - k8s_network_services_dns_enabled | bool
+    - k8s_network_services_dns_internal_autodiscover_inventory_hosts | bool
+  changed_when: false
+
+- name: Add autodiscovered DNS records
+  ansible.builtin.set_fact:
+    k8s_network_services_dns_records_effective: >-
+      {{
+        k8s_network_services_dns_records_effective
+        + [
+            {
+              'name': item ~ '.' ~ k8s_network_services_dns_internal_domain,
+              'address': (
+                hostvars[item].dns_internal_address
+                | default(
+                    hostvars[item].k3s_node_ip
+                    | default(
+                        hostvars[item].rpi_edge_attachment.current.primary_access_ip
+                        | default(hostvars[item].ansible_host)
+                    )
+                )
+              )
+            }
+          ]
+      }}
+  loop: "{{ k8s_network_services_dns_autodiscovered_hosts | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - k8s_network_services_dns_enabled | bool
+    - k8s_network_services_dns_internal_autodiscover_inventory_hosts | bool
+    - hostvars[item].ansible_host is defined
+  changed_when: false
+
+- name: Deduplicate internal DNS records
+  ansible.builtin.set_fact:
+    k8s_network_services_dns_records_effective: >-
+      {{
+        k8s_network_services_dns_records_effective
+        | map('to_json')
+        | unique
+        | map('from_json')
+        | list
+      }}
+  when: k8s_network_services_dns_enabled | bool
+  changed_when: false
+
+- name: Build RADIUS clients.conf payload
+  ansible.builtin.set_fact:
+    k8s_network_services_radius_clients_conf: |
+      client localhost {
+        ipaddr = 127.0.0.1
+        secret = testing123
+      }
+      {% for client in k8s_network_services_radius_clients %}
+      client {{ client.name | replace('-', '_') }} {
+        ipaddr = {{ client.ipaddr }}
+        secret = "{{ client.secret }}"
+        shortname = "{{ client.shortname }}"
+        nastype = "{{ client.nastype | default('other') }}"
+      }
+      {% endfor %}
+  when: k8s_network_services_radius_enabled | bool
+  no_log: true
+  changed_when: false
+
+- name: Build RADIUS authorize payload
+  ansible.builtin.set_fact:
+    k8s_network_services_radius_authorize: |
+      # Bootstrap users for PAP/PEAP/TTLS.
+      {% for user in k8s_network_services_radius_users %}
+      {{ user.username }} Cleartext-Password := "{{ user.password }}"
+          Reply-Message := "{{ user.reply_message | default('Welcome') }}"
+      {% endfor %}
+  when: k8s_network_services_radius_enabled | bool
+  no_log: true
+  changed_when: false
+
+- name: Build RADIUS EAP payload
+  ansible.builtin.set_fact:
+    k8s_network_services_radius_eap_conf: |
+      eap {
+        default_eap_type = {{ k8s_network_services_radius_eap_default_type }}
+        timer_expire = 60
+        ignore_unknown_eap_types = no
+        cisco_accounting_username_bug = no
+        max_sessions = ${max_requests}
+
+        tls-config peap-common {
+          private_key_password = whatever
+          private_key_file = ${certdir}/server.pem
+          certificate_file = ${certdir}/server.pem
+          tls_min_version = "{{ k8s_network_services_radius_eap_tls_min_version }}"
+          tls_max_version = "{{ k8s_network_services_radius_eap_tls_max_version }}"
+          cipher_list = "DEFAULT"
+          cipher_server_preference = no
+        }
+
+        tls-config eap-tls-common {
+          private_key_password = whatever
+          private_key_file = ${certdir}/server.pem
+          certificate_file = ${certdir}/server.pem
+          ca_file = ${cadir}/ca.pem
+          tls_min_version = "{{ k8s_network_services_radius_eap_tls_min_version }}"
+          tls_max_version = "{{ k8s_network_services_radius_eap_tls_max_version }}"
+          cipher_list = "DEFAULT"
+          cipher_server_preference = no
+      {% if k8s_network_services_radius_eap_tls_check_cert_cn_enabled | bool %}
+          check_cert_cn = %{User-Name}
+      {% endif %}
+      {% if k8s_network_services_radius_eap_tls_reject_unknown_intermediate_ca | bool %}
+          reject_unknown_intermediate_ca = yes
+      {% endif %}
+        }
+
+        tls {
+          tls = eap-tls-common
+          virtual_server = "check-eap-tls"
+        }
+
+        peap {
+          tls = peap-common
+          default_eap_type = mschapv2
+          copy_request_to_tunnel = yes
+          use_tunneled_reply = yes
+          virtual_server = "inner-tunnel"
+        }
+
+        mschapv2 {
+        }
+      }
+  when: k8s_network_services_radius_enabled | bool
+  no_log: true
+  changed_when: false
+
+- name: Build RADIUS check-eap-tls payload
+  ansible.builtin.set_fact:
+    k8s_network_services_radius_check_eap_tls_conf: |
+      server check-eap-tls {
+        authorize {
+          auth_log
+          if (&TLS-Client-Cert-Common-Name && &User-Name && (&TLS-Client-Cert-Common-Name == &User-Name)) {
+            update control {
+              Auth-Type := Accept
+            }
+            ok
+          }
+        }
+      }
+  when: k8s_network_services_radius_enabled | bool
+  no_log: true
+  changed_when: false
+
+- name: Build LDAP seed LDIF payload
+  ansible.builtin.set_fact:
+    k8s_network_services_ldap_seed_ldif: ""
+  when: k8s_network_services_ldap_enabled | bool
+  no_log: true
+  changed_when: false
+
+- name: Ensure cert-manager namespace exists when enabled
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} get namespace cert-manager"
+  register: k8s_network_services_cert_manager_ns
+  failed_when: false
+  changed_when: false
+  when: k8s_network_services_cert_manager_enabled | bool
+
+- name: Install cert-manager when requested and missing
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} apply -f {{ k8s_network_services_cert_manager_manifest_url }}"
+  register: k8s_network_services_cert_manager_install_result
+  changed_when: >-
+    {{
+      ' created' in (k8s_network_services_cert_manager_install_result.stdout | default(''))
+      or ' configured' in (k8s_network_services_cert_manager_install_result.stdout | default(''))
+      or ' patched' in (k8s_network_services_cert_manager_install_result.stdout | default(''))
+    }}
+  when:
+    - k8s_network_services_cert_manager_enabled | bool
+    - k8s_network_services_cert_manager_install | bool
+    - k8s_network_services_cert_manager_ns.rc != 0
+
+- name: Wait for cert-manager webhook to become available
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} -n cert-manager rollout status deployment/cert-manager-webhook --timeout=180s"
+  changed_when: false
+  when:
+    - k8s_network_services_cert_manager_enabled | bool
+    - k8s_network_services_cert_manager_install | bool
+    - k8s_network_services_cert_manager_ns.rc != 0
+
+- name: Render network services manifest
+  ansible.builtin.template:
+    src: k8s-network-services.yaml.j2
+    dest: /tmp/k8s-network-services.yaml
+    mode: '0600'
+  no_log: true
+  changed_when: false
+
+- name: Compute network services diff
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} diff -f /tmp/k8s-network-services.yaml"
+  register: k8s_network_services_diff
+  failed_when: k8s_network_services_diff.rc not in [0, 1]
+  changed_when: false
+
+- name: Dry-run network services manifest
+  ansible.builtin.debug:
+    msg: "net-services manifest drift detected"
+  changed_when: k8s_network_services_diff.rc == 1
+  when: k8s_network_services_dry_run | bool
+
+- name: Apply network services manifest
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} apply -f /tmp/k8s-network-services.yaml"
+  register: k8s_network_services_apply
+  changed_when: >-
+    {{
+      ' created' in (k8s_network_services_apply.stdout | default(''))
+      or ' configured' in (k8s_network_services_apply.stdout | default(''))
+      or ' patched' in (k8s_network_services_apply.stdout | default(''))
+    }}
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_diff.rc == 1
+  no_log: true
+
+- name: Wait for DNS daemonset
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} rollout status daemonset/infra-dns --timeout=180s"
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_dns_enabled | bool
+
+- name: Wait for cert-manager ClusterIssuer
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_network_services_kubectl_bin }}"
+      - wait
+      - --for=condition=Ready
+      - "clusterissuer/{{ k8s_network_services_cert_manager_clusterissuer_name }}"
+      - --timeout=180s
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_cert_manager_enabled | bool
+    - k8s_network_services_radius_enabled | bool
+    - k8s_network_services_radius_cert_manager_enabled | bool
+
+- name: Wait for public RADIUS certificate
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_network_services_kubectl_bin }}"
+      - -n
+      - "{{ k8s_network_services_namespace }}"
+      - wait
+      - --for=condition=Ready
+      - "certificate/{{ k8s_network_services_radius_cert_manager_certificate_name }}"
+      - --timeout=300s
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_cert_manager_enabled | bool
+    - k8s_network_services_radius_enabled | bool
+    - k8s_network_services_radius_cert_manager_enabled | bool
+
+- name: Wait for RADIUS daemonset
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} rollout status daemonset/infra-radius --timeout=180s"
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_radius_enabled | bool
+
+- name: Wait for CA deployment
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} rollout status deployment/infra-ca --timeout=180s"
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ca_enabled | bool
+
+- name: Wait for LDAP deployment
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} rollout status deployment/infra-ldap --timeout=180s"
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+
+- name: Resolve LDAP pod name
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -lc
+      - >-
+        {{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }}
+        get pod -l app.kubernetes.io/name=infra-ldap
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{range .status.containerStatuses[*]}{.ready}{" "}{end}{"\n"}{end}'
+        | awk '$2 == "Running" && $3 ~ /true/ {print $1; exit}'
+  register: k8s_network_services_ldap_pod_name
+  failed_when: (k8s_network_services_ldap_pod_name.stdout | string | trim | length) == 0
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (
+        (k8s_network_services_ldap_seed_users | default([]) | length) > 0
+        or (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
+      )
+
+- name: Build LDAP bootstrap URI
+  ansible.builtin.set_fact:
+    k8s_network_services_ldap_bootstrap_uri: >-
+      {{
+        (
+          'ldaps://127.0.0.1:' ~ (k8s_network_services_ldap_bind_port | string)
+        )
+        if (
+          (k8s_network_services_ldap_tls_enabled | default(false) | bool)
+          and (k8s_network_services_ldap_bind_port | int) == 636
+        )
+        else
+        (
+          'ldap://127.0.0.1:' ~ (k8s_network_services_ldap_bind_port | string)
+        )
+      }}
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (
+        (k8s_network_services_ldap_seed_users | default([]) | length) > 0
+        or (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
+      )
+
+- name: Build LDAP seed subtree facts
+  ansible.builtin.set_fact:
+    k8s_network_services_ldap_seed_users_parent_dn: >-
+      {{
+        k8s_network_services_ldap_seed_users_dn
+        | regex_replace('^[^,]+,', '')
+      }}
+    k8s_network_services_ldap_seed_users_ou: >-
+      {{
+        k8s_network_services_ldap_seed_users_dn
+        | regex_replace('^ou=([^,]+),.*$', '\\1')
+      }}
+    k8s_network_services_ldap_seed_groups_parent_dn: >-
+      {{
+        k8s_network_services_ldap_seed_groups_dn
+        | regex_replace('^[^,]+,', '')
+      }}
+    k8s_network_services_ldap_seed_groups_ou: >-
+      {{
+        k8s_network_services_ldap_seed_groups_dn
+        | regex_replace('^ou=([^,]+),.*$', '\\1')
+      }}
+    k8s_network_services_ldap_seed_users_parent_ou: >-
+      {{
+        (
+          k8s_network_services_ldap_seed_users_dn
+          | regex_replace('^[^,]+,', '')
+        )
+        | regex_replace('^ou=([^,]+),.*$', '\\1')
+      }}
+    k8s_network_services_ldap_seed_groups_parent_ou: >-
+      {{
+        (
+          k8s_network_services_ldap_seed_groups_dn
+          | regex_replace('^[^,]+,', '')
+        )
+        | regex_replace('^ou=([^,]+),.*$', '\\1')
+      }}
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (
+        (k8s_network_services_ldap_seed_users | default([]) | length) > 0
+        or (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
+      )
+
+- name: Ensure LDAP seed users parent OU exists
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} exec {{ k8s_network_services_ldap_pod_name.stdout }} -- sh -lc '
+      ldapsearch -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+        -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD" \
+        -b "{{ k8s_network_services_ldap_seed_users_parent_dn }}" -s base dn >/dev/null 2>&1 ||
+      printf "%s\n" \
+        "dn: {{ k8s_network_services_ldap_seed_users_parent_dn }}" \
+        "objectClass: organizationalUnit" \
+        "ou: {{ k8s_network_services_ldap_seed_users_parent_ou }}" \
+      | ldapadd -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+          -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD"
+    '
+  args:
+    executable: /bin/bash
+  register: k8s_network_services_ldap_seed_users_parent_ou_apply
+  changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_users_parent_ou_apply.stdout | lower)"
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (k8s_network_services_ldap_seed_users | default([]) | length) > 0
+    - (k8s_network_services_ldap_seed_users_parent_dn | string) != 'dc=freakydonkey,dc=net'
+
+- name: Ensure LDAP seed users OU exists
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} exec {{ k8s_network_services_ldap_pod_name.stdout }} -- sh -lc '
+      ldapsearch -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+        -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD" \
+        -b "{{ k8s_network_services_ldap_seed_users_dn }}" -s base dn >/dev/null 2>&1 ||
+      printf "%s\n" \
+        "dn: {{ k8s_network_services_ldap_seed_users_dn }}" \
+        "objectClass: organizationalUnit" \
+        "ou: {{ k8s_network_services_ldap_seed_users_ou }}" \
+      | ldapadd -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+          -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD"
+    '
+  args:
+    executable: /bin/bash
+  register: k8s_network_services_ldap_seed_users_ou_apply
+  changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_users_ou_apply.stdout | lower)"
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (k8s_network_services_ldap_seed_users | default([]) | length) > 0
+
+- name: Ensure LDAP seed groups parent OU exists
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} exec {{ k8s_network_services_ldap_pod_name.stdout }} -- sh -lc '
+      ldapsearch -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+        -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD" \
+        -b "{{ k8s_network_services_ldap_seed_groups_parent_dn }}" -s base dn >/dev/null 2>&1 ||
+      printf "%s\n" \
+        "dn: {{ k8s_network_services_ldap_seed_groups_parent_dn }}" \
+        "objectClass: organizationalUnit" \
+        "ou: {{ k8s_network_services_ldap_seed_groups_parent_ou }}" \
+      | ldapadd -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+          -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD"
+    '
+  args:
+    executable: /bin/bash
+  register: k8s_network_services_ldap_seed_groups_parent_ou_apply
+  changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_groups_parent_ou_apply.stdout | lower)"
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
+    - (k8s_network_services_ldap_seed_groups_parent_dn | string) != 'dc=freakydonkey,dc=net'
+
+- name: Ensure LDAP seed groups OU exists
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} exec {{ k8s_network_services_ldap_pod_name.stdout }} -- sh -lc '
+      ldapsearch -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+        -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD" \
+        -b "{{ k8s_network_services_ldap_seed_groups_dn }}" -s base dn >/dev/null 2>&1 ||
+      printf "%s\n" \
+        "dn: {{ k8s_network_services_ldap_seed_groups_dn }}" \
+        "objectClass: organizationalUnit" \
+        "ou: {{ k8s_network_services_ldap_seed_groups_ou }}" \
+      | ldapadd -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+          -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD"
+    '
+  args:
+    executable: /bin/bash
+  register: k8s_network_services_ldap_seed_groups_ou_apply
+  changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_groups_ou_apply.stdout | lower)"
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
+
+- name: Ensure LDAP seed users exist
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} exec {{ k8s_network_services_ldap_pod_name.stdout }} -- sh -lc '
+      ldapsearch -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+        -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD" \
+        -b "{{ k8s_network_services_ldap_seed_users_dn }}" "(uid={{ item.username }})" dn | grep -q "^dn:" ||
+      printf "%s\n" \
+        "dn: uid={{ item.username }},{{ k8s_network_services_ldap_seed_users_dn }}" \
+        "objectClass: inetOrgPerson" \
+        "objectClass: organizationalPerson" \
+        "objectClass: person" \
+        "objectClass: top" \
+        "cn: {{ item.cn | default(item.username) }}" \
+        "sn: {{ item.sn | default(item.username) }}" \
+        "uid: {{ item.username }}" \
+        "mail: {{ item.mail | default(item.username ~ '@' ~ k8s_network_services_dns_internal_domain) }}" \
+        "userPassword: {{ item.password }}" \
+      | ldapadd -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+          -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD"
+    '
+  args:
+    executable: /bin/bash
+  loop: "{{ k8s_network_services_ldap_seed_users | default([]) }}"
+  loop_control:
+    label: "{{ item.username }}"
+  register: k8s_network_services_ldap_seed_users_apply
+  changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_users_apply.stdout | lower)"
+  no_log: true
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (k8s_network_services_ldap_seed_users | default([]) | length) > 0
+
+- name: Ensure LDAP seed groups exist
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} exec {{ k8s_network_services_ldap_pod_name.stdout }} -- sh -lc '
+      ldapsearch -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+        -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD" \
+        -b "{{ k8s_network_services_ldap_seed_groups_dn }}" "(cn={{ item.name }})" dn | grep -q "^dn:" ||
+      printf "%s\n" \
+        "dn: cn={{ item.name }},{{ k8s_network_services_ldap_seed_groups_dn }}" \
+        "objectClass: groupOfNames" \
+        "objectClass: top" \
+        "cn: {{ item.name }}" \
+        {% for member in (item.members | default([])) %}
+        "member: uid={{ member }},{{ k8s_network_services_ldap_seed_users_dn }}" \
+        {% endfor %}
+      | ldapadd -x -H {{ k8s_network_services_ldap_bootstrap_uri | quote }} \
+          -D "cn=admin,dc=freakydonkey,dc=net" -w "$LDAP_ADMIN_PASSWORD"
+    '
+  args:
+    executable: /bin/bash
+  loop: "{{ k8s_network_services_ldap_seed_groups | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: k8s_network_services_ldap_seed_groups_apply
+  changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_groups_apply.stdout | lower)"
+  no_log: true
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+    - (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
+
+- name: Remove rendered manifest
+  ansible.builtin.file:
+    path: /tmp/k8s-network-services.yaml
+    state: absent
+  changed_when: false

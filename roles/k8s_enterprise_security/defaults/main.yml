@@ -1,0 +1,160 @@
+---
+k8s_enterprise_security_kubeconfig: /etc/rancher/k3s/k3s.yaml
+k8s_enterprise_security_namespace: kyverno
+k8s_enterprise_security_namespace_pod_security_enforce: baseline
+k8s_enterprise_security_namespace_pod_security_warn: restricted
+k8s_enterprise_security_namespace_pod_security_audit: restricted
+k8s_enterprise_security_break_glass_enabled: true
+k8s_enterprise_security_break_glass_namespace: kube-system
+k8s_enterprise_security_break_glass_serviceaccount_name: rtr-fabric-break-glass
+k8s_enterprise_security_break_glass_token_ttl: 15m
+k8s_enterprise_security_break_glass_review_hours: 24
+k8s_enterprise_security_break_glass_fail_on_usage: false
+k8s_enterprise_security_break_glass_audit_principals:
+  - >-
+    system:serviceaccount:{{ k8s_enterprise_security_break_glass_namespace }}:{{ k8s_enterprise_security_break_glass_serviceaccount_name }}
+  - "oidc:{{ k8s_enterprise_security_rbac_groups.break_glass }}"
+
+k8s_enterprise_security_kyverno_enabled: true
+k8s_enterprise_security_kyverno_release_name: kyverno
+k8s_enterprise_security_kyverno_chart_name: kyverno
+k8s_enterprise_security_kyverno_chart_repo: https://kyverno.github.io/kyverno
+k8s_enterprise_security_kyverno_chart_version: 3.6.3
+k8s_enterprise_security_kyverno_crds_migration_enabled: false
+k8s_enterprise_security_kyverno_validation_failure_action: Audit
+k8s_enterprise_security_kyverno_policy_background: true
+k8s_enterprise_security_kyverno_copy_local_helm_binary: true
+k8s_enterprise_security_kyverno_local_helm_binary: "{{ lookup('ansible.builtin.pipe', 'command -v helm') }}"
+k8s_enterprise_security_kyverno_helm_bin: /usr/local/bin/helm
+k8s_enterprise_security_kyverno_helm_environment:
+  HELM_CACHE_HOME: /tmp/helm-cache
+  HELM_CONFIG_HOME: /tmp/helm-config
+  HELM_DATA_HOME: /tmp/helm-data
+k8s_enterprise_security_kyverno_helm_wait_timeout: 15m0s
+k8s_enterprise_security_kyverno_admission_controller_replicas: 1
+k8s_enterprise_security_kyverno_background_controller_replicas: 1
+k8s_enterprise_security_kyverno_cleanup_controller_replicas: 1
+k8s_enterprise_security_kyverno_reports_controller_replicas: 1
+k8s_enterprise_security_kyverno_node_selector: {}
+k8s_enterprise_security_kyverno_tolerations: []
+k8s_enterprise_security_kyverno_admission_controller_resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+k8s_enterprise_security_kyverno_background_controller_resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+k8s_enterprise_security_kyverno_cleanup_controller_resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+k8s_enterprise_security_kyverno_reports_controller_resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+k8s_enterprise_security_rbac_enabled: true
+
+k8s_enterprise_security_rbac_groups:
+  platform_admin: kubernetes-platform-admins
+  security_admin: kubernetes-security-admins
+  ops_readonly: kubernetes-ops-readonly
+  tenant_operator: kubernetes-tenant-operators
+  break_glass: kubernetes-break-glass
+k8s_enterprise_security_kyverno_policy_excluded_namespaces:
+  - kube-system
+  - fabric-net
+  - net-services
+  - openbao
+  - ingress-public
+  - monitoring
+  - auth-internal
+  - longhorn-system
+  - arc-system
+  - github-actions-runner
+  - kyverno
+  - cert-manager
+k8s_enterprise_security_allowed_image_registries:
+  - docker.io
+  - ghcr.io
+  - quay.io
+  - registry.k8s.io
+  - reg.kyverno.io
+k8s_enterprise_security_allowed_image_registries_regex: >-
+  ^({{
+    k8s_enterprise_security_allowed_image_registries
+    | map('regex_escape')
+    | join('|')
+  }})(/|$)
+k8s_enterprise_security_verify_image_signatures_enabled: false
+k8s_enterprise_security_verify_image_signatures_required: true
+k8s_enterprise_security_signed_image_references: []
+k8s_enterprise_security_cosign_public_keys: []
+k8s_enterprise_security_falco_enabled: true
+k8s_enterprise_security_falco_namespace: falco
+k8s_enterprise_security_falco_namespace_pod_security_enforce: privileged
+k8s_enterprise_security_falco_namespace_pod_security_warn: baseline
+k8s_enterprise_security_falco_namespace_pod_security_audit: baseline
+k8s_enterprise_security_falco_release_name: falco
+k8s_enterprise_security_falco_chart_name: falco
+k8s_enterprise_security_falco_chart_repo: https://falcosecurity.github.io/charts
+k8s_enterprise_security_falco_chart_version: 8.0.1
+k8s_enterprise_security_falco_driver_kind: modern_ebpf
+k8s_enterprise_security_falco_target_hosts: []
+k8s_enterprise_security_falco_prepare_kernel_headers: true
+k8s_enterprise_security_falco_custom_driver_loader_enabled: false
+k8s_enterprise_security_falco_custom_driver_loader_image: docker.io/falcosecurity/falco-driver-loader:0.39.2
+k8s_enterprise_security_falco_helm_wait_timeout: 15m0s
+k8s_enterprise_security_falco_node_selector:
+  freakydonkey.net/worker: "true"
+  freakydonkey.net/arch-class: amd64
+k8s_enterprise_security_falco_affinity: {}
+k8s_enterprise_security_falco_tolerations: []
+k8s_enterprise_security_falco_priority: notice
+k8s_enterprise_security_falco_json_output: true
+k8s_enterprise_security_falco_log_level: info
+k8s_enterprise_security_falco_resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+k8s_enterprise_security_tenant_namespaces: []
+k8s_enterprise_security_tenant_namespace_defaults:
+  pod_security_enforce: restricted
+  pod_security_warn: restricted
+  pod_security_audit: restricted
+  resource_quota:
+    requests_cpu: "4"
+    requests_memory: 8Gi
+    limits_cpu: "8"
+    limits_memory: 16Gi
+    persistentvolumeclaims: "10"
+    requests_storage: 200Gi
+  limit_range:
+    default_cpu: 500m
+    default_memory: 512Mi
+    default_request_cpu: 100m
+    default_request_memory: 128Mi
+k8s_enterprise_security_policies:
+  - require-owned-workload-labels
+  - require-pod-requests-limits
+  - require-secure-pod-security-context
+  - restrict-privileged-containers
+  - restrict-hostpath-volumes
+  - restrict-host-namespaces
+  - restrict-latest-tags
+  - restrict-allowed-image-registries

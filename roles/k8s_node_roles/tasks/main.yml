@@ -1,0 +1,231 @@
+- name: Assert kubectl is available for node role convergence
+  ansible.builtin.command:
+    cmd: "{{ k8s_node_roles_kubectl_bin }} version --client"
+  changed_when: false
+
+- name: Collect current Kubernetes node state
+  ansible.builtin.command:
+    cmd: "{{ k8s_node_roles_kubectl_bin }} get nodes -o json"
+  register: k8s_node_roles_nodes_raw
+  changed_when: false
+
+- name: Build effective node role groups
+  ansible.builtin.set_fact:
+    k8s_node_roles_cluster_nodes: "{{ (k8s_node_roles_nodes_raw.stdout | from_json).get('items', []) }}"
+    k8s_node_roles_frontend_hosts_effective: "{{ groups.get(k8s_frontend_group | default('vps_public'), []) | list }}"
+    k8s_node_roles_edge_hosts_effective: "{{ groups.get(k8s_edge_group | default('bare_metal'), []) | list }}"
+    k8s_node_roles_master_hosts_effective: "{{ k8s_kube_ovn_master_hosts | default([k3s_server_host]) | list }}"
+    k8s_node_roles_cluster_hostnames: >-
+      {{
+        ((k8s_node_roles_nodes_raw.stdout | from_json).get('items', []))
+        | map(attribute='metadata.name')
+        | list
+      }}
+  changed_when: false
+
+- name: Assert inventory-backed nodes exist in Kubernetes
+  ansible.builtin.assert:
+    that:
+      - (k8s_node_roles_frontend_hosts_effective | difference(k8s_node_roles_cluster_hostnames)) | length == 0
+      - (k8s_node_roles_edge_hosts_effective | difference(k8s_node_roles_cluster_hostnames)) | length == 0
+      - (k8s_node_roles_master_hosts_effective | difference(k8s_node_roles_cluster_hostnames)) | length == 0
+    fail_msg: >-
+      Some inventory node-role targets are missing from the cluster.
+      frontends={{ k8s_node_roles_frontend_hosts_effective | difference(k8s_node_roles_cluster_hostnames) }},
+      edges={{ k8s_node_roles_edge_hosts_effective | difference(k8s_node_roles_cluster_hostnames) }},
+      masters={{ k8s_node_roles_master_hosts_effective | difference(k8s_node_roles_cluster_hostnames) }}.
+
+- name: Ensure frontend label is present on frontend nodes
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_node_roles_kubectl_bin }}"
+      - label
+      - node
+      - "{{ item }}"
+      - "{{ k8s_frontend_label_key }}={{ k8s_frontend_label_value }}"
+      - --overwrite
+  loop: "{{ k8s_node_roles_frontend_hosts_effective }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (
+      (
+        k8s_node_roles_cluster_nodes
+        | selectattr('metadata.name', 'equalto', item)
+        | first
+      ).metadata.labels[k8s_frontend_label_key]
+      | default('')
+    ) != (k8s_frontend_label_value | string)
+
+- name: Remove edge taint from frontend nodes
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_node_roles_kubectl_bin }}"
+      - taint
+      - node
+      - "{{ item }}"
+      - "{{ k8s_edge_taint_key }}:{{ k8s_edge_taint_effect }}-"
+  loop: "{{ k8s_node_roles_frontend_hosts_effective }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (
+      (
+        (
+          k8s_node_roles_cluster_nodes
+          | selectattr('metadata.name', 'equalto', item)
+          | first
+        ).spec.taints
+        | default([])
+      )
+      | selectattr('key', 'equalto', k8s_edge_taint_key)
+      | selectattr('effect', 'equalto', k8s_edge_taint_effect)
+      | list
+      | length
+    ) > 0
+
+- name: Remove edge label from frontend nodes
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_node_roles_kubectl_bin }}"
+      - label
+      - node
+      - "{{ item }}"
+      - "{{ k8s_edge_label_key }}-"
+  loop: "{{ k8s_node_roles_frontend_hosts_effective }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (
+      (
+        k8s_node_roles_cluster_nodes
+        | selectattr('metadata.name', 'equalto', item)
+        | first
+      ).metadata.labels[k8s_edge_label_key]
+      | default('')
+    ) | length > 0
+
+- name: Ensure edge label is present on edge nodes
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_node_roles_kubectl_bin }}"
+      - label
+      - node
+      - "{{ item }}"
+      - "{{ k8s_edge_label_key }}={{ k8s_edge_label_value }}"
+      - --overwrite
+  loop: "{{ k8s_node_roles_edge_hosts_effective }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (
+      (
+        k8s_node_roles_cluster_nodes
+        | selectattr('metadata.name', 'equalto', item)
+        | first
+      ).metadata.labels[k8s_edge_label_key]
+      | default('')
+    ) != (k8s_edge_label_value | string)
+
+- name: Remove frontend label from edge nodes
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_node_roles_kubectl_bin }}"
+      - label
+      - node
+      - "{{ item }}"
+      - "{{ k8s_frontend_label_key }}-"
+  loop: "{{ k8s_node_roles_edge_hosts_effective }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (
+      (
+        k8s_node_roles_cluster_nodes
+        | selectattr('metadata.name', 'equalto', item)
+        | first
+      ).metadata.labels[k8s_frontend_label_key]
+      | default('')
+    ) | length > 0
+
+- name: Ensure edge taint is present on edge nodes
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_node_roles_kubectl_bin }}"
+      - taint
+      - node
+      - "{{ item }}"
+      - "{{ k8s_edge_taint_key }}={{ k8s_edge_taint_value }}:{{ k8s_edge_taint_effect }}"
+      - --overwrite
+  loop: "{{ k8s_node_roles_edge_hosts_effective }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - k8s_node_roles_edge_taint_enabled | bool
+    - >-
+      (
+        (
+          (
+            k8s_node_roles_cluster_nodes
+            | selectattr('metadata.name', 'equalto', item)
+            | first
+          ).spec.taints
+          | default([])
+        )
+        | selectattr('key', 'equalto', k8s_edge_taint_key)
+        | selectattr('effect', 'equalto', k8s_edge_taint_effect)
+        | selectattr('value', 'equalto', (k8s_edge_taint_value | string))
+        | list
+        | length
+      ) == 0
+
+- name: Ensure kube-ovn master label is present on selected hosts
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_node_roles_kubectl_bin }}"
+      - label
+      - node
+      - "{{ item }}"
+      - "{{ k8s_kube_ovn_master_label_key }}={{ k8s_kube_ovn_master_label_value }}"
+      - --overwrite
+  loop: "{{ k8s_node_roles_master_hosts_effective }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (
+      (
+        k8s_node_roles_cluster_nodes
+        | selectattr('metadata.name', 'equalto', item)
+        | first
+      ).metadata.labels[k8s_kube_ovn_master_label_key]
+      | default('')
+    ) != (k8s_kube_ovn_master_label_value | string)
+
+- name: Remove kube-ovn master label from non-master nodes
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_node_roles_kubectl_bin }}"
+      - label
+      - node
+      - "{{ item }}"
+      - "{{ k8s_kube_ovn_master_label_key }}-"
+  loop: "{{ k8s_node_roles_cluster_hostnames | difference(k8s_node_roles_master_hosts_effective) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (
+      (
+        k8s_node_roles_cluster_nodes
+        | selectattr('metadata.name', 'equalto', item)
+        | first
+      ).metadata.labels[k8s_kube_ovn_master_label_key]
+      | default('')
+    ) | length > 0
+
+- name: Show node role convergence summary
+  ansible.builtin.debug:
+    msg:
+      frontends: "{{ k8s_node_roles_frontend_hosts_effective }}"
+      edges: "{{ k8s_node_roles_edge_hosts_effective }}"
+      kube_ovn_masters: "{{ k8s_node_roles_master_hosts_effective }}"
+  changed_when: false

@@ -1,0 +1,22 @@
+fullnameOverride: {{ k8s_github_actions_runner_controller_fullname_override }}
+replicaCount: {{ k8s_github_actions_runner_controller_replicas | int }}
+serviceAccount:
+  create: true
+  name: {{ k8s_github_actions_runner_controller_service_account_name }}
+flags:
+  logLevel: {{ k8s_github_actions_runner_controller_log_level }}
+  logFormat: {{ k8s_github_actions_runner_controller_log_format }}
+  runnerMaxConcurrentReconciles: {{ k8s_github_actions_runner_controller_runner_max_concurrent_reconciles | int }}
+  updateStrategy: {{ k8s_github_actions_runner_controller_update_strategy }}
+podSecurityContext:
+{{ k8s_github_actions_runner_controller_pod_security_context | to_nice_yaml(indent=2) | indent(2, true) }}
+securityContext:
+{{ k8s_github_actions_runner_controller_security_context | to_nice_yaml(indent=2) | indent(2, true) }}
+resources:
+{{ k8s_github_actions_runner_controller_resources | to_nice_yaml(indent=2) | indent(2, true) }}
+nodeSelector:
+{{ k8s_github_actions_runner_controller_node_selector | to_nice_yaml(indent=2) | indent(2, true) }}
+affinity:
+{{ k8s_github_actions_runner_controller_affinity | to_nice_yaml(indent=2) | indent(2, true) }}
+tolerations:
+{{ k8s_github_actions_runner_tolerations | to_nice_yaml(indent=2) | indent(2, true) }}

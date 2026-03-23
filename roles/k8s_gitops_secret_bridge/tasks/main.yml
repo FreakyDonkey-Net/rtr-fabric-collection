@@ -1,0 +1,176 @@
+---
+- name: Skip GitOps secret bridge when disabled
+  ansible.builtin.meta: end_host
+  when: not (k8s_gitops_secret_bridge_enabled | bool)
+
+- name: Ensure Kubernetes Python client package is installed
+  ansible.builtin.apt:
+    name: python3-kubernetes
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Assert GitOps bridge secret inputs are available
+  ansible.builtin.assert:
+    that:
+      - not (k8s_network_services_ldap_enabled | default(false) | bool) or (k8s_network_services_ldap_admin_password | string | trim | length) > 0
+      - >-
+        not (
+          (k8s_network_services_ldap_enabled | default(false) | bool)
+          and (k8s_network_services_ldap_tls_enabled | default(false) | bool)
+        )
+        or (k8s_network_services_ldap_tls_server_pem | string | trim | length) > 0
+      - >-
+        not (
+          (k8s_network_services_ldap_enabled | default(false) | bool)
+          and (k8s_network_services_ldap_tls_enabled | default(false) | bool)
+        )
+        or (k8s_network_services_ldap_tls_key_pem | string | trim | length) > 0
+      - >-
+        not (
+          (k8s_network_services_ldap_enabled | default(false) | bool)
+          and (k8s_network_services_ldap_tls_enabled | default(false) | bool)
+        )
+        or (k8s_network_services_ldap_tls_ca_pem | string | trim | length) > 0
+      - not (k8s_keycloak_enabled | default(false) | bool) or (k8s_keycloak_admin_password | string | trim | length) > 0
+      - not (k8s_keycloak_enabled | default(false) | bool) or (k8s_keycloak_db_password | string | trim | length) > 0
+      - not (k8s_keycloak_oauth2_proxy_enabled | default(false) | bool) or (k8s_keycloak_oauth2_client_secret | string | trim | length) > 0
+      - not (k8s_keycloak_oauth2_proxy_enabled | default(false) | bool) or (k8s_keycloak_oauth2_proxy_cookie_secret | string | trim | length) > 0
+    fail_msg: >-
+      GitOps secret bridge requires resolved OpenBao-backed values before it can
+      project Kubernetes consumer secrets.
+  no_log: true
+
+- name: Build Keycloak sensitive values payload
+  ansible.builtin.set_fact:
+    k8s_gitops_secret_bridge_keycloak_values_payload:
+      auth:
+        adminPassword: "{{ k8s_keycloak_admin_password }}"
+      postgresql:
+        auth:
+          password: "{{ k8s_keycloak_db_password }}"
+  no_log: true
+  when: k8s_keycloak_enabled | default(false) | bool
+
+- name: Render Keycloak sensitive values YAML
+  ansible.builtin.set_fact:
+    k8s_gitops_secret_bridge_keycloak_values_yaml: >-
+      {{
+        k8s_gitops_secret_bridge_keycloak_values_payload
+        | to_nice_yaml(indent=2)
+      }}
+  no_log: true
+  when: k8s_keycloak_enabled | default(false) | bool
+
+- name: Ensure Keycloak Helm values secret exists for Flux
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_gitops_secret_bridge_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ k8s_gitops_secret_bridge_keycloak_values_secret_name }}"
+        namespace: "{{ k8s_gitops_secret_bridge_flux_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: identity
+          app.kubernetes.io/managed-by: "{{ k8s_gitops_secret_bridge_managed_by }}"
+          freakydonkey.net/gitops-bridge: "true"
+      type: Opaque
+      stringData:
+        values.yaml: "{{ k8s_gitops_secret_bridge_keycloak_values_yaml }}"
+  no_log: true
+  when: k8s_keycloak_enabled | default(false) | bool
+
+- name: Ensure infra LDAP config secret exists for GitOps consumers
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_gitops_secret_bridge_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: infra-ldap-config
+        namespace: "{{ k8s_network_services_namespace }}"
+        labels:
+          app.kubernetes.io/name: infra-ldap
+          app.kubernetes.io/part-of: identity
+          app.kubernetes.io/managed-by: "{{ k8s_gitops_secret_bridge_managed_by }}"
+          freakydonkey.net/gitops-bridge: "true"
+      type: Opaque
+      stringData:
+        LDAP_ADMIN_PASSWORD: "{{ k8s_network_services_ldap_admin_password }}"
+  no_log: true
+  when: k8s_network_services_ldap_enabled | default(false) | bool
+
+- name: Ensure infra LDAP TLS secret exists for GitOps consumers
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_gitops_secret_bridge_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ k8s_network_services_ldap_tls_secret_name }}"
+        namespace: "{{ k8s_network_services_namespace }}"
+        labels:
+          app.kubernetes.io/name: infra-ldap
+          app.kubernetes.io/part-of: identity
+          app.kubernetes.io/managed-by: "{{ k8s_gitops_secret_bridge_managed_by }}"
+          freakydonkey.net/gitops-bridge: "true"
+      type: Opaque
+      stringData:
+        ldap.crt: "{{ k8s_network_services_ldap_tls_server_pem }}"
+        ldap.key: "{{ k8s_network_services_ldap_tls_key_pem }}"
+        ca.crt: "{{ k8s_network_services_ldap_tls_ca_pem }}"
+  no_log: true
+  when:
+    - k8s_network_services_ldap_enabled | default(false) | bool
+    - k8s_network_services_ldap_tls_enabled | default(false) | bool
+
+- name: Ensure Keycloak LDAP CA secret exists for GitOps consumers
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_gitops_secret_bridge_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ k8s_keycloak_ldap_ca_secret_name }}"
+        namespace: "{{ k8s_keycloak_namespace }}"
+        labels:
+          app.kubernetes.io/name: keycloak
+          app.kubernetes.io/part-of: identity
+          app.kubernetes.io/managed-by: "{{ k8s_gitops_secret_bridge_managed_by }}"
+          freakydonkey.net/gitops-bridge: "true"
+      type: Opaque
+      stringData:
+        ca.crt: "{{ k8s_network_services_ldap_tls_ca_pem }}"
+  no_log: true
+  when:
+    - k8s_keycloak_enabled | default(false) | bool
+    - k8s_keycloak_ldap_enabled | default(false) | bool
+    - k8s_network_services_ldap_tls_enabled | default(false) | bool
+
+- name: Ensure OAuth2 Proxy secret exists for current and future GitOps consumers
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_gitops_secret_bridge_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: oauth2-proxy-secrets
+        namespace: "{{ k8s_keycloak_namespace }}"
+        labels:
+          app.kubernetes.io/name: oauth2-proxy
+          app.kubernetes.io/part-of: identity
+          app.kubernetes.io/managed-by: "{{ k8s_gitops_secret_bridge_managed_by }}"
+          freakydonkey.net/gitops-bridge: "true"
+      type: Opaque
+      stringData:
+        client_id: "{{ k8s_keycloak_oauth2_client_id }}"
+        client_secret: "{{ k8s_keycloak_oauth2_client_secret }}"
+        cookie_secret: "{{ k8s_keycloak_oauth2_proxy_cookie_secret }}"
+  no_log: true
+  when: k8s_keycloak_oauth2_proxy_enabled | default(false) | bool

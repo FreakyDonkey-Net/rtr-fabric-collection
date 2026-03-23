@@ -1,0 +1,16 @@
+public_proxy_enabled: true
+public_proxy_dry_run: false
+public_proxy_expose_public_ports: false
+public_proxy_package_name: haproxy
+public_proxy_service_name: haproxy
+public_proxy_stats_bind_host: 127.0.0.1
+public_proxy_stats_port: 8404
+public_proxy_k3s_api_enabled: false
+public_proxy_k3s_api_bind_host: >-
+  {{
+    '0.0.0.0'
+    if (public_proxy_expose_public_ports | bool)
+    else '127.0.0.1'
+  }}
+public_proxy_k3s_api_bind_port: 16443
+public_proxy_k3s_api_backend_port: 6443

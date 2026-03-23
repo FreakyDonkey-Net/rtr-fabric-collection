@@ -1,0 +1,431 @@
+---
+- name: Validate GitHub Actions runner inputs
+  ansible.builtin.assert:
+    that:
+      - k8s_github_actions_runner_controller_namespace | string | trim | length > 0
+      - k8s_github_actions_runner_namespace | string | trim | length > 0
+      - k8s_github_actions_runner_scale_set_name | string | trim | length > 0
+      - (k8s_github_actions_runner_scale_set_name | string | trim | length) <= 45
+      - k8s_github_actions_runner_controller_chart_ref | string | trim | length > 0
+      - k8s_github_actions_runner_scale_set_chart_ref | string | trim | length > 0
+      - k8s_github_actions_runner_github_config_url | string | trim | length > 0
+      - k8s_github_actions_runner_github_config_url is match('^https://github\\.com/.+')
+      - k8s_github_actions_runner_github_auth_token | string | trim | length > 0
+      - k8s_github_actions_runner_local_secrets_source_file | string | trim | length > 0
+      - k8s_github_actions_runner_local_k3s_token_source_file | string | trim | length > 0
+      - k8s_github_actions_runner_local_ssh_private_key_file | string | trim | length > 0
+      - k8s_github_actions_runner_local_ssh_known_hosts_file | string | trim | length > 0
+
+- name: Validate local ARC support files exist
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop:
+    - path: "{{ k8s_github_actions_runner_local_secrets_source_file }}"
+      label: local secrets
+    - path: "{{ k8s_github_actions_runner_local_k3s_token_source_file }}"
+      label: k3s token
+    - path: "{{ k8s_github_actions_runner_local_ssh_private_key_file }}"
+      label: ssh private key
+    - path: "{{ k8s_github_actions_runner_local_ssh_known_hosts_file }}"
+      label: ssh known_hosts
+    - path: "{{ k8s_github_actions_runner_local_helm_binary }}"
+      label: local helm binary
+  loop_control:
+    label: "{{ item.label }}"
+  register: k8s_github_actions_runner_local_file_stats
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  changed_when: false
+
+- name: Assert required local ARC support files are present
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg or item.stat.islnk
+    fail_msg: "Required local file is missing: {{ item.item.path }}"
+  loop: "{{ k8s_github_actions_runner_local_file_stats.results }}"
+  loop_control:
+    label: "{{ item.item.label }}"
+
+- name: Assert OpenBao AppRole file paths are defined for prod runner mode
+  ansible.builtin.assert:
+    that:
+      - (openbao_approle_role_id_file | default('', true) | string | trim | length) > 0
+      - (openbao_approle_secret_id_file | default('', true) | string | trim | length) > 0
+    fail_msg: >-
+      OpenBao AppRole file paths must be defined in production runner mode.
+  when: rtr_fabric_is_prod | default(false) | bool
+
+- name: Validate local OpenBao AppRole files exist for prod runner mode
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop:
+    - path: "{{ openbao_approle_role_id_file | string | trim }}"
+      label: openbao approle role_id
+    - path: "{{ openbao_approle_secret_id_file | string | trim }}"
+      label: openbao approle secret_id
+  loop_control:
+    label: "{{ item.label }}"
+  register: k8s_github_actions_runner_openbao_local_file_stats
+  delegate_to: localhost
+  vars:
+    ansible_connection: local
+    ansible_become: false
+  when: rtr_fabric_is_prod | default(false) | bool
+  changed_when: false
+
+- name: Assert OpenBao AppRole files are present for prod runner mode
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg or item.stat.islnk
+    fail_msg: "Required local file is missing: {{ item.item.path }}"
+  loop: "{{ k8s_github_actions_runner_openbao_local_file_stats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.label }}"
+  when: rtr_fabric_is_prod | default(false) | bool
+
+- name: Ensure Kubernetes Python client package is installed
+  ansible.builtin.apt:
+    name: python3-kubernetes
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Check whether helm is available on the control-plane host
+  ansible.builtin.stat:
+    path: "{{ k8s_github_actions_runner_helm_bin }}"
+  register: k8s_github_actions_runner_remote_helm
+
+- name: Copy local helm binary to control-plane host when missing
+  ansible.builtin.copy:
+    src: "{{ k8s_github_actions_runner_local_helm_binary }}"
+    dest: "{{ k8s_github_actions_runner_helm_bin }}"
+    mode: "0755"
+  when:
+    - k8s_github_actions_runner_copy_local_helm_binary | bool
+    - not k8s_github_actions_runner_remote_helm.stat.exists
+
+- name: Validate helm is available on the control-plane host
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_github_actions_runner_helm_bin }}"
+      - version
+      - --short
+  environment: "{{ k8s_github_actions_runner_helm_environment }}"
+  changed_when: false
+
+- name: Build ARC runner SSH egress CIDRs
+  ansible.builtin.set_fact:
+    k8s_github_actions_runner_ssh_egress_cidrs: []
+  changed_when: false
+
+- name: Collect ARC runner SSH egress CIDRs from managed hosts
+  ansible.builtin.set_fact:
+    k8s_github_actions_runner_ssh_egress_cidrs: >-
+      {{
+        (
+          k8s_github_actions_runner_ssh_egress_cidrs
+          + [hostvars[item].ansible_host ~ '/32']
+        )
+        | unique
+      }}
+  loop: "{{ ((groups.get('rtr_fabric', []) | list) + (groups.get('external_edges', []) | list)) | unique }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - hostvars[item].ansible_host is defined
+    - hostvars[item].ansible_host is match('^[0-9]+(\\.[0-9]+){3}$')
+  changed_when: false
+
+- name: Initialize ARC runner SSH egress blocks
+  ansible.builtin.set_fact:
+    k8s_github_actions_runner_ssh_egress_blocks: []
+  changed_when: false
+
+- name: Build ARC runner SSH egress blocks
+  ansible.builtin.set_fact:
+    k8s_github_actions_runner_ssh_egress_blocks: >-
+      {{
+        k8s_github_actions_runner_ssh_egress_blocks
+        + [{'ipBlock': {'cidr': item}}]
+      }}
+  loop: "{{ k8s_github_actions_runner_ssh_egress_cidrs }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+
+- name: Ensure ARC controller namespace exists
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ k8s_github_actions_runner_controller_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ k8s_github_actions_runner_controller_namespace_pod_security_enforce }}"
+          pod-security.kubernetes.io/warn: "{{ k8s_github_actions_runner_controller_namespace_pod_security_warn }}"
+          pod-security.kubernetes.io/audit: "{{ k8s_github_actions_runner_controller_namespace_pod_security_audit }}"
+
+- name: Ensure ARC runner namespace exists
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ k8s_github_actions_runner_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ k8s_github_actions_runner_namespace_pod_security_enforce }}"
+          pod-security.kubernetes.io/warn: "{{ k8s_github_actions_runner_namespace_pod_security_warn }}"
+          pod-security.kubernetes.io/audit: "{{ k8s_github_actions_runner_namespace_pod_security_audit }}"
+
+- name: Ensure ARC controller namespace denies unsolicited ingress
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: default-deny-ingress
+        namespace: "{{ k8s_github_actions_runner_controller_namespace }}"
+      spec:
+        podSelector: {}
+        policyTypes:
+          - Ingress
+
+- name: Ensure ARC runner namespace denies unsolicited ingress
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: default-deny-ingress
+        namespace: "{{ k8s_github_actions_runner_namespace }}"
+      spec:
+        podSelector: {}
+        policyTypes:
+          - Ingress
+
+- name: Ensure ARC runner namespace allows DNS egress
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: allow-egress-dns
+        namespace: "{{ k8s_github_actions_runner_namespace }}"
+      spec:
+        podSelector: {}
+        policyTypes:
+          - Egress
+        egress:
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+                podSelector:
+                  matchLabels:
+                    k8s-app: kube-dns
+            ports:
+              - protocol: UDP
+                port: 53
+              - protocol: TCP
+                port: 53
+
+- name: Ensure ARC runner namespace allows HTTPS egress
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: allow-egress-https
+        namespace: "{{ k8s_github_actions_runner_namespace }}"
+      spec:
+        podSelector: {}
+        policyTypes:
+          - Egress
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+            ports:
+              - protocol: TCP
+                port: 443
+
+- name: Ensure ARC runner namespace allows SSH egress to managed nodes
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: allow-egress-ssh
+        namespace: "{{ k8s_github_actions_runner_namespace }}"
+      spec:
+        podSelector: {}
+        policyTypes:
+          - Egress
+        egress:
+          - to: "{{ k8s_github_actions_runner_ssh_egress_blocks }}"
+            ports:
+              - protocol: TCP
+                port: 22
+  when: (k8s_github_actions_runner_ssh_egress_cidrs | default([]) | length) > 0
+
+- name: Ensure ARC GitHub auth secret exists
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ k8s_github_actions_runner_github_auth_secret_name }}"
+        namespace: "{{ k8s_github_actions_runner_namespace }}"
+      type: Opaque
+      stringData:
+        github_token: "{{ k8s_github_actions_runner_github_auth_token }}"
+  no_log: true
+
+- name: Ensure ARC runner support secret exists
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ k8s_github_actions_runner_support_secret_name }}"
+        namespace: "{{ k8s_github_actions_runner_namespace }}"
+      type: Opaque
+      stringData:
+        99-secrets.local.yml: "{{ lookup('ansible.builtin.file', k8s_github_actions_runner_local_secrets_source_file) }}"
+        runner-secrets.prod.yml: "{{ lookup('ansible.builtin.file', k8s_github_actions_runner_local_secrets_source_file) }}"
+        k3s-token: "{{ lookup('ansible.builtin.file', k8s_github_actions_runner_local_k3s_token_source_file) }}"
+        id_ed25519: "{{ lookup('ansible.builtin.file', k8s_github_actions_runner_local_ssh_private_key_file) ~ '\n' }}"
+        known_hosts: "{{ lookup('ansible.builtin.file', k8s_github_actions_runner_local_ssh_known_hosts_file) }}"
+        openbao-approle-role-id: >-
+          {{ lookup('ansible.builtin.file', openbao_approle_role_id_file, errors='ignore') | default('', true) | string | trim }}
+        openbao-approle-secret-id: >-
+          {{ lookup('ansible.builtin.file', openbao_approle_secret_id_file, errors='ignore') | default('', true) | string | trim }}
+  no_log: true
+
+- name: Render ARC controller values
+  ansible.builtin.template:
+    src: controller-values.yaml.j2
+    dest: /tmp/arc-controller-values.yaml
+    mode: "0600"
+  changed_when: false
+
+- name: Install ARC controller
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_github_actions_runner_helm_bin }}
+      upgrade --install
+      {{ k8s_github_actions_runner_controller_release_name }}
+      {{ k8s_github_actions_runner_controller_chart_ref }}
+      --namespace {{ k8s_github_actions_runner_controller_namespace }}
+      --create-namespace
+      --wait
+      --timeout {{ k8s_github_actions_runner_helm_wait_timeout }}
+      {% if (k8s_github_actions_runner_controller_chart_version | default('', true) | string | trim | length) > 0 %}
+      --version {{ k8s_github_actions_runner_controller_chart_version }}
+      {% endif %}
+      -f /tmp/arc-controller-values.yaml
+      --kubeconfig {{ k8s_github_actions_runner_kubeconfig }}
+  register: k8s_github_actions_runner_controller_install
+  environment: "{{ k8s_github_actions_runner_helm_environment }}"
+  changed_when: >-
+    {{
+      'STATUS: deployed' in (k8s_github_actions_runner_controller_install.stdout | default(''))
+      or 'STATUS: pending-upgrade' in (k8s_github_actions_runner_controller_install.stdout | default(''))
+      or 'STATUS: pending-install' in (k8s_github_actions_runner_controller_install.stdout | default(''))
+    }}
+
+- name: Wait for ARC controller deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ k8s_github_actions_runner_controller_namespace }}"
+    name: "{{ k8s_github_actions_runner_controller_fullname_override }}"
+  register: k8s_github_actions_runner_controller_deploy
+  changed_when: false
+  retries: 30
+  delay: 5
+  until:
+    - (k8s_github_actions_runner_controller_deploy.resources | default([]) | length) > 0
+    - >-
+      (k8s_github_actions_runner_controller_deploy.resources[0].status.availableReplicas | default(0) | int)
+      >= 1
+
+- name: Render ARC runner scale set values
+  ansible.builtin.template:
+    src: runner-values.yaml.j2
+    dest: /tmp/arc-runner-values.yaml
+    mode: "0600"
+  changed_when: false
+
+- name: Install ARC runner scale set
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_github_actions_runner_helm_bin }}
+      upgrade --install
+      {{ k8s_github_actions_runner_scale_set_release_name }}
+      {{ k8s_github_actions_runner_scale_set_chart_ref }}
+      --namespace {{ k8s_github_actions_runner_namespace }}
+      --create-namespace
+      --wait
+      --timeout {{ k8s_github_actions_runner_helm_wait_timeout }}
+      {% if (k8s_github_actions_runner_scale_set_chart_version | default('', true) | string | trim | length) > 0 %}
+      --version {{ k8s_github_actions_runner_scale_set_chart_version }}
+      {% endif %}
+      -f /tmp/arc-runner-values.yaml
+      --kubeconfig {{ k8s_github_actions_runner_kubeconfig }}
+  register: k8s_github_actions_runner_scale_set_install
+  environment: "{{ k8s_github_actions_runner_helm_environment }}"
+  changed_when: >-
+    {{
+      'STATUS: deployed' in (k8s_github_actions_runner_scale_set_install.stdout | default(''))
+      or 'STATUS: pending-upgrade' in (k8s_github_actions_runner_scale_set_install.stdout | default(''))
+      or 'STATUS: pending-install' in (k8s_github_actions_runner_scale_set_install.stdout | default(''))
+    }}
+
+- name: Wait for ARC runner scale set object
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_github_actions_runner_kubeconfig }}"
+    api_version: actions.github.com/v1alpha1
+    kind: AutoscalingRunnerSet
+    namespace: "{{ k8s_github_actions_runner_namespace }}"
+    name: "{{ k8s_github_actions_runner_scale_set_name }}"
+  register: k8s_github_actions_runner_scale_set_info
+  changed_when: false
+  retries: 30
+  delay: 5
+  until: (k8s_github_actions_runner_scale_set_info.resources | default([]) | length) > 0
+
+- name: Show ARC runner summary
+  ansible.builtin.debug:
+    msg:
+      controller_namespace: "{{ k8s_github_actions_runner_controller_namespace }}"
+      controller_release: "{{ k8s_github_actions_runner_controller_release_name }}"
+      runner_namespace: "{{ k8s_github_actions_runner_namespace }}"
+      runner_release: "{{ k8s_github_actions_runner_scale_set_release_name }}"
+      github_config_url: "{{ k8s_github_actions_runner_github_config_url }}"
+      min_runners: "{{ k8s_github_actions_runner_min_runners | int }}"
+      max_runners: "{{ k8s_github_actions_runner_max_runners | int }}"
+  changed_when: false

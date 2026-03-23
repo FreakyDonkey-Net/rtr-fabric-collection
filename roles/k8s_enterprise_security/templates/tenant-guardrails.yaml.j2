@@ -1,0 +1,78 @@
+{% for tenant in (k8s_enterprise_security_tenant_namespaces | default([])) %}
+{% set tenant_labels = {
+  'freakydonkey.net/tenant': 'true',
+  'freakydonkey.net/tenant-name': (tenant.name | string),
+  'app.kubernetes.io/managed-by': 'ansible'
+} | combine(tenant.labels | default({}), recursive=True) %}
+{% set tenant_quota = (k8s_enterprise_security_tenant_namespace_defaults.resource_quota | default({})) | combine(tenant.resource_quota | default({}), recursive=True) %}
+{% set tenant_limit_range = (k8s_enterprise_security_tenant_namespace_defaults.limit_range | default({})) | combine(tenant.limit_range | default({}), recursive=True) %}
+{% set tenant_operator_groups = tenant.operator_groups | default([k8s_enterprise_security_rbac_groups.tenant_operator]) %}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ tenant.name }}
+  labels:
+{% for key, value in tenant_labels.items() %}
+    {{ key }}: "{{ value }}"
+{% endfor %}
+    pod-security.kubernetes.io/enforce: "{{ tenant.pod_security_enforce | default(k8s_enterprise_security_tenant_namespace_defaults.pod_security_enforce) }}"
+    pod-security.kubernetes.io/warn: "{{ tenant.pod_security_warn | default(k8s_enterprise_security_tenant_namespace_defaults.pod_security_warn) }}"
+    pod-security.kubernetes.io/audit: "{{ tenant.pod_security_audit | default(k8s_enterprise_security_tenant_namespace_defaults.pod_security_audit) }}"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-defaults
+  namespace: {{ tenant.name }}
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "{{ tenant_limit_range.default_cpu }}"
+        memory: "{{ tenant_limit_range.default_memory }}"
+      defaultRequest:
+        cpu: "{{ tenant_limit_range.default_request_cpu }}"
+        memory: "{{ tenant_limit_range.default_request_memory }}"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-quota
+  namespace: {{ tenant.name }}
+spec:
+  hard:
+    requests.cpu: "{{ tenant_quota.requests_cpu }}"
+    requests.memory: "{{ tenant_quota.requests_memory }}"
+    limits.cpu: "{{ tenant_quota.limits_cpu }}"
+    limits.memory: "{{ tenant_quota.limits_memory }}"
+    persistentvolumeclaims: "{{ tenant_quota.persistentvolumeclaims }}"
+    requests.storage: "{{ tenant_quota.requests_storage }}"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: {{ tenant.name }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-operators
+  namespace: {{ tenant.name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rtr-fabric-tenant-operator
+subjects:
+{% for group_name in tenant_operator_groups %}
+  - kind: Group
+    apiGroup: rbac.authorization.k8s.io
+    name: "{{ group_name }}"
+{% endfor %}
+{% endfor %}

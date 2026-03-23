@@ -1,0 +1,504 @@
+---
+- name: Skip kube-ovn underlay role when disabled
+  ansible.builtin.meta: end_host
+  when: not (kube_ovn_underlay_enabled | default(true) | bool)
+
+- name: Build effective underlay trunk interface map
+  ansible.builtin.set_fact:
+    kube_ovn_underlay_effective_trunk_map: >-
+      {%- set ns = namespace(items={}) -%}
+      {%- for node in (groups['bare_metal'] | default([])) -%}
+      {%-   set explicit = kube_ovn_underlay_trunk_interface_map[node] | default('') | string | trim -%}
+      {%-   set fallback = '' -%}
+      {%-   if explicit | length == 0 and node == 'rtr-bondy' -%}
+      {%-     set fallback = kube_ovn_underlay_trunk_interface_default_bondy | default('') | string | trim -%}
+      {%-   elif explicit | length == 0 and node == 'rtr-noisy' -%}
+      {%-     set fallback = kube_ovn_underlay_trunk_interface_default_noisy | default('') | string | trim -%}
+      {%-   endif -%}
+      {%-   set effective = explicit if (explicit | length) > 0 else fallback -%}
+      {%-   if effective | length > 0 -%}
+      {%-     set _ = ns.items.update({node: effective}) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  changed_when: false
+
+- name: Build effective underlay subnet list
+  ansible.builtin.set_fact:
+    kube_ovn_underlay_expected_subnets: "{{ fabric_underlay_subnets | default([]) }}"
+    kube_ovn_underlay_excluded_nodes: >-
+      {{
+        (groups['rtr_fabric'] | default([]))
+        | difference(groups['bare_metal'] | default([]))
+        | sort
+      }}
+    kube_ovn_underlay_provider_default_interface: >-
+      {{
+        (
+          kube_ovn_underlay_effective_trunk_map
+          | default({})
+          | dict2items
+          | map(attribute='value')
+          | unique
+          | list
+          | first
+        ) | default('', true)
+      }}
+  changed_when: false
+
+- name: Build effective underlay access port list for the local node
+  ansible.builtin.set_fact:
+    kube_ovn_underlay_local_access_ports_effective: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for port in (kube_ovn_underlay_access_ports | default([])) -%}
+      {%-   set iface = (
+              port.interface
+              | default(port.name | default(''))
+              | string
+              | trim
+            ) -%}
+      {%-   set vlan_id = (
+              port.vlan_id
+              | default(port.tag | default(0))
+              | int
+            ) -%}
+      {%-   if iface | length > 0 and vlan_id > 0 -%}
+      {%-     set _ = ns.items.append(
+              {
+                'interface': iface,
+                'vlan_id': vlan_id,
+                'description': (
+                  port.description
+                  | default('')
+                  | string
+                  | trim
+                )
+              }
+            ) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  changed_when: false
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Build effective underlay internal port list for the local node
+  ansible.builtin.set_fact:
+    kube_ovn_underlay_local_internal_ports_effective: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for port in (kube_ovn_underlay_internal_ports | default([])) -%}
+      {%-   set iface = (
+              port.interface
+              | default(port.name | default(''))
+              | string
+              | trim
+            ) -%}
+      {%-   set vlan_id = (
+              port.vlan_id
+              | default(port.tag | default(0))
+              | int
+            ) -%}
+      {%-   set ipv4_addresses = (
+              port.ipv4_addresses
+              | default(port.addresses | default([]))
+              | list
+            ) -%}
+      {%-   if iface | length > 0 and vlan_id > 0 -%}
+      {%-     set _ = ns.items.append(
+              {
+                'interface': iface,
+                'vlan_id': vlan_id,
+                'ipv4_addresses': ipv4_addresses,
+                'description': (
+                  port.description
+                  | default('')
+                  | string
+                  | trim
+                )
+              }
+            ) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  changed_when: false
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Ensure underlay trunk interface map is complete for bare metal nodes
+  ansible.builtin.assert:
+    that:
+      - (groups['bare_metal'] | default([]) | length) > 0
+      - (kube_ovn_underlay_effective_trunk_map | default({}) | length) == (groups['bare_metal'] | default([]) | length)
+      - (kube_ovn_underlay_provider_default_interface | default('') | length) > 0
+    fail_msg: >-
+      kube_ovn_underlay requires a resolved trunk interface for every bare-metal
+      node. Check kube_ovn_underlay_trunk_interface_map/defaults.
+
+- name: Ensure all underlay nodes share the same provider interface name
+  ansible.builtin.assert:
+    that:
+      - >-
+        (
+          kube_ovn_underlay_effective_trunk_map
+          | dict2items
+          | map(attribute='value')
+          | unique
+          | list
+          | length
+        ) == 1
+    fail_msg: >-
+      Current kube_ovn_underlay implementation supports one shared provider
+      interface name across bare-metal nodes.
+
+- name: Ensure local underlay artifact directory exists
+  ansible.builtin.file:
+    path: "{{ kube_ovn_underlay_artifact_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+
+- name: Write underlay trunk suggestion artifact
+  ansible.builtin.copy:
+    dest: "{{ kube_ovn_underlay_artifact_dir }}/trunk-suggestions.json"
+    mode: "0644"
+    content: |
+      {{
+        {
+          'provider_network': kube_ovn_underlay_provider_network_name,
+          'provider_interface': kube_ovn_underlay_provider_default_interface,
+          'node_trunk_map': kube_ovn_underlay_effective_trunk_map,
+          'subnets': kube_ovn_underlay_expected_subnets
+        } | to_nice_json
+      }}
+  delegate_to: localhost
+  become: false
+
+- name: Validate underlay access port declarations
+  ansible.builtin.assert:
+    that:
+      - (item.interface | string | length) > 0
+      - (item.vlan_id | int) > 0
+      - item.interface != (kube_ovn_underlay_effective_trunk_map[inventory_hostname] | default(''))
+    fail_msg: >-
+      Invalid underlay access port declaration on {{ inventory_hostname }}:
+      interface={{ item.interface }}, vlan={{ item.vlan_id }}.
+      Access ports must define a VLAN ID and cannot reuse the trunk interface.
+  loop: "{{ kube_ovn_underlay_local_access_ports_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.interface }} -> vlan {{ item.vlan_id }}"
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Validate underlay internal port declarations
+  ansible.builtin.assert:
+    that:
+      - (item.interface | string | length) > 0
+      - (item.vlan_id | int) > 0
+      - item.interface != (kube_ovn_underlay_effective_trunk_map[inventory_hostname] | default(''))
+      - item.interface not in (kube_ovn_underlay_local_access_ports_effective | default([]) | map(attribute='interface') | list)
+    fail_msg: >-
+      Invalid underlay internal port declaration on {{ inventory_hostname }}:
+      interface={{ item.interface }}, vlan={{ item.vlan_id }}.
+      Internal ports must define a VLAN ID and cannot reuse the trunk or access interfaces.
+  loop: "{{ kube_ovn_underlay_local_internal_ports_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.interface }} -> vlan {{ item.vlan_id }}"
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Check declared underlay access port interfaces exist
+  ansible.builtin.stat:
+    path: "/sys/class/net/{{ item.interface }}"
+  loop: "{{ kube_ovn_underlay_local_access_ports_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.interface }}"
+  register: kube_ovn_underlay_access_port_stats
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Assert underlay access port interfaces exist
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+    fail_msg: >-
+      Underlay access port interface {{ item.item.interface }} does not exist on {{ inventory_hostname }}.
+  loop: "{{ kube_ovn_underlay_access_port_stats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.interface }}"
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Read current OVS state for underlay access ports
+  ansible.builtin.shell: |
+    set -eu
+    bridge="$(ovs-vsctl port-to-br {{ item.interface | quote }} 2>/dev/null || true)"
+    tag="$(ovs-vsctl get port {{ item.interface | quote }} tag 2>/dev/null || true)"
+    mode="$(ovs-vsctl get port {{ item.interface | quote }} vlan_mode 2>/dev/null || true)"
+    trunks="$(ovs-vsctl get port {{ item.interface | quote }} trunks 2>/dev/null || true)"
+    printf 'bridge=%s\ntag=%s\nmode=%s\ntrunks=%s\n' "$bridge" "$tag" "$mode" "$trunks"
+  args:
+    executable: /bin/bash
+  loop: "{{ kube_ovn_underlay_local_access_ports_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.interface }}"
+  register: kube_ovn_underlay_access_port_state
+  changed_when: false
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Ensure underlay access ports are attached to br-underlay-net
+  ansible.builtin.command:
+    argv:
+      - ovs-vsctl
+      - --may-exist
+      - add-port
+      - br-underlay-net
+      - "{{ item.item.interface }}"
+      - --
+      - clear
+      - Port
+      - "{{ item.item.interface }}"
+      - trunks
+      - --
+      - set
+      - Port
+      - "{{ item.item.interface }}"
+      - "tag={{ item.item.vlan_id }}"
+      - vlan_mode=access
+  loop: "{{ kube_ovn_underlay_access_port_state.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.interface }} -> vlan {{ item.item.vlan_id }}"
+  when:
+    - inventory_hostname in (groups['bare_metal'] | default([]))
+    - >-
+      (
+        (
+          item.stdout
+          | regex_findall('bridge=(.*)')
+          | first
+          | default('')
+          | trim
+        ) != 'br-underlay-net'
+      )
+      or
+      (
+        (
+          item.stdout
+          | regex_findall('tag=(.*)')
+          | first
+          | default('0')
+          | regex_replace('^\"|\"$', '')
+          | trim
+          | int
+        ) != (item.item.vlan_id | int)
+      )
+      or
+      (
+        (
+          item.stdout
+          | regex_findall('mode=(.*)')
+          | first
+          | default('')
+          | regex_replace('^\"|\"$', '')
+          | trim
+        ) != 'access'
+      )
+      or
+      (
+        (
+          item.stdout
+          | regex_findall('trunks=(.*)')
+          | first
+          | default('[]')
+          | trim
+        ) != '[]'
+      )
+
+- name: Read current OVS state for underlay internal ports
+  ansible.builtin.shell: |
+    set -eu
+    bridge="$(ovs-vsctl port-to-br {{ item.interface | quote }} 2>/dev/null || true)"
+    tag="$(ovs-vsctl get port {{ item.interface | quote }} tag 2>/dev/null || true)"
+    mode="$(ovs-vsctl get port {{ item.interface | quote }} vlan_mode 2>/dev/null || true)"
+    trunks="$(ovs-vsctl get port {{ item.interface | quote }} trunks 2>/dev/null || true)"
+    type="$(ovs-vsctl get interface {{ item.interface | quote }} type 2>/dev/null || true)"
+    printf 'bridge=%s\ntag=%s\nmode=%s\ntrunks=%s\ntype=%s\n' "$bridge" "$tag" "$mode" "$trunks" "$type"
+  args:
+    executable: /bin/bash
+  loop: "{{ kube_ovn_underlay_local_internal_ports_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.interface }}"
+  register: kube_ovn_underlay_internal_port_state
+  changed_when: false
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Ensure underlay internal ports are attached to br-underlay-net
+  ansible.builtin.command:
+    argv:
+      - ovs-vsctl
+      - --may-exist
+      - add-port
+      - br-underlay-net
+      - "{{ item.item.interface }}"
+      - --
+      - clear
+      - Port
+      - "{{ item.item.interface }}"
+      - trunks
+      - --
+      - set
+      - Port
+      - "{{ item.item.interface }}"
+      - "tag={{ item.item.vlan_id }}"
+      - vlan_mode=access
+      - --
+      - set
+      - Interface
+      - "{{ item.item.interface }}"
+      - type=internal
+  loop: "{{ kube_ovn_underlay_internal_port_state.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.interface }} -> vlan {{ item.item.vlan_id }}"
+  when:
+    - inventory_hostname in (groups['bare_metal'] | default([]))
+    - >-
+      (
+        (
+          item.stdout
+          | regex_findall('bridge=(.*)')
+          | first
+          | default('')
+          | trim
+        ) != 'br-underlay-net'
+      )
+      or
+      (
+        (
+          item.stdout
+          | regex_findall('tag=(.*)')
+          | first
+          | default('0')
+          | regex_replace('^\"|\"$', '')
+          | trim
+          | int
+        ) != (item.item.vlan_id | int)
+      )
+      or
+      (
+        (
+          item.stdout
+          | regex_findall('mode=(.*)')
+          | first
+          | default('')
+          | regex_replace('^\"|\"$', '')
+          | trim
+        ) != 'access'
+      )
+      or
+      (
+        (
+          item.stdout
+          | regex_findall('trunks=(.*)')
+          | first
+          | default('[]')
+          | trim
+        ) != '[]'
+      )
+      or
+      (
+        (
+          item.stdout
+          | regex_findall('type=(.*)')
+          | first
+          | default('')
+          | regex_replace('^\"|\"$', '')
+          | trim
+        ) != 'internal'
+      )
+
+- name: Ensure underlay internal port links are up
+  ansible.builtin.command:
+    argv:
+      - ip
+      - link
+      - set
+      - dev
+      - "{{ item.interface }}"
+      - up
+  changed_when: false
+  loop: "{{ kube_ovn_underlay_local_internal_ports_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.interface }}"
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Read current IPv4 addresses for underlay internal ports
+  ansible.builtin.command:
+    argv:
+      - ip
+      - -4
+      - -o
+      - addr
+      - show
+      - dev
+      - "{{ item.interface }}"
+  register: kube_ovn_underlay_internal_port_ipv4_state
+  changed_when: false
+  failed_when: false
+  loop: "{{ kube_ovn_underlay_local_internal_ports_effective | default([]) }}"
+  loop_control:
+    label: "{{ item.interface }}"
+  when: inventory_hostname in (groups['bare_metal'] | default([]))
+
+- name: Ensure IPv4 addresses are configured on underlay internal ports
+  ansible.builtin.command:
+    argv:
+      - ip
+      - address
+      - replace
+      - "{{ item.1 }}"
+      - dev
+      - "{{ item.0.item.interface }}"
+  loop: "{{ kube_ovn_underlay_internal_port_ipv4_state.results | default([]) | subelements('item.ipv4_addresses', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.item.interface }} -> {{ item.1 }}"
+  when:
+    - inventory_hostname in (groups['bare_metal'] | default([]))
+    - item.1 not in ((item.0.stdout_lines | default([])) | join(' '))
+
+- name: Skip manifest apply on non-primary control nodes
+  ansible.builtin.meta: end_host
+  when: inventory_hostname != k3s_server_host
+
+- name: Render kube-ovn underlay manifest
+  ansible.builtin.template:
+    src: kube-ovn-underlay.yaml.j2
+    dest: /tmp/kube-ovn-underlay.yaml
+    mode: "0600"
+  changed_when: false
+
+- name: Compute kube-ovn underlay diff
+  ansible.builtin.command:
+    cmd: "{{ kube_ovn_underlay_kubectl_bin }} diff -f /tmp/kube-ovn-underlay.yaml"
+  register: kube_ovn_underlay_diff
+  failed_when: kube_ovn_underlay_diff.rc not in [0, 1]
+  changed_when: false
+
+- name: Show kube-ovn underlay dry-run diff state
+  ansible.builtin.debug:
+    msg: kube-ovn underlay manifest drift detected
+  changed_when: kube_ovn_underlay_diff.rc == 1
+  when: kube_ovn_underlay_dry_run | default(false) | bool
+
+- name: Apply kube-ovn underlay manifest
+  ansible.builtin.command:
+    cmd: "{{ kube_ovn_underlay_kubectl_bin }} apply -f /tmp/kube-ovn-underlay.yaml"
+  register: kube_ovn_underlay_apply
+  changed_when: >-
+    {{
+      ' created' in (kube_ovn_underlay_apply.stdout | default(''))
+      or ' configured' in (kube_ovn_underlay_apply.stdout | default(''))
+      or ' patched' in (kube_ovn_underlay_apply.stdout | default(''))
+    }}
+  when:
+    - not (kube_ovn_underlay_dry_run | default(false) | bool)
+    - kube_ovn_underlay_diff.rc == 1
+
+- name: Remove rendered kube-ovn underlay manifest
+  ansible.builtin.file:
+    path: /tmp/kube-ovn-underlay.yaml
+    state: absent
+  changed_when: false

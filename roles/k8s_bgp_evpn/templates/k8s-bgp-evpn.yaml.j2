@@ -1,0 +1,369 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ k8s_bgp_evpn_namespace }}
+{% for node in k8s_bgp_evpn_router_nodes %}
+{% set bfd_internal_enabled_for_node = (
+     (bgp_evpn_bfd_enabled | default(false) | bool)
+     and (node in (k8s_bgp_evpn_rr_nodes | default([])))
+     and ((k8s_bgp_evpn_rr_nodes | default([]) | difference([node]) | length) > 0)
+   ) %}
+{% set bfd_external_enabled_for_node = (
+     (
+       k8s_bgp_evpn_external_peers_effective
+       | default([])
+       | selectattr('node', 'equalto', node)
+       | selectattr('bfd', 'equalto', true)
+       | list
+       | length
+     ) > 0
+   ) %}
+{% set bfd_enabled_for_node = bfd_internal_enabled_for_node or bfd_external_enabled_for_node %}
+{% set ospf_external_enabled_for_node = (
+     (
+       k8s_bgp_evpn_external_peers_effective
+       | default([])
+       | selectattr('node', 'equalto', node)
+       | selectattr('ospf', 'equalto', true)
+       | list
+       | length
+     ) > 0
+   ) %}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wg-private-key-{{ node }}
+  namespace: {{ k8s_bgp_evpn_namespace }}
+type: Opaque
+stringData:
+  privatekey: {{ hostvars[node].wireguard_private_key_effective | to_json }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frr-conf-{{ node }}
+  namespace: {{ k8s_bgp_evpn_namespace }}
+data:
+  daemons: |
+    bgpd=yes
+    zebra=yes
+    watchfrr=yes
+    ospfd={{ 'yes' if ospf_external_enabled_for_node else 'no' }}
+    ospf6d=no
+    ripd=no
+    ripngd=no
+    isisd=no
+    pimd=no
+    ldpd=no
+    nhrpd=no
+    eigrpd=no
+    babeld=no
+    sharpd=no
+    pbrd=no
+    staticd=no
+    bfdd={{ 'yes' if bfd_enabled_for_node else 'no' }}
+    fabricd=no
+    vrrpd=no
+    pathd=no
+    vtysh_enable=yes
+  frr.conf: |
+    frr version 9.1
+    frr defaults datacenter
+    hostname {{ node }}
+    service integrated-vtysh-config
+    log stdout informational
+{% set external_peer_prefixes = [] %}
+{% for peer in (k8s_bgp_evpn_external_peers_effective | default([])) if peer.node == node %}
+{%   for prefix in (peer.peer_allowed_ips | default([])) %}
+{%     if prefix != '0.0.0.0/0' and prefix not in external_peer_prefixes %}
+{%       set _ = external_peer_prefixes.append(prefix) %}
+{%     endif %}
+{%   endfor %}
+{% endfor %}
+{% set external_gateway_proxy_prefixes = [] %}
+{% if node in (k8s_bgp_evpn_rr_nodes | default([])) %}
+{%   for prefix in (k8s_bgp_evpn_external_gateway_proxy_prefixes | default([])) %}
+{%     if prefix != '0.0.0.0/0' and prefix not in external_gateway_proxy_prefixes %}
+{%       set _ = external_gateway_proxy_prefixes.append(prefix) %}
+{%     endif %}
+{%   endfor %}
+{% endif %}
+{% if external_peer_prefixes | length > 0 %}
+    !
+    ip prefix-list ext-ipv4-{{ node }} seq 5 deny 0.0.0.0/0
+{%   for prefix in external_peer_prefixes %}
+    ip prefix-list ext-ipv4-{{ node }} seq {{ ((loop.index0 + 2) * 10) }} permit {{ prefix }}
+{%   endfor %}
+{% endif %}
+{% if external_gateway_proxy_prefixes | length > 0 %}
+    !
+    ip prefix-list ext-gateway-proxy-{{ node }} seq 5 deny 0.0.0.0/0
+{%   for prefix in external_gateway_proxy_prefixes %}
+    ip prefix-list ext-gateway-proxy-{{ node }} seq {{ ((loop.index0 + 2) * 10) }} permit {{ prefix }}
+{%   endfor %}
+{% endif %}
+{% if (external_peer_prefixes | length > 0) or (external_gateway_proxy_prefixes | length > 0) %}
+    !
+{%   if external_gateway_proxy_prefixes | length > 0 %}
+    route-map rr-internal-out-{{ node }} deny 5
+{%   if external_gateway_proxy_prefixes | length > 0 %}
+      match ip address prefix-list ext-gateway-proxy-{{ node }}
+{%   endif %}
+{%   endif %}
+{%   if external_peer_prefixes | length > 0 %}
+    !
+    route-map rr-internal-out-{{ node }} permit 10
+      match ip address prefix-list ext-ipv4-{{ node }}
+      set ip next-hop {{ hostvars[node].bgp_evpn_loopback_ip }}
+{%   endif %}
+    !
+    route-map rr-internal-out-{{ node }} permit 100
+{% endif %}
+{% if external_gateway_proxy_prefixes | length > 0 %}
+    !
+    route-map ext-peer-out-{{ node }} permit 10
+      match ip address prefix-list ext-gateway-proxy-{{ node }}
+      set ip next-hop {{ hostvars[node].bgp_evpn_loopback_ip }}
+    !
+    route-map ext-peer-out-{{ node }} permit 100
+{% endif %}
+{% if ospf_external_enabled_for_node %}
+    !
+    interface {{ bgp_evpn_wireguard_iface }}
+      ip ospf area {{ k8s_bgp_evpn_ospf_area | default('0.0.0.0') }}
+      ip ospf network {{ k8s_bgp_evpn_ospf_network_type | default('point-to-point') }}
+      ip ospf hello-interval {{ k8s_bgp_evpn_ospf_hello_interval | default(10) | int }}
+      ip ospf dead-interval {{ k8s_bgp_evpn_ospf_dead_interval | default(40) | int }}
+{%   if k8s_bgp_evpn_ospf_mtu_ignore | default(false) | bool %}
+      ip ospf mtu-ignore
+{%   endif %}
+    exit
+    !
+    router ospf
+      ospf router-id {{ hostvars[node].bgp_evpn_loopback_ip }}
+      passive-interface default
+      no passive-interface {{ bgp_evpn_wireguard_iface }}
+      network {{ hostvars[node].bgp_evpn_loopback_ip }}/32 area {{ k8s_bgp_evpn_ospf_area | default('0.0.0.0') }}
+{%   for peer in (k8s_bgp_evpn_external_peers_effective | default([])) if peer.node == node and (peer.ospf | default(false) | bool) %}
+      neighbor {{ peer.ospf_neighbor_ip }}
+{%   endfor %}
+    exit
+{% endif %}
+{% set global_neighbor_password = (k8s_bgp_evpn_neighbor_password | default('', true) | string | trim) %}
+    !
+    router bgp {{ bgp_evpn_asn }}
+      bgp router-id {{ hostvars[node].bgp_evpn_loopback_ip }}
+      no bgp ebgp-requires-policy
+      no bgp default ipv4-unicast
+      bgp log-neighbor-changes
+{% if bgp_evpn_graceful_restart | default(true) | bool %}
+      bgp graceful-restart
+{% endif %}
+      maximum-paths {{ bgp_evpn_maximum_paths }}
+{% for peer_node in (k8s_bgp_evpn_internal_neighbors[node] | default([])) %}
+      neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} remote-as {{ bgp_evpn_asn }}
+      neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} update-source {{ hostvars[node].bgp_evpn_loopback_ip }}
+      neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} timers {{ bgp_evpn_keepalive }} {{ bgp_evpn_holdtime }}
+      neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} disable-connected-check
+{%   if bfd_internal_enabled_for_node and (peer_node in (k8s_bgp_evpn_rr_nodes | default([]))) %}
+      neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} bfd
+{%   endif %}
+{%   if global_neighbor_password | length > 0 %}
+      neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} password {{ global_neighbor_password }}
+{%   endif %}
+{% endfor %}
+{% for peer in (k8s_bgp_evpn_external_peers_effective | default([])) if peer.node == node %}
+{%   set peer_password_enabled = (peer.password_enabled | default(true) | bool) %}
+{%   set peer_password_effective = ((peer.password | default(global_neighbor_password, true) | string | trim) if peer_password_enabled else '') %}
+      neighbor {{ peer.peer_ip }} remote-as {{ peer.peer_asn }}
+      neighbor {{ peer.peer_ip }} timers {{ peer.keepalive | default(10) }} {{ peer.holdtime | default(30) }}
+      neighbor {{ peer.peer_ip }} update-source {{ hostvars[node].bgp_evpn_loopback_ip }}
+      neighbor {{ peer.peer_ip }} disable-connected-check
+      neighbor {{ peer.peer_ip }} ebgp-multihop {{ peer.ebgp_multihop | default(2) }}
+{%   if peer.bfd | default(false) | bool %}
+      neighbor {{ peer.peer_ip }} bfd
+{%   endif %}
+{%   if peer_password_effective | length > 0 %}
+      neighbor {{ peer.peer_ip }} password {{ peer_password_effective }}
+{%   endif %}
+{% endfor %}
+      !
+      address-family ipv4 unicast
+{% for peer_node in (k8s_bgp_evpn_internal_neighbors[node] | default([])) %}
+        neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} activate
+{%   if (node in (k8s_bgp_evpn_rr_nodes | default([]))) and (peer_node not in (k8s_bgp_evpn_rr_nodes | default([]))) %}
+        neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} route-reflector-client
+{%   endif %}
+{%   if (node in (k8s_bgp_evpn_rr_nodes | default([]))) and ((external_peer_prefixes | length > 0) or (external_gateway_proxy_prefixes | length > 0)) %}
+        neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} route-map rr-internal-out-{{ node }} out
+{%   endif %}
+{% endfor %}
+{% for peer in (k8s_bgp_evpn_external_peers_effective | default([])) if peer.node == node %}
+        neighbor {{ peer.peer_ip }} activate
+{%   if external_gateway_proxy_prefixes | length > 0 %}
+        neighbor {{ peer.peer_ip }} route-map ext-peer-out-{{ node }} out
+{%   endif %}
+{% endfor %}
+{% for prefix in (hostvars[node].fabric_advertise_ipv4_networks | default([])) %}
+        network {{ prefix }}
+{% endfor %}
+{% if node in (k8s_bgp_evpn_rr_nodes | default([])) %}
+{%   for prefix in external_gateway_proxy_prefixes %}
+        network {{ prefix }}
+{%   endfor %}
+{% endif %}
+      exit-address-family
+      !
+      address-family l2vpn evpn
+{% for peer_node in (k8s_bgp_evpn_internal_neighbors[node] | default([])) %}
+        neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} activate
+{%   if (node in (k8s_bgp_evpn_rr_nodes | default([]))) and (peer_node not in (k8s_bgp_evpn_rr_nodes | default([]))) %}
+        neighbor {{ hostvars[peer_node].bgp_evpn_loopback_ip }} route-reflector-client
+{%   endif %}
+{% endfor %}
+        advertise-all-vni
+      exit-address-family
+    !
+    line vty
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: frr-evpn-{{ node }}
+  namespace: {{ k8s_bgp_evpn_namespace }}
+  labels:
+    app.kubernetes.io/name: frr-evpn
+    app.kubernetes.io/instance: {{ node }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frr-evpn
+      app.kubernetes.io/instance: {{ node }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frr-evpn
+        app.kubernetes.io/instance: {{ node }}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: {{ node }}
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: prepare-vxlan
+          image: {{ bgp_evpn_wireguard_image }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              desired_local_ip="{{ hostvars[node].wireguard_address | regex_replace('/.*$', '') }}"
+              desired_spec="id {{ bgp_evpn_vni }} dstport {{ bgp_evpn_vxlan_port }} local ${desired_local_ip}"
+              ip link show {{ bgp_evpn_bridge_name }} >/dev/null 2>&1 || ip link add {{ bgp_evpn_bridge_name }} type bridge
+              ip link set {{ bgp_evpn_bridge_name }} up || true
+              if ip -d link show {{ bgp_evpn_vxlan_name }} >/dev/null 2>&1; then
+                if ! ip -d link show {{ bgp_evpn_vxlan_name }} | grep -F "${desired_spec}" >/dev/null 2>&1; then
+                  ip link set {{ bgp_evpn_vxlan_name }} down || true
+                  ip link del {{ bgp_evpn_vxlan_name }} || true
+                fi
+              fi
+              if ! ip -d link show {{ bgp_evpn_vxlan_name }} >/dev/null 2>&1; then
+                ip link add {{ bgp_evpn_vxlan_name }} type vxlan id {{ bgp_evpn_vni }} dstport {{ bgp_evpn_vxlan_port }} local ${desired_local_ip} nolearning
+              fi
+              ip link set {{ bgp_evpn_vxlan_name }} master {{ bgp_evpn_bridge_name }} || true
+              ip link set {{ bgp_evpn_vxlan_name }} up || true
+              ip address replace {{ hostvars[node].bgp_evpn_loopback_ip }}/{{ bgp_evpn_loopback_prefixlen }} dev lo || true
+          securityContext:
+            privileged: true
+            capabilities:
+              add: [NET_ADMIN]
+      containers:
+        - name: wireguard-sync
+          image: {{ bgp_evpn_wireguard_image }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              modprobe wireguard >/dev/null 2>&1 || true
+              ip link show {{ bgp_evpn_wireguard_iface }} >/dev/null 2>&1 || ip link add {{ bgp_evpn_wireguard_iface }} type wireguard
+              while true; do
+                wg set {{ bgp_evpn_wireguard_iface }} private-key /etc/wireguard/privatekey listen-port {{ bgp_evpn_wireguard_listen_port }}
+                ip address replace {{ hostvars[node].wireguard_address }} dev {{ bgp_evpn_wireguard_iface }}
+{% for peer_node in (k8s_bgp_evpn_internal_neighbors[node] | default([])) %}
+                wg set {{ bgp_evpn_wireguard_iface }} peer {{ hostvars[peer_node].wireguard_public_key }} endpoint {{ hostvars[peer_node].wireguard_endpoint_host | default(hostvars[peer_node].node_public_ip | default(hostvars[peer_node].ansible_host)) }}:{{ hostvars[peer_node].wireguard_listen_port | default(bgp_evpn_wireguard_listen_port) }} allowed-ips {{ k8s_bgp_evpn_internal_wg_allowed_ips[node][peer_node] | join(',') }} persistent-keepalive {{ hostvars[peer_node].wireguard_persistent_keepalive | default(bgp_evpn_wireguard_persistent_keepalive) }}
+                ip route replace {{ hostvars[peer_node].bgp_evpn_loopback_ip }}/32 dev {{ bgp_evpn_wireguard_iface }} || true
+{%   for prefix in (k8s_bgp_evpn_internal_wg_host_routes[node][peer_node] | default([])) %}
+                ip route replace {{ prefix }} dev {{ bgp_evpn_wireguard_iface }} || true
+{%   endfor %}
+{% endfor %}
+{% for peer in (k8s_bgp_evpn_external_peers_effective | default([])) if peer.node == node %}
+                wg set {{ bgp_evpn_wireguard_iface }} peer {{ peer.peer_public_key }}{% if (peer.endpoint_host | default('') | string | length) > 0 %} endpoint {{ peer.endpoint_host }}:{{ peer.endpoint_port | default(bgp_evpn_wireguard_listen_port) }}{% endif %} allowed-ips {{ (peer.peer_allowed_ips | default([])) | join(',') }} persistent-keepalive {{ peer.persistent_keepalive | default(bgp_evpn_wireguard_persistent_keepalive) }}
+{% endfor %}
+                ip link set {{ bgp_evpn_wireguard_iface }} up || true
+                sleep {{ bgp_evpn_wireguard_sync_interval }}
+              done
+          securityContext:
+            privileged: true
+            capabilities:
+              add: [NET_ADMIN, SYS_MODULE]
+          resources:
+            requests:
+              cpu: {{ bgp_evpn_wireguard_resources_requests_cpu }}
+              memory: {{ bgp_evpn_wireguard_resources_requests_memory }}
+            limits:
+              cpu: {{ bgp_evpn_wireguard_resources_limits_cpu }}
+              memory: {{ bgp_evpn_wireguard_resources_limits_memory }}
+          volumeMounts:
+            - name: wireguard-private-key
+              mountPath: /etc/wireguard/privatekey
+              readOnly: true
+              subPath: privatekey
+            - name: host-lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+        - name: frr
+          image: {{ bgp_evpn_frr_image }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+          resources:
+            requests:
+              cpu: {{ bgp_evpn_frr_resources_requests_cpu }}
+              memory: {{ bgp_evpn_frr_resources_requests_memory }}
+            limits:
+              cpu: {{ bgp_evpn_frr_resources_limits_cpu }}
+              memory: {{ bgp_evpn_frr_resources_limits_memory }}
+          volumeMounts:
+            - name: frr-config
+              mountPath: /etc/frr/frr.conf
+              subPath: frr.conf
+            - name: frr-config
+              mountPath: /etc/frr/daemons
+              subPath: daemons
+            - name: frr-run
+              mountPath: /var/run/frr
+      volumes:
+        - name: frr-config
+          configMap:
+            name: frr-conf-{{ node }}
+        - name: frr-run
+          emptyDir: {}
+        - name: wireguard-private-key
+          secret:
+            secretName: wg-private-key-{{ node }}
+        - name: host-lib-modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
+{% endfor %}

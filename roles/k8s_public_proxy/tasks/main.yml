@@ -1,0 +1,319 @@
+- name: Optionally skip public proxy in dry-run mode
+  when: k8s_public_proxy_dry_run | default(false) | bool
+  block:
+    - name: Show public proxy dry-run summary
+      ansible.builtin.debug:
+        msg:
+          namespace: "{{ k8s_public_proxy_namespace }}"
+          deployment: "{{ k8s_public_proxy_deployment_name }}"
+          ingress_class: "{{ k8s_public_proxy_ingress_class_name }}"
+          replicas: "{{ k8s_public_proxy_replicas | int }}"
+      changed_when: false
+
+    - name: End host when public proxy dry-run is enabled
+      ansible.builtin.meta: end_host
+
+- name: Ensure Kubernetes Python client package is installed
+  ansible.builtin.apt:
+    name: python3-kubernetes
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Build public proxy node affinity
+  ansible.builtin.set_fact:
+    k8s_public_proxy_required_node_selector_terms: >-
+      {{
+        [
+          {
+            'matchExpressions': [
+              {
+                'key': k8s_frontend_label_key,
+                'operator': 'In',
+                'values': [k8s_frontend_label_value | string]
+              }
+            ]
+          }
+        ]
+        +
+        (
+          [
+            {
+              'matchExpressions': [
+                {
+                  'key': k8s_edge_label_key,
+                  'operator': 'In',
+                  'values': [k8s_edge_label_value | string]
+                }
+              ]
+            }
+          ]
+          if (k8s_public_proxy_allow_edge_backup | default(true) | bool)
+          else []
+        )
+      }}
+  changed_when: false
+
+- name: Ensure ingress namespace exists
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ k8s_public_proxy_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ k8s_public_proxy_namespace_pod_security_enforce }}"
+          pod-security.kubernetes.io/warn: "{{ k8s_public_proxy_namespace_pod_security_warn }}"
+          pod-security.kubernetes.io/audit: "{{ k8s_public_proxy_namespace_pod_security_audit }}"
+
+- name: Ensure ingress service account exists
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ k8s_public_proxy_serviceaccount_name }}"
+        namespace: "{{ k8s_public_proxy_namespace }}"
+
+- name: Ensure ingress controller configmap exists
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ k8s_public_proxy_configmap_name }}"
+        namespace: "{{ k8s_public_proxy_namespace }}"
+      data: {}
+
+- name: Ensure ingress controller cluster role exists
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: ingress-nginx
+      rules:
+        - apiGroups: [""]
+          resources:
+            - configmaps
+            - endpoints
+            - nodes
+            - pods
+            - secrets
+            - services
+            - events
+          verbs:
+            - get
+            - list
+            - watch
+            - create
+            - patch
+            - update
+        - apiGroups: ["networking.k8s.io"]
+          resources:
+            - ingresses
+            - ingresses/status
+            - ingressclasses
+          verbs:
+            - get
+            - list
+            - watch
+            - update
+            - patch
+        - apiGroups: ["discovery.k8s.io"]
+          resources:
+            - endpointslices
+          verbs:
+            - get
+            - list
+            - watch
+        - apiGroups: ["coordination.k8s.io"]
+          resources:
+            - leases
+          verbs:
+            - get
+            - list
+            - watch
+            - create
+            - update
+            - patch
+
+- name: Ensure ingress controller cluster role binding exists
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: ingress-nginx
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: ingress-nginx
+      subjects:
+        - kind: ServiceAccount
+          name: "{{ k8s_public_proxy_serviceaccount_name }}"
+          namespace: "{{ k8s_public_proxy_namespace }}"
+
+- name: Ensure public ingress class exists
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: IngressClass
+      metadata:
+        name: "{{ k8s_public_proxy_ingress_class_name }}"
+      spec:
+        controller: "{{ k8s_public_proxy_controller_class_name }}"
+
+- name: Ensure public ingress controller deployment exists
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "{{ k8s_public_proxy_deployment_name }}"
+        namespace: "{{ k8s_public_proxy_namespace }}"
+        labels:
+          app.kubernetes.io/name: ingress-nginx
+      spec:
+        replicas: "{{ k8s_public_proxy_replicas | int }}"
+        selector:
+          matchLabels:
+            app.kubernetes.io/component: controller
+            app.kubernetes.io/name: ingress-nginx
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxSurge: "{{ k8s_public_proxy_max_surge }}"
+            maxUnavailable: "{{ k8s_public_proxy_max_unavailable }}"
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/component: controller
+              app.kubernetes.io/name: ingress-nginx
+          spec:
+            serviceAccountName: "{{ k8s_public_proxy_serviceaccount_name }}"
+            serviceAccount: "{{ k8s_public_proxy_serviceaccount_name }}"
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            containers:
+              - name: controller
+                image: "{{ k8s_public_proxy_image }}"
+                imagePullPolicy: IfNotPresent
+                args:
+                  - /nginx-ingress-controller
+                  - "--ingress-class={{ k8s_public_proxy_ingress_class_name }}"
+                  - "--controller-class={{ k8s_public_proxy_controller_class_name }}"
+                  - "--configmap=$(POD_NAMESPACE)/{{ k8s_public_proxy_configmap_name }}"
+                  - "--default-server-port={{ k8s_public_proxy_default_server_port | int }}"
+                  - --watch-ingress-without-class=false
+                env:
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.name
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+                ports:
+                  - name: http
+                    containerPort: "{{ k8s_public_proxy_http_port | int }}"
+                    protocol: TCP
+                  - name: https
+                    containerPort: "{{ k8s_public_proxy_https_port | int }}"
+                    protocol: TCP
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                  limits:
+                    cpu: "1"
+                    memory: 512Mi
+                securityContext:
+                  allowPrivilegeEscalation: "{{ k8s_public_proxy_allow_privilege_escalation | bool }}"
+                  readOnlyRootFilesystem: "{{ k8s_public_proxy_read_only_root_filesystem | bool }}"
+                  runAsNonRoot: "{{ k8s_public_proxy_run_as_non_root | bool }}"
+                  runAsUser: "{{ k8s_public_proxy_run_as_user | int }}"
+                  runAsGroup: "{{ k8s_public_proxy_run_as_group | int }}"
+                  seccompProfile:
+                    type: "{{ k8s_public_proxy_seccomp_type }}"
+                  appArmorProfile:
+                    type: "{{ k8s_public_proxy_apparmor_type }}"
+                  capabilities:
+                    drop: "{{ k8s_public_proxy_capabilities_drop }}"
+                    add: "{{ k8s_public_proxy_capabilities_add }}"
+            affinity:
+              nodeAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    preference:
+                      matchExpressions:
+                        - key: "{{ k8s_frontend_label_key }}"
+                          operator: In
+                          values:
+                            - "{{ k8s_frontend_label_value | string }}"
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms: "{{ k8s_public_proxy_required_node_selector_terms }}"
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/component: controller
+                        app.kubernetes.io/name: ingress-nginx
+            tolerations: >-
+              {{
+                [
+                  {
+                    'key': k8s_edge_taint_key,
+                    'operator': 'Equal',
+                    'value': (k8s_edge_taint_value | string),
+                    'effect': k8s_edge_taint_effect
+                  }
+                ]
+                if (k8s_public_proxy_allow_edge_backup | default(true) | bool)
+                else []
+              }}
+
+- name: Wait for ingress controller rollout
+  kubernetes.core.k8s_info:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ k8s_public_proxy_namespace }}"
+    name: "{{ k8s_public_proxy_deployment_name }}"
+  register: k8s_public_proxy_deploy_info
+  changed_when: false
+  retries: 30
+  delay: 5
+  until:
+    - (k8s_public_proxy_deploy_info.resources | length) > 0
+    - >-
+      (k8s_public_proxy_deploy_info.resources[0].status.availableReplicas | default(0) | int)
+      >=
+      (k8s_public_proxy_replicas | int)
+
+- name: Show public proxy summary
+  ansible.builtin.debug:
+    msg:
+      namespace: "{{ k8s_public_proxy_namespace }}"
+      deployment: "{{ k8s_public_proxy_deployment_name }}"
+      replicas: "{{ k8s_public_proxy_replicas | int }}"
+      ingress_class: "{{ k8s_public_proxy_ingress_class_name }}"
+  changed_when: false

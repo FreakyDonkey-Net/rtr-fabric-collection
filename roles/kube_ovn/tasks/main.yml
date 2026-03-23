@@ -1,0 +1,402 @@
+---
+- name: Assert kube-ovn control host exposes kubectl
+  ansible.builtin.command:
+    cmd: "{{ kube_ovn_kubectl_bin }} version --client"
+  changed_when: false
+
+- name: Collect kube-ovn controller deployment
+  ansible.builtin.command:
+    cmd: >-
+      {{ kube_ovn_kubectl_bin }} -n {{ kube_ovn_namespace }}
+      get deployment {{ kube_ovn_controller_deployment_name }}
+      -o json
+  register: kube_ovn_controller_deployment_raw
+  changed_when: false
+
+- name: Collect kube-ovn cni daemonset
+  ansible.builtin.command:
+    cmd: >-
+      {{ kube_ovn_kubectl_bin }} -n {{ kube_ovn_namespace }}
+      get daemonset {{ kube_ovn_cni_daemonset_name }}
+      -o json
+  register: kube_ovn_cni_daemonset_raw
+  changed_when: false
+
+- name: Collect kube-ovn ovs daemonset
+  ansible.builtin.command:
+    cmd: >-
+      {{ kube_ovn_kubectl_bin }} -n {{ kube_ovn_namespace }}
+      get daemonset {{ kube_ovn_ovs_daemonset_name }}
+      -o json
+  register: kube_ovn_ovs_daemonset_raw
+  changed_when: false
+
+- name: Build live kube-ovn resource facts
+  ansible.builtin.set_fact:
+    kube_ovn_controller_deployment_live: "{{ kube_ovn_controller_deployment_raw.stdout | from_json }}"
+    kube_ovn_cni_daemonset_live: "{{ kube_ovn_cni_daemonset_raw.stdout | from_json }}"
+    kube_ovn_ovs_daemonset_live: "{{ kube_ovn_ovs_daemonset_raw.stdout | from_json }}"
+  changed_when: false
+
+- name: Build effective kube-ovn controller args
+  ansible.builtin.set_fact:
+    kube_ovn_controller_args_live: >-
+      {{
+        (
+          kube_ovn_controller_deployment_live.spec.template.spec.containers
+          | selectattr('name', 'equalto', kube_ovn_controller_container_name)
+          | map(attribute='args')
+          | list
+          | first
+        ) | default([], true)
+      }}
+  changed_when: false
+
+- name: Compute effective kube-ovn controller args
+  ansible.builtin.set_fact:
+    kube_ovn_controller_args_effective: >-
+      {{
+        (
+          kube_ovn_controller_args_live
+          | map('regex_replace', '^--network-type=.*$', '--network-type=' ~ kube_ovn_tunnel_type)
+          | list
+        )
+      }}
+  changed_when: false
+
+- name: Build effective kube-ovn cni args
+  ansible.builtin.set_fact:
+    kube_ovn_cni_args_live: >-
+      {{
+        (
+          kube_ovn_cni_daemonset_live.spec.template.spec.containers
+          | selectattr('name', 'equalto', kube_ovn_cni_container_name)
+          | map(attribute='args')
+          | list
+          | first
+        ) | default([], true)
+      }}
+  changed_when: false
+
+- name: Compute effective kube-ovn cni args
+  ansible.builtin.set_fact:
+    kube_ovn_cni_args_effective: >-
+      {%- set ns = namespace(items=[], has_tunnel=false, has_ovs_concurrency=false) -%}
+      {%- for item in (kube_ovn_cni_args_live | default([])) -%}
+      {%-   if item is match('^--network-type=') -%}
+      {%-     set _ = ns.items.append('--network-type=' ~ kube_ovn_tunnel_type) -%}
+      {%-     set ns.has_tunnel = true -%}
+      {%-   elif item is match('^--ovs-vsctl-concurrency=') -%}
+      {%-     set _ = ns.items.append('--ovs-vsctl-concurrency=' ~ (kube_ovn_cni_ovs_vsctl_concurrency | int | string)) -%}
+      {%-     set ns.has_ovs_concurrency = true -%}
+      {%-   else -%}
+      {%-     set _ = ns.items.append(item) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {%- if not ns.has_tunnel -%}
+      {%-   set _ = ns.items.append('--network-type=' ~ kube_ovn_tunnel_type) -%}
+      {%- endif -%}
+      {%- if not ns.has_ovs_concurrency -%}
+      {%-   set _ = ns.items.append('--ovs-vsctl-concurrency=' ~ (kube_ovn_cni_ovs_vsctl_concurrency | int | string)) -%}
+      {%- endif -%}
+      {{ ns.items }}
+  changed_when: false
+
+- name: Build live kube-ovn cni probes
+  ansible.builtin.set_fact:
+    kube_ovn_cni_liveness_probe_live: >-
+      {{
+        (
+          kube_ovn_cni_daemonset_live.spec.template.spec.containers
+          | selectattr('name', 'equalto', kube_ovn_cni_container_name)
+          | map(attribute='livenessProbe')
+          | list
+          | first
+        ) | default({}, true)
+      }}
+    kube_ovn_cni_readiness_probe_live: >-
+      {{
+        (
+          kube_ovn_cni_daemonset_live.spec.template.spec.containers
+          | selectattr('name', 'equalto', kube_ovn_cni_container_name)
+          | map(attribute='readinessProbe')
+          | list
+          | first
+        ) | default({}, true)
+      }}
+  changed_when: false
+
+- name: Compute effective kube-ovn cni probes
+  ansible.builtin.set_fact:
+    kube_ovn_cni_liveness_probe_effective: >-
+      {{
+        (kube_ovn_cni_liveness_probe_live | default({}))
+        | combine(
+            {
+              'initialDelaySeconds': (kube_ovn_cni_liveness_initial_delay_seconds | int),
+              'periodSeconds': (kube_ovn_cni_liveness_period_seconds | int),
+              'timeoutSeconds': (kube_ovn_cni_liveness_timeout_seconds | int),
+              'failureThreshold': (kube_ovn_cni_liveness_failure_threshold | int)
+            },
+            recursive=True
+          )
+      }}
+    kube_ovn_cni_readiness_probe_effective: >-
+      {{
+        (kube_ovn_cni_readiness_probe_live | default({}))
+        | combine(
+            {
+              'periodSeconds': (kube_ovn_cni_readiness_period_seconds | int),
+              'timeoutSeconds': (kube_ovn_cni_readiness_timeout_seconds | int),
+              'failureThreshold': (kube_ovn_cni_readiness_failure_threshold | int)
+            },
+            recursive=True
+          )
+      }}
+  changed_when: false
+
+- name: Build effective kube-ovn ovs environment
+  ansible.builtin.set_fact:
+    kube_ovn_ovs_env_live: >-
+      {{
+        (
+          kube_ovn_ovs_daemonset_live.spec.template.spec.containers
+          | selectattr('name', 'equalto', kube_ovn_ovs_container_name)
+          | map(attribute='env')
+          | list
+          | first
+        ) | default([], true)
+      }}
+  changed_when: false
+
+- name: Compute effective kube-ovn ovs environment
+  ansible.builtin.set_fact:
+    kube_ovn_ovs_env_effective: >-
+      {%- set ns = namespace(items=[], found=false) -%}
+      {%- for item in (kube_ovn_ovs_env_live | default([])) -%}
+      {%-   if (item.name | default('')) == 'TUNNEL_TYPE' -%}
+      {%-     set _ = ns.items.append(item | combine({'value': kube_ovn_tunnel_type})) -%}
+      {%-     set ns.found = true -%}
+      {%-   else -%}
+      {%-     set _ = ns.items.append(item) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {%- if not ns.found -%}
+      {%-   set _ = ns.items.append({'name': 'TUNNEL_TYPE', 'value': kube_ovn_tunnel_type}) -%}
+      {%- endif -%}
+      {{ ns.items }}
+  changed_when: false
+
+- name: Assert kube-ovn live resources expose tunnel type knobs
+  ansible.builtin.assert:
+    that:
+      - (kube_ovn_controller_args_live | select('match', '^--network-type=') | list | length) == 1
+      - (kube_ovn_cni_args_live | select('match', '^--network-type=') | list | length) == 1
+      - >-
+        (
+          kube_ovn_ovs_env_live
+          | selectattr('name', 'equalto', 'TUNNEL_TYPE')
+          | list
+          | length
+        ) == 1
+    fail_msg: >-
+      Live kube-ovn resources do not expose the expected tunnel type flags.
+      Inspect kube-ovn-controller, kube-ovn-cni, and ovs-ovn before reconciling.
+
+- name: Compute kube-ovn tunnel drift state
+  ansible.builtin.set_fact:
+    kube_ovn_controller_tunnel_drift: "{{ kube_ovn_controller_args_live != kube_ovn_controller_args_effective }}"
+    kube_ovn_cni_tunnel_drift: "{{ kube_ovn_cni_args_live != kube_ovn_cni_args_effective }}"
+    kube_ovn_cni_probe_drift: >-
+      {{
+        (kube_ovn_cni_liveness_probe_live != kube_ovn_cni_liveness_probe_effective)
+        or (kube_ovn_cni_readiness_probe_live != kube_ovn_cni_readiness_probe_effective)
+      }}
+    kube_ovn_ovs_tunnel_drift: "{{ kube_ovn_ovs_env_live != kube_ovn_ovs_env_effective }}"
+  changed_when: false
+
+- name: Patch kube-ovn controller tunnel type
+  ansible.builtin.command:
+    argv:
+      - "{{ kube_ovn_kubectl_bin }}"
+      - -n
+      - "{{ kube_ovn_namespace }}"
+      - patch
+      - deployment
+      - "{{ kube_ovn_controller_deployment_name }}"
+      - --type
+      - strategic
+      - --patch
+      - >-
+        {{
+          {
+            'spec': {
+              'template': {
+                'spec': {
+                  'containers': [
+                    {
+                      'name': kube_ovn_controller_container_name,
+                      'args': kube_ovn_controller_args_effective,
+                    }
+                  ]
+                }
+              }
+            }
+          } | to_json
+        }}
+  register: kube_ovn_controller_patch
+  changed_when: true
+  when: kube_ovn_controller_tunnel_drift | bool
+
+- name: Patch kube-ovn cni tunnel type
+  ansible.builtin.command:
+    argv:
+      - "{{ kube_ovn_kubectl_bin }}"
+      - -n
+      - "{{ kube_ovn_namespace }}"
+      - patch
+      - daemonset
+      - "{{ kube_ovn_cni_daemonset_name }}"
+      - --type
+      - strategic
+      - --patch
+      - >-
+        {{
+          {
+            'spec': {
+              'template': {
+                'spec': {
+                  'containers': [
+                    {
+                      'name': kube_ovn_cni_container_name,
+                      'args': kube_ovn_cni_args_effective,
+                      'livenessProbe': kube_ovn_cni_liveness_probe_effective,
+                      'readinessProbe': kube_ovn_cni_readiness_probe_effective,
+                    }
+                  ]
+                }
+              }
+            }
+          } | to_json
+        }}
+  register: kube_ovn_cni_patch
+  changed_when: true
+  when:
+    - (kube_ovn_cni_tunnel_drift | bool) or (kube_ovn_cni_probe_drift | bool)
+
+- name: Patch kube-ovn ovs tunnel type
+  ansible.builtin.command:
+    argv:
+      - "{{ kube_ovn_kubectl_bin }}"
+      - -n
+      - "{{ kube_ovn_namespace }}"
+      - patch
+      - daemonset
+      - "{{ kube_ovn_ovs_daemonset_name }}"
+      - --type
+      - strategic
+      - --patch
+      - >-
+        {{
+          {
+            'spec': {
+              'template': {
+                'spec': {
+                  'containers': [
+                    {
+                      'name': kube_ovn_ovs_container_name,
+                      'env': kube_ovn_ovs_env_effective,
+                    }
+                  ]
+                }
+              }
+            }
+          } | to_json
+        }}
+  register: kube_ovn_ovs_patch
+  changed_when: true
+  when: kube_ovn_ovs_tunnel_drift | bool
+
+- name: Wait for kube-ovn controller rollout
+  ansible.builtin.command:
+    cmd: >-
+      {{ kube_ovn_kubectl_bin }} -n {{ kube_ovn_namespace }}
+      rollout status deployment/{{ kube_ovn_controller_deployment_name }}
+      --timeout={{ kube_ovn_rollout_timeout }}
+  changed_when: false
+  when: kube_ovn_controller_tunnel_drift | bool
+
+- name: Wait for kube-ovn cni rollout
+  ansible.builtin.command:
+    cmd: >-
+      {{ kube_ovn_kubectl_bin }} -n {{ kube_ovn_namespace }}
+      rollout status daemonset/{{ kube_ovn_cni_daemonset_name }}
+      --timeout={{ kube_ovn_rollout_timeout }}
+  changed_when: false
+  when:
+    - (kube_ovn_cni_tunnel_drift | bool) or (kube_ovn_cni_probe_drift | bool)
+
+- name: Wait for kube-ovn ovs rollout
+  ansible.builtin.command:
+    cmd: >-
+      {{ kube_ovn_kubectl_bin }} -n {{ kube_ovn_namespace }}
+      rollout status daemonset/{{ kube_ovn_ovs_daemonset_name }}
+      --timeout={{ kube_ovn_rollout_timeout }}
+  changed_when: false
+  when: kube_ovn_ovs_tunnel_drift | bool
+
+- name: Collect kube-ovn daemonset readiness
+  ansible.builtin.command:
+    cmd: >-
+      {{ kube_ovn_kubectl_bin }} -n {{ kube_ovn_namespace }}
+      get daemonset {{ item }}
+      -o jsonpath={.status.numberReady}/{.status.desiredNumberScheduled}
+  loop: "{{ kube_ovn_expected_daemonsets }}"
+  loop_control:
+    label: "{{ item }}"
+  register: kube_ovn_daemonset_status
+  changed_when: false
+
+- name: Collect kube-ovn deployment readiness
+  ansible.builtin.command:
+    cmd: >-
+      {{ kube_ovn_kubectl_bin }} -n {{ kube_ovn_namespace }}
+      get deployment {{ item }}
+      -o jsonpath={.status.readyReplicas}/{.status.replicas}
+  loop: "{{ kube_ovn_expected_deployments }}"
+  loop_control:
+    label: "{{ item }}"
+  register: kube_ovn_deployment_status
+  changed_when: false
+
+- name: Assert kube-ovn daemonsets are ready
+  ansible.builtin.assert:
+    that:
+      - item.stdout is match('^[1-9][0-9]*/[1-9][0-9]*$')
+      - (item.stdout.split('/')[0] | int) == (item.stdout.split('/')[1] | int)
+    fail_msg: "Kube-OVN daemonset {{ item.item }} is not ready: {{ item.stdout }}"
+  loop: "{{ kube_ovn_daemonset_status.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Assert kube-ovn deployments are ready
+  ansible.builtin.assert:
+    that:
+      - item.stdout is match('^[1-9][0-9]*/[1-9][0-9]*$')
+      - (item.stdout.split('/')[0] | int) == (item.stdout.split('/')[1] | int)
+    fail_msg: "Kube-OVN deployment {{ item.item }} is not ready: {{ item.stdout }}"
+  loop: "{{ kube_ovn_deployment_status.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Show kube-ovn readiness summary
+  ansible.builtin.debug:
+    msg:
+      tunnel_type: "{{ kube_ovn_tunnel_type }}"
+      controller_drift: "{{ kube_ovn_controller_tunnel_drift }}"
+      cni_drift: "{{ kube_ovn_cni_tunnel_drift }}"
+      cni_probe_drift: "{{ kube_ovn_cni_probe_drift }}"
+      ovs_drift: "{{ kube_ovn_ovs_tunnel_drift }}"
+      daemonsets: "{{ kube_ovn_daemonset_status.results | map(attribute='stdout') | list }}"
+      deployments: "{{ kube_ovn_deployment_status.results | map(attribute='stdout') | list }}"
+  changed_when: false

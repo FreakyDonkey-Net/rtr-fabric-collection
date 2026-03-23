@@ -1,0 +1,6 @@
+---
+k8s_gitops_secret_bridge_kubeconfig: /etc/rancher/k3s/k3s.yaml
+k8s_gitops_secret_bridge_enabled: true
+k8s_gitops_secret_bridge_flux_namespace: flux-system
+k8s_gitops_secret_bridge_keycloak_values_secret_name: keycloak-sensitive-values
+k8s_gitops_secret_bridge_managed_by: ansible

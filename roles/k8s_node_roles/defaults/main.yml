@@ -1,0 +1,2 @@
+k8s_node_roles_kubectl_bin: kubectl
+k8s_node_roles_edge_taint_enabled: "{{ k8s_edge_prefer_noschedule | default(true) | bool }}"

@@ -1,0 +1,246 @@
+---
+- name: Build effective upstream DNS server list
+  ansible.builtin.set_fact:
+    openwrt_dns_forwarders_servers_effective: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for srv in (openwrt_dns_forwarders_servers | default([])) -%}
+      {%-   set raw = (srv | string | trim) -%}
+      {%-   if raw | length > 0 -%}
+      {%-     set normalized = raw if ('#' in raw) else (raw ~ '#' ~ (openwrt_dns_forwarders_server_port | default(53) | string)) -%}
+      {%-     set _ = ns.items.append(normalized) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {%- if openwrt_dns_forwarders_allow_fallback | default(false) | bool -%}
+      {%-   for srv in (openwrt_dns_forwarders_fallback_servers | default([])) -%}
+      {%-     set raw = (srv | string | trim) -%}
+      {%-     if raw | length > 0 -%}
+      {%-       set normalized = raw if ('#' in raw) else (raw ~ '#' ~ (openwrt_dns_forwarders_server_port | default(53) | string)) -%}
+      {%-       set _ = ns.items.append(normalized) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%- endif -%}
+      {{ ns.items | unique | list }}
+
+- name: Validate DNS forwarder inputs
+  ansible.builtin.assert:
+    that:
+      - (openwrt_dns_forwarders_servers_effective | default([])) | length > 0
+      - not (
+          (openwrt_dns_forwarders_strict_order | default(true) | bool)
+          and (openwrt_dns_forwarders_allservers | default(false) | bool)
+        )
+    fail_msg: >-
+      openwrt_dns_forwarders_servers_effective is empty. Configure at least one
+      upstream resolver before enabling the role. `strict_order=true` and
+      `allservers=true` are mutually exclusive.
+
+- name: Normalize dnsmasq rebind_domain allowlist
+  ansible.builtin.set_fact:
+    openwrt_dns_forwarders_rebind_domains_effective: >-
+      {{
+        (openwrt_dns_forwarders_rebind_domain_allowlist | default([]))
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    openwrt_dns_forwarders_servers_serialized: >-
+      {{ (openwrt_dns_forwarders_servers_effective | default([])) | join(' ') }}
+    openwrt_dns_forwarders_rebind_domains_serialized: >-
+      {{
+        (
+          (openwrt_dns_forwarders_rebind_domain_allowlist | default([]))
+          | map('string')
+          | map('trim')
+          | reject('equalto', '')
+          | unique
+          | list
+        ) | join(' ')
+      }}
+    openwrt_dns_forwarders_address_overrides_effective: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for override in (openwrt_dns_forwarders_address_overrides | default([])) -%}
+      {%-   set domain = (
+              override.name
+              | default(override.domain | default('', true), true)
+              | string
+              | trim
+            ) -%}
+      {%-   set address = (
+              override.address
+              | default('', true)
+              | string
+              | trim
+            ) -%}
+      {%-   if (domain | length) > 0 and (address | length) > 0 -%}
+      {%-     set _ = ns.items.append('/' ~ domain ~ '/' ~ address) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items | unique | list }}
+
+- name: Build dnsmasq address override serialized list
+  ansible.builtin.set_fact:
+    openwrt_dns_forwarders_address_overrides_serialized: >-
+      {{
+        (
+          openwrt_dns_forwarders_address_overrides_effective
+          | default([])
+        ) | join(' ')
+      }}
+
+- name: Show DNS forwarder dry-run plan
+  ansible.builtin.debug:
+    msg:
+      dnsmasq_section: "{{ openwrt_dns_forwarders_dnsmasq_section }}"
+      upstream_servers: "{{ openwrt_dns_forwarders_servers_effective }}"
+      noresolv: "{{ openwrt_dns_forwarders_noresolv | default(true) | bool }}"
+      strict_order: "{{ openwrt_dns_forwarders_strict_order | default(true) | bool }}"
+      allservers: "{{ openwrt_dns_forwarders_allservers | default(false) | bool }}"
+      cache_size: "{{ openwrt_dns_forwarders_cache_size | default(1000) | int }}"
+      dnsforwardmax: "{{ openwrt_dns_forwarders_dnsforwardmax | default(300) | int }}"
+      rebind_protection: "{{ openwrt_dns_forwarders_rebind_protection | default(true) | bool }}"
+      rebind_domain_allowlist: "{{ openwrt_dns_forwarders_rebind_domain_allowlist | default([]) }}"
+      address_overrides: "{{ openwrt_dns_forwarders_address_overrides_effective | default([]) }}"
+  changed_when: false
+  when:
+    - openwrt_dns_forwarders_dry_run | default(true) | bool
+    - not (openwrt_dns_forwarders_force_apply | default(false) | bool)
+
+- name: Apply dnsmasq upstream forwarders
+  when: >-
+    not (openwrt_dns_forwarders_dry_run | default(true) | bool)
+    or (openwrt_dns_forwarders_force_apply | default(false) | bool)
+  block:
+    - name: Set dnsmasq upstream server list (CLI list semantics)
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          current="$(
+            uci -q get "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.server" 2>/dev/null || true
+          )"
+          desired='{{ openwrt_dns_forwarders_servers_serialized | default("") }}'
+          if [ "${current}" != "${desired}" ]; then
+            uci -q del "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.server" || true
+            {% for srv in openwrt_dns_forwarders_servers_effective %}
+            uci add_list "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.server={{ srv }}"
+            {% endfor %}
+            echo CHANGED
+          fi
+      register: openwrt_dns_forwarders_server_list_result
+      changed_when: "'CHANGED' in (openwrt_dns_forwarders_server_list_result.stdout | default(''))"
+
+    - name: Set dnsmasq noresolv flag
+      community.openwrt.uci:
+        command: set
+        key: "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.noresolv"
+        value: "{{ '1' if (openwrt_dns_forwarders_noresolv | default(true) | bool) else '0' }}"
+
+    - name: Set dnsmasq strictorder flag
+      community.openwrt.uci:
+        command: set
+        key: "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.strictorder"
+        value: "{{ '1' if (openwrt_dns_forwarders_strict_order | default(true) | bool) else '0' }}"
+
+    - name: Set dnsmasq allservers flag
+      community.openwrt.uci:
+        command: set
+        key: "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.allservers"
+        value: "{{ '1' if (openwrt_dns_forwarders_allservers | default(false) | bool) else '0' }}"
+
+    - name: Set dnsmasq cache size
+      community.openwrt.uci:
+        command: set
+        key: "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.cachesize"
+        value: "{{ openwrt_dns_forwarders_cache_size | default(1000) | int | string }}"
+
+    - name: Set dnsmasq forward concurrency cap
+      community.openwrt.uci:
+        command: set
+        key: "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.dnsforwardmax"
+        value: "{{ openwrt_dns_forwarders_dnsforwardmax | default(300) | int | string }}"
+
+    - name: Set dnsmasq rebind protection flag
+      community.openwrt.uci:
+        command: set
+        key: "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.rebind_protection"
+        value: "{{ '1' if (openwrt_dns_forwarders_rebind_protection | default(true) | bool) else '0' }}"
+
+    - name: Set dnsmasq rebind_domain allowlist (CLI list semantics)
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          current="$(
+            uci -q get "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.rebind_domain" 2>/dev/null || true
+          )"
+          desired='{{ openwrt_dns_forwarders_rebind_domains_serialized | default("") }}'
+          if [ "${current}" != "${desired}" ]; then
+            uci -q del "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.rebind_domain" || true
+            {% for domain in (openwrt_dns_forwarders_rebind_domains_effective | default([])) %}
+            uci add_list "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.rebind_domain={{ domain }}"
+            {% endfor %}
+            echo CHANGED
+          fi
+      register: openwrt_dns_forwarders_rebind_domain_result
+      changed_when: "'CHANGED' in (openwrt_dns_forwarders_rebind_domain_result.stdout | default(''))"
+
+    - name: Set dnsmasq address overrides (CLI list semantics)
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          current="$(
+            uci -q get "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.address" 2>/dev/null || true
+          )"
+          desired='{{ openwrt_dns_forwarders_address_overrides_serialized | default("") }}'
+          if [ "${current}" != "${desired}" ]; then
+            uci -q del "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.address" || true
+            {% for value in (openwrt_dns_forwarders_address_overrides_effective | default([])) %}
+            uci add_list "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.address={{ value }}"
+            {% endfor %}
+            echo CHANGED
+          fi
+      register: openwrt_dns_forwarders_address_overrides_result
+      changed_when: "'CHANGED' in (openwrt_dns_forwarders_address_overrides_result.stdout | default(''))"
+
+    - name: Purge invalid plain-IP dnsmasq address overrides (legacy bug cleanup)
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          changed=0
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            val="${line#*=}"
+            val="${val#\'}"
+            val="${val%\'}"
+            case "$val" in
+              */*) continue ;;
+              *[!0-9.]* ) continue ;;
+              * )
+                uci -q del_list "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.address=$val" && changed=1 || true
+                ;;
+            esac
+          done <<EOF
+          $(uci -q show "dhcp.{{ openwrt_dns_forwarders_dnsmasq_section }}.address" 2>/dev/null || true)
+          EOF
+          [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_dns_forwarders_purge_plain_ip_address
+      changed_when: "'CHANGED' in (openwrt_dns_forwarders_purge_plain_ip_address.stdout | default(''))"
+
+    - name: Check pending dnsmasq UCI changes
+      community.openwrt.uci:
+        command: changes
+        config: dhcp
+      register: openwrt_dns_forwarders_dhcp_changes
+      changed_when: false
+
+    - name: Commit dnsmasq UCI changes
+      community.openwrt.uci:
+        command: commit
+        config: dhcp
+      when: (openwrt_dns_forwarders_dhcp_changes.result | default('') | trim | length) > 0
+
+    - name: Restart dnsmasq when config changed
+      community.openwrt.service:
+        name: "{{ openwrt_dns_forwarders_dnsmasq_service_name }}"
+        state: restarted
+      when: (openwrt_dns_forwarders_dhcp_changes.result | default('') | trim | length) > 0

@@ -1,0 +1,8 @@
+---
+network_infra_agent_supported_actions:
+  - list_vlans
+  - verify_interfaces
+  - verify_connectivity
+  - list_routes
+
+network_infra_agent_ping_count: 2

@@ -1,0 +1,41 @@
+---
+- name: Gather service facts
+  ansible.builtin.service_facts:
+
+- name: Ensure dhcpcd config directory exists when DNS override is requested
+  ansible.builtin.file:
+    path: "{{ common_dhcpcd_override_path | dirname }}"
+    state: directory
+    mode: "0755"
+  when:
+    - common_dhcpcd_dns_override_interface is defined
+    - common_dhcpcd_dns_override_servers is defined
+    - (common_dhcpcd_dns_override_servers | length) > 0
+
+- name: Render dhcpcd DNS override for selected interface
+  ansible.builtin.copy:
+    dest: "{{ common_dhcpcd_override_path }}"
+    mode: "0644"
+    content: |
+      interface {{ common_dhcpcd_dns_override_interface }}
+        static domain_name_servers={{ common_dhcpcd_dns_override_servers | join(' ') }}
+  when:
+    - common_dhcpcd_dns_override_interface is defined
+    - common_dhcpcd_dns_override_servers is defined
+    - (common_dhcpcd_dns_override_servers | length) > 0
+  register: common_dhcpcd_override_result
+
+- name: Restart dhcpcd when DNS override changed
+  ansible.builtin.service:
+    name: dhcpcd
+    state: restarted
+  when:
+    - common_dhcpcd_override_result is changed
+    - ansible_facts.services['dhcpcd.service'] is defined
+
+- name: Show common baseline summary
+  ansible.builtin.debug:
+    msg:
+      dhcpcd_override_interface: "{{ common_dhcpcd_dns_override_interface | default('') }}"
+      dhcpcd_override_servers: "{{ common_dhcpcd_dns_override_servers | default([]) }}"
+  changed_when: false

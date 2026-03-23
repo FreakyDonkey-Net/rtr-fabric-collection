@@ -1,0 +1,30 @@
+global:
+  tolerations:
+{{ k8s_longhorn_global_tolerations | to_nice_yaml(indent=2) | indent(4, true) }}
+  nodeSelector:
+{{ k8s_longhorn_global_node_selector | to_nice_yaml(indent=2) | indent(4, true) }}
+
+service:
+  ui:
+    type: {{ k8s_longhorn_ui_service_type }}
+
+preUpgradeChecker:
+  jobEnabled: {{ k8s_longhorn_pre_upgrade_checker_job_enabled | bool | lower }}
+  upgradeVersionCheck: {{ k8s_longhorn_pre_upgrade_checker_upgrade_version_check | bool | lower }}
+
+persistence:
+  defaultClass: {{ k8s_longhorn_default_storage_class | bool | lower }}
+  defaultFsType: {{ k8s_longhorn_default_fs_type }}
+  defaultClassReplicaCount: {{ k8s_longhorn_default_replica_count | int }}
+  defaultDataLocality: {{ k8s_longhorn_default_data_locality }}
+  volumeBindingMode: {{ k8s_longhorn_volume_binding_mode }}
+
+defaultSettings:
+  createDefaultDiskLabeledNodes: {{ k8s_longhorn_create_default_disk_labeled_nodes | bool | lower }}
+  defaultDataPath: {{ k8s_longhorn_default_data_path }}
+  storageMinimalAvailablePercentage: {{ k8s_longhorn_storage_minimal_available_percentage | int }}
+  storageReservedPercentageForDefaultDisk: {{ k8s_longhorn_storage_reserved_percentage_for_default_disk | int }}
+  taintToleration: {{ k8s_longhorn_system_managed_taint_toleration }}
+{% if k8s_longhorn_system_managed_components_node_selector | string | trim | length > 0 %}
+  systemManagedComponentsNodeSelector: {{ k8s_longhorn_system_managed_components_node_selector | quote }}
+{% endif %}

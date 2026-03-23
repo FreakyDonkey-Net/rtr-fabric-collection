@@ -1,0 +1,33 @@
+---
+edge_worker_prep_nm_trunk_enabled: false
+edge_worker_prep_nm_parent_conn_name: netplan-eth0
+edge_worker_prep_nm_parent_iface: eth0
+edge_worker_prep_nm_vlan_conn_name: rtr-pre-admin-eth11
+edge_worker_prep_nm_vlan_parent_iface: eth0
+edge_worker_prep_nm_vlan_iface: eth0.11
+edge_worker_prep_nm_vlan_id: 11
+edge_worker_prep_nm_vlan_ip4: []
+edge_worker_prep_nm_vlan_gw4: ""
+edge_worker_prep_nm_vlan_dns4: []
+edge_worker_prep_nm_vlan_route_metric4: 100
+edge_worker_prep_nm_breakglass_wifi_connection_names: []
+
+edge_worker_prep_dhcpcd_config_path: /etc/dhcpcd.conf
+edge_worker_prep_dhcpcd_deny_interfaces: []
+edge_worker_prep_dhcpcd_restart_on_change: true
+
+edge_worker_prep_sudo_nopasswd_enabled: false
+edge_worker_prep_sudo_nopasswd_user: "{{ ansible_user | default('admin') }}"
+edge_worker_prep_sudo_nopasswd_file: /etc/sudoers.d/90-edge-worker-automation
+edge_worker_prep_sudo_nopasswd_commands: ALL
+
+edge_worker_prep_k3s_preflight_enabled: false
+edge_worker_prep_k3s_cmdline_path: /boot/firmware/cmdline.txt
+edge_worker_prep_k3s_required_cmdline_tokens:
+  - cgroup_enable=memory
+  - cgroup_memory=1
+edge_worker_prep_k3s_forbidden_cmdline_tokens:
+  - cgroup_disable=memory
+edge_worker_prep_k3s_fail_if_runtime_flag_persists: true
+edge_worker_prep_k3s_fail_if_memory_controller_missing: true
+edge_worker_prep_k3s_fail_if_swap_present: true

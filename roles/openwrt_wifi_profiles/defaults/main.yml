@@ -1,0 +1,62 @@
+---
+openwrt_wifi_profiles_enabled: true
+openwrt_wifi_profiles_dry_run: true
+openwrt_wifi_profiles_force_apply: false
+
+openwrt_wifi_profiles_site_name: "{{ fabric_site | default('') }}"
+openwrt_wifi_profiles_admin_vlan_id: 11
+openwrt_wifi_profiles_users_vlan_id: 40
+openwrt_wifi_profiles_guest_vlan_id: 50
+openwrt_wifi_profiles_network_section_prefix: "{{ openwrt_wifi_profiles_site_name }}"
+
+openwrt_wifi_profiles_trusted_enabled: true
+openwrt_wifi_profiles_admin_enabled: false
+openwrt_wifi_profiles_iot_enabled: true
+
+openwrt_wifi_profiles_radio_2g: radio0
+openwrt_wifi_profiles_radio_5g: radio1
+openwrt_wifi_profiles_country: ""
+
+openwrt_wifi_profiles_trusted_ssid_base: Trusted
+openwrt_wifi_profiles_admin_ssid_base: Admin
+openwrt_wifi_profiles_iot_ssid_base: IoT
+openwrt_wifi_profiles_trusted_ssid_2g: "{{ openwrt_wifi_profiles_trusted_ssid_base }}_2G"
+openwrt_wifi_profiles_trusted_ssid_5g: "{{ openwrt_wifi_profiles_trusted_ssid_base }}_5G"
+openwrt_wifi_profiles_admin_ssid_2g: "{{ openwrt_wifi_profiles_admin_ssid_base }}_2G"
+openwrt_wifi_profiles_admin_ssid_5g: "{{ openwrt_wifi_profiles_admin_ssid_base }}_5G"
+openwrt_wifi_profiles_iot_ssid_2g: "{{ openwrt_wifi_profiles_iot_ssid_base }}_2G"
+
+openwrt_wifi_profiles_trusted_psk: ""
+openwrt_wifi_profiles_admin_psk: ""
+openwrt_wifi_profiles_iot_psk: ""
+
+openwrt_wifi_profiles_trusted_encryption: sae-mixed
+openwrt_wifi_profiles_trusted_ieee80211w: "1"
+openwrt_wifi_profiles_admin_encryption: sae-mixed
+openwrt_wifi_profiles_admin_ieee80211w: "1"
+openwrt_wifi_profiles_iot_encryption: psk2
+openwrt_wifi_profiles_iot_ieee80211w: "0"
+
+openwrt_wifi_profiles_trusted_hidden: false
+openwrt_wifi_profiles_admin_hidden: false
+openwrt_wifi_profiles_iot_hidden: false
+openwrt_wifi_profiles_iot_isolate_clients: true
+
+openwrt_wifi_profiles_admin_on_2g: false
+openwrt_wifi_profiles_admin_on_5g: true
+
+openwrt_wifi_profiles_legacy_wifi_ifaces_absent: []
+
+openwrt_wifi_profiles_trusted_radius_enabled: false
+openwrt_wifi_profiles_trusted_radius_auth_server: ""
+openwrt_wifi_profiles_trusted_radius_auth_port: 1812
+openwrt_wifi_profiles_trusted_radius_auth_secret: ""
+openwrt_wifi_profiles_trusted_radius_auth_server_secondary: ""
+openwrt_wifi_profiles_trusted_radius_auth_port_secondary: 1812
+openwrt_wifi_profiles_trusted_radius_auth_secret_secondary: ""
+openwrt_wifi_profiles_trusted_radius_acct_server: ""
+openwrt_wifi_profiles_trusted_radius_acct_port: 1813
+openwrt_wifi_profiles_trusted_radius_acct_secret: ""
+openwrt_wifi_profiles_trusted_radius_acct_server_secondary: ""
+openwrt_wifi_profiles_trusted_radius_acct_port_secondary: 1813
+openwrt_wifi_profiles_trusted_radius_acct_secret_secondary: ""

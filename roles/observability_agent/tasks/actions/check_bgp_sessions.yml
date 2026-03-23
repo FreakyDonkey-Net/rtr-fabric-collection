@@ -1,0 +1,14 @@
+---
+- name: Check BGP sessions in FRR pods (fabric-net)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ observability_agent_kubectl_bin }} -n {{ observability_agent_bgp_namespace }} \
+      exec -l app.kubernetes.io/name=frr-evpn \
+      -- vtysh -c "show bgp summary json" 2>/dev/null || echo '{}'
+  register: observability_agent_bgp_summary
+  changed_when: false
+  failed_when: false
+
+- name: Display BGP session summary
+  ansible.builtin.debug:
+    msg: "BGP sessions: {{ observability_agent_bgp_summary.stdout | default('{}') }}"

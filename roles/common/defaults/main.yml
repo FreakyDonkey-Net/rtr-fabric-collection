@@ -1,0 +1,2 @@
+---
+common_dhcpcd_override_path: /etc/dhcpcd.conf.d/60-rtr-fabric.conf

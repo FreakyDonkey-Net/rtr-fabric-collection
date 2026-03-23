@@ -1,0 +1,155 @@
+---
+- name: Validate requested k8s agent action
+  ansible.builtin.assert:
+    that:
+      - k8s_agent_action in k8s_agent_supported_actions
+    fail_msg: >-
+      Unsupported k8s_agent_action='{{ k8s_agent_action }}'.
+      Supported actions: {{ k8s_agent_supported_actions | join(', ') }}
+
+- name: Gather service facts
+  ansible.builtin.service_facts:
+
+- name: Detect kubectl binary
+  ansible.builtin.command:
+    argv:
+      - which
+      - kubectl
+  register: k8s_agent_kubectl
+  changed_when: false
+  failed_when: false
+
+- name: Build local K3s service summary
+  ansible.builtin.set_fact:
+    k8s_agent_local_status:
+      k3s: "{{ ansible_facts.services['k3s.service'].state | default('absent') }}"
+      k3s_agent: "{{ ansible_facts.services['k3s-agent.service'].state | default('absent') }}"
+      kubectl_available: "{{ k8s_agent_kubectl.rc == 0 }}"
+  changed_when: false
+
+- name: Show local K3s service summary
+  ansible.builtin.debug:
+    msg: "{{ k8s_agent_local_status }}"
+  when: k8s_agent_action == "check_k3s_status"
+
+- name: Show cluster node status from primary server
+  ansible.builtin.command:
+    cmd: "kubectl get nodes -o wide"
+  register: k8s_agent_cluster_nodes
+  changed_when: false
+  when:
+    - k8s_agent_action == "check_k3s_status"
+    - inventory_hostname == k3s_server_host
+    - k8s_agent_kubectl.rc == 0
+
+- name: Print cluster node status
+  ansible.builtin.debug:
+    msg: "{{ k8s_agent_cluster_nodes.stdout }}"
+  when:
+    - k8s_agent_action == "check_k3s_status"
+    - inventory_hostname == k3s_server_host
+    - k8s_agent_kubectl.rc == 0
+
+- name: Stop non-control hosts for kubectl write actions
+  ansible.builtin.meta: end_host
+  when:
+    - k8s_agent_action in ['label_node', 'taint_node', 'drain_node', 'etcd_snapshot']
+    - inventory_hostname != k3s_server_host
+
+- name: Require kubectl on control host for write actions
+  ansible.builtin.assert:
+    that:
+      - k8s_agent_kubectl.rc == 0
+    fail_msg: kubectl is required on {{ inventory_hostname }} for {{ k8s_agent_action }}.
+  when: k8s_agent_action in ['label_node', 'taint_node', 'drain_node', 'etcd_snapshot']
+
+- name: Require node name for label action
+  ansible.builtin.assert:
+    that:
+      - (k8s_agent_node_name | default('') | length) > 0
+      - (k8s_agent_node_labels | default({}) | length) > 0
+    fail_msg: k8s_agent_node_name and k8s_agent_node_labels are required for label_node.
+  when: k8s_agent_action == 'label_node'
+
+- name: Build label argv
+  ansible.builtin.set_fact:
+    k8s_agent_label_argv: >-
+      {{
+        ['kubectl', 'label', 'node', k8s_agent_node_name, '--overwrite']
+        + (
+          (k8s_agent_node_labels | dict2items)
+          | map(attribute='key')
+          | zip((k8s_agent_node_labels | dict2items) | map(attribute='value'))
+          | map('join', '=')
+          | list
+        )
+      }}
+  changed_when: false
+  when: k8s_agent_action == 'label_node'
+
+- name: Apply node labels
+  ansible.builtin.command:
+    argv: "{{ k8s_agent_label_argv }}"
+  changed_when: true
+  when: k8s_agent_action == 'label_node'
+
+- name: Require node name for taint action
+  ansible.builtin.assert:
+    that:
+      - (k8s_agent_node_name | default('') | length) > 0
+      - (k8s_agent_node_taints | default([]) | length) > 0
+    fail_msg: k8s_agent_node_name and k8s_agent_node_taints are required for taint_node.
+  when: k8s_agent_action == 'taint_node'
+
+- name: Build taint argv
+  ansible.builtin.set_fact:
+    k8s_agent_taint_argv: >-
+      {{
+        ['kubectl', 'taint', 'nodes', k8s_agent_node_name, '--overwrite']
+        + (k8s_agent_node_taints | list)
+      }}
+  changed_when: false
+  when: k8s_agent_action == 'taint_node'
+
+- name: Apply node taints
+  ansible.builtin.command:
+    argv: "{{ k8s_agent_taint_argv }}"
+  changed_when: true
+  when: k8s_agent_action == 'taint_node'
+
+- name: Require node name for drain action
+  ansible.builtin.assert:
+    that:
+      - (k8s_agent_node_name | default('') | length) > 0
+    fail_msg: k8s_agent_node_name is required for drain_node.
+  when: k8s_agent_action == 'drain_node'
+
+- name: Drain Kubernetes node
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - drain
+      - "{{ k8s_agent_node_name }}"
+      - --ignore-daemonsets
+      - --delete-emptydir-data
+      - --force
+      - --timeout=180s
+  changed_when: true
+  when: k8s_agent_action == 'drain_node'
+
+- name: Build default etcd snapshot name
+  ansible.builtin.set_fact:
+    k8s_agent_etcd_snapshot_name_effective: "{{ k8s_agent_etcd_snapshot_name | default('snapshot-' ~ ansible_date_time.iso8601_basic_short, true) }}"
+  changed_when: false
+  when: k8s_agent_action == 'etcd_snapshot'
+
+- name: Create etcd snapshot
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - etcd-snapshot
+      - save
+      - --name
+      - "{{ k8s_agent_etcd_snapshot_name_effective }}"
+  changed_when: true
+  when: k8s_agent_action == 'etcd_snapshot'

@@ -1,0 +1,68 @@
+---
+k8s_longhorn_namespace: longhorn-system
+k8s_longhorn_release_name: longhorn
+k8s_longhorn_chart_name: longhorn
+k8s_longhorn_chart_repo: https://charts.longhorn.io
+k8s_longhorn_chart_version: 1.11.0
+k8s_longhorn_kubeconfig: /etc/rancher/k3s/k3s.yaml
+k8s_longhorn_copy_local_helm_binary: true
+k8s_longhorn_local_helm_binary: "{{ lookup('ansible.builtin.pipe', 'command -v helm') }}"
+k8s_longhorn_helm_bin: /usr/local/bin/helm
+k8s_longhorn_helm_environment:
+  HELM_CACHE_HOME: /tmp/helm-cache
+  HELM_CONFIG_HOME: /tmp/helm-config
+  HELM_DATA_HOME: /tmp/helm-data
+k8s_longhorn_helm_wait_timeout: 15m0s
+k8s_longhorn_helm_no_hooks: true
+k8s_longhorn_namespace_pod_security_enforce: privileged
+k8s_longhorn_namespace_pod_security_warn: privileged
+k8s_longhorn_namespace_pod_security_audit: privileged
+k8s_longhorn_global_tolerations:
+  - key: freakydonkey.net/edge
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+k8s_longhorn_global_node_selector: {}
+k8s_longhorn_ui_service_type: ClusterIP
+k8s_longhorn_default_storage_class: true
+k8s_longhorn_default_replica_count: 1
+k8s_longhorn_default_fs_type: ext4
+k8s_longhorn_volume_binding_mode: WaitForFirstConsumer
+k8s_longhorn_default_data_locality: disabled
+k8s_longhorn_storage_minimal_available_percentage: 10
+k8s_longhorn_storage_reserved_percentage_for_default_disk: 5
+k8s_longhorn_create_default_disk_labeled_nodes: true
+k8s_longhorn_default_data_path: /var/lib/longhorn
+k8s_longhorn_system_managed_taint_toleration: freakydonkey.net/edge=true:NoSchedule
+k8s_longhorn_system_managed_components_node_selector: ""
+k8s_longhorn_worker_node_label_key: node.longhorn.io/create-default-disk
+k8s_longhorn_worker_node_label_value: "true"
+k8s_longhorn_storage_hosts: []
+k8s_longhorn_storage_classes: []
+# Longhorn pre-upgrade hooks are intentionally disabled for GitOps-style
+# reconciliation runs where chart drift is reconciled frequently.
+k8s_longhorn_pre_upgrade_checker_job_enabled: false
+k8s_longhorn_pre_upgrade_checker_upgrade_version_check: true
+# Preserve Longhorn CSI capacity publishing when overriding provisioner args.
+# Keep CSIStorageCapacity enabled but disable ownerRef traversal because the
+# edge-worker path is not always stable enough for external-provisioner to walk
+# Deployment ownership without fatally timing out against the API server.
+k8s_longhorn_csi_provisioner_args_override_enabled: true
+k8s_longhorn_csi_provisioner_args_override:
+  - --v=2
+  - --csi-address=$(ADDRESS)
+  - --timeout=1m50s
+  - --leader-election
+  - --leader-election-namespace=$(POD_NAMESPACE)
+  - --default-fstype=ext4
+  - --enable-capacity
+  - --capacity-ownerref-level=-1
+  - --kube-api-qps=50
+  - --kube-api-burst=100
+  - --http-endpoint=:8000
+# Mitigate DNS flaps on edge workers by pinning longhorn-csi-plugin manager URL
+# to the live longhorn-backend Service ClusterIP instead of DNS resolution.
+k8s_longhorn_csi_plugin_manager_url_use_service_ip: true
+k8s_longhorn_csi_plugin_manager_service_name: longhorn-backend
+k8s_longhorn_csi_plugin_manager_service_port: 9500
+k8s_longhorn_csi_plugin_manager_api_path: /v1

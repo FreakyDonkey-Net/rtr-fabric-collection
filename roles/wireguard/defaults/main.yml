@@ -1,0 +1,15 @@
+---
+wireguard_enabled: true
+wireguard_interface: wg0
+wireguard_group: rtr_fabric
+wireguard_package_name: wireguard-tools
+wireguard_config_dir: /etc/wireguard
+wireguard_private_key_path: "{{ wireguard_config_dir }}/{{ wireguard_interface }}.key"
+wireguard_public_key_path: "{{ wireguard_config_dir }}/{{ wireguard_interface }}.pub"
+wireguard_config_path: "{{ wireguard_config_dir }}/{{ wireguard_interface }}.conf"
+wireguard_listen_port: 62000
+wireguard_persistent_keepalive: 25
+wireguard_endpoint_host: "{{ node_public_ip | default(ansible_host) }}"
+wireguard_disable_host_interface: true
+wireguard_remove_host_interface_when_disabled: false
+wireguard_include_external_peers: true

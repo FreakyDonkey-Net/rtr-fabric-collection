@@ -1,0 +1,326 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-owned-workload-labels
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: {{ k8s_enterprise_security_kyverno_policy_background | bool | lower }}
+  rules:
+    - name: require-app-and-manager-labels
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      validate:
+        message: Pods must declare app.kubernetes.io/name and app.kubernetes.io/managed-by.
+        pattern:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "?*"
+              app.kubernetes.io/managed-by: "?*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-pod-requests-limits
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: {{ k8s_enterprise_security_kyverno_policy_background | bool | lower }}
+  rules:
+    - name: require-cpu-memory-requests-and-limits
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      validate:
+        message: Pods must define CPU and memory requests and limits for all containers.
+        pattern:
+          spec:
+            containers:
+              - name: "*"
+                resources:
+                  requests:
+                    cpu: "?*"
+                    memory: "?*"
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"
+            =(initContainers):
+              - name: "*"
+                resources:
+                  requests:
+                    cpu: "?*"
+                    memory: "?*"
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-secure-pod-security-context
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: {{ k8s_enterprise_security_kyverno_policy_background | bool | lower }}
+  rules:
+    - name: require-runtime-default-seccomp-and-non-root
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      validate:
+        message: Pods must declare RuntimeDefault seccomp and drop privilege escalation.
+        pattern:
+          spec:
+            securityContext:
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: "*"
+                securityContext:
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop:
+                      - ALL
+            =(initContainers):
+              - name: "*"
+                securityContext:
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop:
+                      - ALL
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-privileged-containers
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: {{ k8s_enterprise_security_kyverno_policy_background | bool | lower }}
+  rules:
+    - name: forbid-privileged-containers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      validate:
+        message: Privileged containers are forbidden outside declared exception namespaces.
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): false
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): false
+            =(ephemeralContainers):
+              - =(securityContext):
+                  =(privileged): false
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-host-namespaces
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: {{ k8s_enterprise_security_kyverno_policy_background | bool | lower }}
+  rules:
+    - name: forbid-host-network-pid-ipc
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      validate:
+        message: Pods must not use hostNetwork, hostPID, or hostIPC.
+        pattern:
+          spec:
+            =(hostNetwork): false
+            =(hostPID): false
+            =(hostIPC): false
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-hostpath-volumes
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: {{ k8s_enterprise_security_kyverno_policy_background | bool | lower }}
+  rules:
+    - name: forbid-hostpath-volumes
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      validate:
+        message: hostPath volumes are forbidden outside declared exception namespaces.
+        pattern:
+          spec:
+            =(volumes):
+              - X(hostPath): "null"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-latest-tags
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: {{ k8s_enterprise_security_kyverno_policy_background | bool | lower }}
+  rules:
+    - name: forbid-latest-image-tags
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      validate:
+        message: Images tagged latest are forbidden.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{% raw %}{{ ends_with(element.image, ':latest') }}{% endraw %}"
+                    operator: Equals
+                    value: true
+          - list: "request.object.spec.initContainers || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{% raw %}{{ ends_with(element.image, ':latest') }}{% endraw %}"
+                    operator: Equals
+                    value: true
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-allowed-image-registries
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: {{ k8s_enterprise_security_kyverno_policy_background | bool | lower }}
+  rules:
+    - name: forbid-images-outside-allowed-registries
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      validate:
+        message: Images must come from the approved registries list.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: '{% raw %}{{ regex_match(''{% endraw %}{{ k8s_enterprise_security_allowed_image_registries_regex }}{% raw %}'', element.image) }}{% endraw %}'
+                    operator: Equals
+                    value: false
+          - list: "request.object.spec.initContainers || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: '{% raw %}{{ regex_match(''{% endraw %}{{ k8s_enterprise_security_allowed_image_registries_regex }}{% raw %}'', element.image) }}{% endraw %}'
+                    operator: Equals
+                    value: false
+{% if k8s_enterprise_security_verify_image_signatures_enabled | bool %}
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-signed-images
+spec:
+  validationFailureAction: {{ k8s_enterprise_security_kyverno_validation_failure_action }}
+  background: false
+  rules:
+    - name: verify-cosign-signatures
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+{% for namespace in (k8s_enterprise_security_kyverno_policy_excluded_namespaces | default([])) %}
+                - {{ namespace }}
+{% endfor %}
+      verifyImages:
+        - imageReferences:
+{% for image_reference in (k8s_enterprise_security_signed_image_references | default([])) %}
+            - "{{ image_reference }}"
+{% endfor %}
+          required: {{ k8s_enterprise_security_verify_image_signatures_required | bool | lower }}
+          mutateDigest: false
+          attestors:
+            - count: 1
+              entries:
+{% for public_key in (k8s_enterprise_security_cosign_public_keys | default([])) %}
+                - keys:
+                    publicKeys: |-
+{{ public_key | indent(22, true) }}
+{% endfor %}
+{% endif %}

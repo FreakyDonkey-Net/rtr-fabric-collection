@@ -1,0 +1,354 @@
+---
+- name: Validate edge worker prep inputs
+  ansible.builtin.assert:
+    that:
+      - not (edge_worker_prep_nm_trunk_enabled | default(false) | bool) or (edge_worker_prep_nm_vlan_ip4 | default([]) | length) > 0
+      - not (edge_worker_prep_nm_trunk_enabled | default(false) | bool) or (edge_worker_prep_nm_vlan_gw4 | default('') | length) > 0
+    fail_msg: >-
+      edge_worker_prep requires VLAN management IP and gateway when
+      edge_worker_prep_nm_trunk_enabled=true.
+
+- name: Check whether nmcli is available
+  ansible.builtin.shell: command -v nmcli
+  args:
+    executable: /bin/bash
+  register: edge_worker_prep_nmcli_check
+  changed_when: false
+  failed_when:
+    - edge_worker_prep_nm_trunk_enabled | default(false) | bool
+    - edge_worker_prep_nmcli_check.rc != 0
+
+- name: Check whether dhcpcd config exists
+  ansible.builtin.stat:
+    path: "{{ edge_worker_prep_dhcpcd_config_path }}"
+  register: edge_worker_prep_dhcpcd_config
+
+- name: Gather service facts for dhcpcd management
+  ansible.builtin.service_facts:
+  when:
+    - (edge_worker_prep_dhcpcd_deny_interfaces | default([]) | length) > 0
+    - edge_worker_prep_dhcpcd_config.stat.exists | default(false)
+
+- name: Converge dhcpcd denyinterfaces for statically managed interfaces
+  ansible.builtin.blockinfile:
+    path: "{{ edge_worker_prep_dhcpcd_config_path }}"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK edge_worker_prep dhcpcd denyinterfaces"
+    block: |-
+      {% for iface in edge_worker_prep_dhcpcd_deny_interfaces %}
+      denyinterfaces {{ iface }}
+      {% endfor %}
+  register: edge_worker_prep_dhcpcd_deny_block
+  when:
+    - (edge_worker_prep_dhcpcd_deny_interfaces | default([]) | length) > 0
+    - edge_worker_prep_dhcpcd_config.stat.exists | default(false)
+
+- name: Restart dhcpcd when denyinterfaces changed on an active service
+  ansible.builtin.service:
+    name: dhcpcd
+    state: restarted
+  when:
+    - edge_worker_prep_dhcpcd_restart_on_change | default(true) | bool
+    - edge_worker_prep_dhcpcd_deny_block is defined
+    - edge_worker_prep_dhcpcd_deny_block is changed
+    - ansible_facts.services['dhcpcd.service'] is defined
+    - ansible_facts.services['dhcpcd.service'].state == 'running'
+
+- name: Ensure sudoers.d directory exists for automation overrides
+  ansible.builtin.file:
+    path: "{{ edge_worker_prep_sudo_nopasswd_file | dirname }}"
+    state: directory
+    mode: "0750"
+  when: edge_worker_prep_sudo_nopasswd_enabled | default(false) | bool
+
+- name: Converge passwordless sudo for automation user
+  ansible.builtin.copy:
+    dest: "{{ edge_worker_prep_sudo_nopasswd_file }}"
+    content: "{{ edge_worker_prep_sudo_nopasswd_user }} ALL=(ALL:ALL) NOPASSWD: {{ edge_worker_prep_sudo_nopasswd_commands }}\n"
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+  when: edge_worker_prep_sudo_nopasswd_enabled | default(false) | bool
+
+- name: Converge NetworkManager trunk management
+  when: edge_worker_prep_nm_trunk_enabled | default(false) | bool
+  block:
+    - name: Converge parent NetworkManager connection as L2-only
+      ansible.builtin.shell: |
+        set -e
+        current_ipv4="$(nmcli -g ipv4.method connection show '{{ edge_worker_prep_nm_parent_conn_name }}' 2>/dev/null || true)"
+        current_ipv6="$(nmcli -g ipv6.method connection show '{{ edge_worker_prep_nm_parent_conn_name }}' 2>/dev/null || true)"
+        current_autoconnect="$(nmcli -g connection.autoconnect connection show '{{ edge_worker_prep_nm_parent_conn_name }}' 2>/dev/null || true)"
+        if [ "$current_ipv4" != "disabled" ] \
+          || [ "$current_ipv6" != "ignore" ] \
+          || [ "$current_autoconnect" != "yes" ]; then
+          nmcli connection modify "{{ edge_worker_prep_nm_parent_conn_name }}" \
+            ipv4.method disabled \
+            ipv6.method ignore \
+            connection.autoconnect yes
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: edge_worker_prep_nm_parent_modify
+      changed_when: "'CHANGED' in (edge_worker_prep_nm_parent_modify.stdout | default(''))"
+
+    - name: List VLAN management connection candidates
+      ansible.builtin.shell: |
+        nmcli -t -f NAME,UUID,TYPE,DEVICE connection show \
+          | awk -F: '$1 == "{{ edge_worker_prep_nm_vlan_conn_name }}" && $3 == "vlan" { print $2 ":" $4 }'
+      args:
+        executable: /bin/bash
+      register: edge_worker_prep_nm_vlan_candidates
+      changed_when: false
+
+    - name: Remove stale duplicate VLAN management connections
+      ansible.builtin.command:
+        argv:
+          - nmcli
+          - connection
+          - delete
+          - uuid
+          - "{{ item.split(':', 1)[0] }}"
+      loop: "{{ edge_worker_prep_nm_vlan_candidates.stdout_lines[1:] | default([]) }}"
+      when: (edge_worker_prep_nm_vlan_candidates.stdout_lines | default([]) | length) > 1
+
+    - name: Create VLAN management connection when missing
+      ansible.builtin.command:
+        argv:
+          - nmcli
+          - connection
+          - add
+          - type
+          - vlan
+          - con-name
+          - "{{ edge_worker_prep_nm_vlan_conn_name }}"
+          - ifname
+          - "{{ edge_worker_prep_nm_vlan_iface }}"
+          - dev
+          - "{{ edge_worker_prep_nm_vlan_parent_iface }}"
+          - id
+          - "{{ edge_worker_prep_nm_vlan_id | string }}"
+      when: (edge_worker_prep_nm_vlan_candidates.stdout_lines | default([]) | length) == 0
+
+    - name: Gather VLAN management connection state
+      ansible.builtin.shell: |
+        set -e
+        desired_ip4="{{ edge_worker_prep_nm_vlan_ip4 | join(',') }}"
+        desired_dns4="{{ edge_worker_prep_nm_vlan_dns4 | join(',') }}"
+        current_iface="$(nmcli -g connection.interface-name connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null || true)"
+        current_vlan_id="$(nmcli -g vlan.id connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null || true)"
+        current_vlan_parent="$(nmcli -g vlan.parent connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null || true)"
+        current_ipv4="$(nmcli -g ipv4.method connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null || true)"
+        current_ip4_addrs="$(nmcli -g ipv4.addresses connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null | tr ';' ',' || true)"
+        current_gateway="$(nmcli -g ipv4.gateway connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null || true)"
+        current_dns4="$(nmcli -g ipv4.dns connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null | tr ';' ',' || true)"
+        current_metric="$(nmcli -g ipv4.route-metric connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null || true)"
+        current_ipv6="$(nmcli -g ipv6.method connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null || true)"
+        current_autoconnect="$(nmcli -g connection.autoconnect connection show '{{ edge_worker_prep_nm_vlan_conn_name }}' 2>/dev/null || true)"
+        if [ "$current_iface" != "{{ edge_worker_prep_nm_vlan_iface }}" ] \
+          || [ "$current_vlan_id" != "{{ edge_worker_prep_nm_vlan_id | string }}" ] \
+          || [ "$current_vlan_parent" != "{{ edge_worker_prep_nm_vlan_parent_iface }}" ] \
+          || [ "$current_ipv4" != "manual" ] \
+          || [ "$current_ip4_addrs" != "$desired_ip4" ] \
+          || [ "$current_gateway" != "{{ edge_worker_prep_nm_vlan_gw4 }}" ] \
+          || [ "$current_dns4" != "$desired_dns4" ] \
+          || [ "$current_metric" != "{{ edge_worker_prep_nm_vlan_route_metric4 | string }}" ] \
+          || [ "$current_ipv6" != "ignore" ] \
+          || [ "$current_autoconnect" != "yes" ]; then
+          nmcli connection modify "{{ edge_worker_prep_nm_vlan_conn_name }}" \
+            connection.interface-name "{{ edge_worker_prep_nm_vlan_iface }}" \
+            connection.autoconnect yes \
+            vlan.id "{{ edge_worker_prep_nm_vlan_id | string }}" \
+            vlan.parent "{{ edge_worker_prep_nm_vlan_parent_iface }}" \
+            ipv4.method manual \
+            ipv4.addresses "{{ edge_worker_prep_nm_vlan_ip4 | join(',') }}" \
+            ipv4.gateway "{{ edge_worker_prep_nm_vlan_gw4 }}" \
+            ipv4.dns "{{ edge_worker_prep_nm_vlan_dns4 | join(',') }}" \
+            ipv4.route-metric "{{ edge_worker_prep_nm_vlan_route_metric4 | string }}" \
+            ipv6.method ignore
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: edge_worker_prep_nm_vlan_modify
+      changed_when: "'CHANGED' in (edge_worker_prep_nm_vlan_modify.stdout | default(''))"
+
+    - name: Bring parent NetworkManager connection up
+      ansible.builtin.shell: |
+        set -e
+        if nmcli -t -f NAME connection show --active | grep -Fxq "{{ edge_worker_prep_nm_parent_conn_name }}"; then
+          exit 0
+        fi
+        nmcli connection up "{{ edge_worker_prep_nm_parent_conn_name }}"
+        echo CHANGED
+      args:
+        executable: /bin/bash
+      register: edge_worker_prep_nm_parent_up
+      changed_when: "'CHANGED' in (edge_worker_prep_nm_parent_up.stdout | default(''))"
+
+    - name: Bring VLAN management connection up
+      ansible.builtin.shell: |
+        set -e
+        if nmcli -t -f NAME connection show --active | grep -Fxq "{{ edge_worker_prep_nm_vlan_conn_name }}"; then
+          exit 0
+        fi
+        nmcli connection up "{{ edge_worker_prep_nm_vlan_conn_name }}"
+        echo CHANGED
+      args:
+        executable: /bin/bash
+      register: edge_worker_prep_nm_vlan_up
+      changed_when: "'CHANGED' in (edge_worker_prep_nm_vlan_up.stdout | default(''))"
+
+    - name: Gather configured breakglass Wi-Fi connections
+      ansible.builtin.command:
+        argv:
+          - nmcli
+          - -g
+          - NAME,AUTOCONNECT
+          - connection
+          - show
+      register: edge_worker_prep_nm_all_connections
+      changed_when: false
+
+    - name: Disable autoconnect on breakglass Wi-Fi connections
+      ansible.builtin.command:
+        argv:
+          - nmcli
+          - connection
+          - modify
+          - "{{ item }}"
+          - connection.autoconnect
+          - "no"
+      loop: "{{ edge_worker_prep_nm_breakglass_wifi_connection_names | default([]) }}"
+      when: >-
+        (
+          edge_worker_prep_nm_all_connections.stdout_lines | default([])
+          | select('match', '^' ~ (item | regex_escape) ~ ':')
+          | list
+          | length
+        ) > 0
+        and
+        (
+          edge_worker_prep_nm_all_connections.stdout_lines | default([])
+          | select('equalto', item ~ ':yes')
+          | list
+          | length
+        ) > 0
+
+- name: Converge K3s preflight host state
+  when: edge_worker_prep_k3s_preflight_enabled | default(false) | bool
+  block:
+    - name: Disable all active swap immediately
+      ansible.builtin.shell: |
+        set -e
+        if [ -n "$(swapon --noheadings --raw 2>/dev/null)" ]; then
+          swapoff -a
+          echo CHANGED
+        fi
+      args:
+        executable: /bin/bash
+      register: edge_worker_prep_swapoff
+      changed_when: "'CHANGED' in (edge_worker_prep_swapoff.stdout | default(''))"
+
+    - name: Comment out swap entries in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(?!#)(\\S+\\s+\\S+\\s+swap\\s+.*)$'
+        replace: '# \\1'
+
+    - name: Stop and mask zram generator units when present
+      ansible.builtin.shell: |
+        set -e
+        changed=0
+        if systemctl list-unit-files | grep -q '^systemd-zram-setup@\\.service'; then
+          systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
+          systemctl disable systemd-zram-setup@zram0.service 2>/dev/null || true
+          systemctl mask systemd-zram-setup@zram0.service 2>/dev/null || true
+          changed=1
+        fi
+        if systemctl list-unit-files | grep -q '^zramswap\\.service'; then
+          systemctl stop zramswap.service 2>/dev/null || true
+          systemctl disable zramswap.service 2>/dev/null || true
+          systemctl mask zramswap.service 2>/dev/null || true
+          changed=1
+        fi
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      args:
+        executable: /bin/bash
+      register: edge_worker_prep_zram
+      changed_when: "'CHANGED' in (edge_worker_prep_zram.stdout | default(''))"
+
+    - name: Read current kernel cmdline file
+      ansible.builtin.slurp:
+        path: "{{ edge_worker_prep_k3s_cmdline_path }}"
+      register: edge_worker_prep_cmdline_file
+
+    - name: Compute desired kernel cmdline line
+      ansible.builtin.set_fact:
+        edge_worker_prep_cmdline_current: "{{ edge_worker_prep_cmdline_file.content | b64decode | trim }}"
+        edge_worker_prep_cmdline_desired: >-
+          {%- set tokens = (edge_worker_prep_cmdline_file.content | b64decode | trim).split() -%}
+          {%- set ns = namespace(items=[]) -%}
+          {%- for token in tokens -%}
+          {%-   if token not in (edge_worker_prep_k3s_forbidden_cmdline_tokens | default([])) -%}
+          {%-     set _ = ns.items.append(token) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {%- for token in (edge_worker_prep_k3s_required_cmdline_tokens | default([])) -%}
+          {%-   if token not in ns.items -%}
+          {%-     set _ = ns.items.append(token) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ ns.items | join(' ') }}
+
+    - name: Update kernel cmdline for K3s prerequisites
+      ansible.builtin.copy:
+        dest: "{{ edge_worker_prep_k3s_cmdline_path }}"
+        content: "{{ edge_worker_prep_cmdline_desired ~ '\n' }}"
+        mode: "0644"
+      register: edge_worker_prep_cmdline_write
+
+    - name: Reboot edge worker when kernel cmdline changed
+      ansible.builtin.reboot:
+        msg: Reboot triggered by edge_worker_prep after kernel cmdline change
+        reboot_timeout: 900
+      when: edge_worker_prep_cmdline_write is changed
+
+    - name: Read runtime kernel cmdline
+      ansible.builtin.command: cat /proc/cmdline
+      register: edge_worker_prep_runtime_cmdline
+      changed_when: false
+
+    - name: Read cgroup v2 controllers
+      ansible.builtin.command: cat /sys/fs/cgroup/cgroup.controllers
+      register: edge_worker_prep_cgroup_controllers
+      changed_when: false
+
+    - name: Check active swap after preflight converge
+      ansible.builtin.command: swapon --noheadings --raw
+      register: edge_worker_prep_swapon_state
+      changed_when: false
+      failed_when: false
+
+    - name: Assert runtime cgroup_disable=memory flag policy
+      ansible.builtin.assert:
+        that:
+          - "'cgroup_disable=memory' not in (edge_worker_prep_runtime_cmdline.stdout | default(''))"
+        fail_msg: >-
+          Runtime cmdline still contains cgroup_disable=memory after edge_worker_prep.
+      when: edge_worker_prep_k3s_fail_if_runtime_flag_persists | default(true) | bool
+
+    - name: Assert memory controller availability policy
+      ansible.builtin.assert:
+        that:
+          - "'memory' in (edge_worker_prep_cgroup_controllers.stdout | default('')).split()"
+        fail_msg: >-
+          cgroup v2 memory controller is still absent after edge_worker_prep.
+      when: edge_worker_prep_k3s_fail_if_memory_controller_missing | default(true) | bool
+
+    - name: Assert swap is disabled policy
+      ansible.builtin.assert:
+        that:
+          - (edge_worker_prep_swapon_state.stdout | default('') | trim | length) == 0
+        fail_msg: >-
+          Active swap remains configured after edge_worker_prep.
+      when: edge_worker_prep_k3s_fail_if_swap_present | default(true) | bool

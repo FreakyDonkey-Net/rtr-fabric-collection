@@ -1,0 +1,21 @@
+---
+- name: Get nodes status
+  ansible.builtin.command: >-
+    {{ observability_agent_kubectl_bin }} get nodes -o wide
+  register: observability_agent_nodes
+  changed_when: false
+
+- name: Get pods in critical namespaces
+  ansible.builtin.command: >-
+    {{ observability_agent_kubectl_bin }} get pods -A
+    --field-selector=status.phase!=Running,status.phase!=Succeeded
+    -o wide
+  register: observability_agent_unhealthy_pods
+  changed_when: false
+  failed_when: false
+
+- name: Display cluster health
+  ansible.builtin.debug:
+    msg:
+      - "Nodes: {{ observability_agent_nodes.stdout_lines }}"
+      - "Non-running pods: {{ observability_agent_unhealthy_pods.stdout_lines }}"

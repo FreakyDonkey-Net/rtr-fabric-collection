@@ -1,0 +1,83 @@
+frr version 10.2.1
+frr defaults traditional
+hostname {{ inventory_hostname }}
+log syslog informational
+service integrated-vtysh-config
+!
+ip prefix-list FABRIC_DEFAULT_ONLY seq 5 permit 0.0.0.0/0
+{% for route in openwrt_edge_advertised_routes_effective | default([]) %}
+{%   if route.export | default(true) | bool %}
+ip prefix-list FABRIC_OUT seq {{ (loop.index0 + 1) * 10 }} permit {{ route.prefix }}
+{%   endif %}
+{% endfor %}
+!
+route-map FABRIC_IN deny 5
+ match ip address prefix-list FABRIC_DEFAULT_ONLY
+!
+route-map FABRIC_IN permit 10
+!
+route-map FABRIC_OUT permit 10
+ match ip address prefix-list FABRIC_OUT
+!
+route-map FABRIC_OUT deny 100
+!
+router bgp {{ edge_asn }}
+ bgp router-id {{ edge_router_id }}
+ no bgp default ipv4-unicast
+{% for uplink in openwrt_edge_uplinks_effective | default([]) %}
+ neighbor {{ uplink.remote_bgp_ip }} remote-as {{ uplink.remote_asn }}
+ neighbor {{ uplink.remote_bgp_ip }} update-source {{ uplink.local_bgp_ip }}
+ neighbor {{ uplink.remote_bgp_ip }} ebgp-multihop {{ openwrt_edge_bgp_multihop }}
+ neighbor {{ uplink.remote_bgp_ip }} timers {{ openwrt_edge_bgp_keepalive_time }} {{ openwrt_edge_bgp_hold_time }}
+{%   if (openwrt_edge_bgp_neighbor_password_enabled | default(true) | bool) and ((bgp_evpn_neighbor_password | default('') | string | trim | length) > 0) %}
+ neighbor {{ uplink.remote_bgp_ip }} password {{ bgp_evpn_neighbor_password }}
+{%   endif %}
+{% endfor %}
+ !
+ address-family ipv4 unicast
+{% for uplink in openwrt_edge_uplinks_effective | default([]) %}
+  neighbor {{ uplink.remote_bgp_ip }} activate
+  neighbor {{ uplink.remote_bgp_ip }} next-hop-self
+  neighbor {{ uplink.remote_bgp_ip }} route-map FABRIC_IN in
+  neighbor {{ uplink.remote_bgp_ip }} route-map FABRIC_OUT out
+{% endfor %}
+{% for route in openwrt_edge_advertised_routes_effective | default([]) %}
+{%   if route.export | default(true) | bool %}
+  network {{ route.prefix }}
+{%   endif %}
+{% endfor %}
+ exit-address-family
+!
+{% if openwrt_edge_ospf_enabled | default(false) | bool %}
+{% for uplink in openwrt_edge_uplinks_effective | default([]) %}
+interface {{ uplink.interface_name }}
+ ip ospf area {{ openwrt_edge_ospf_area | default('0.0.0.0') }}
+ ip ospf network {{ openwrt_edge_ospf_network_type | default('point-to-point') }}
+ ip ospf hello-interval {{ openwrt_edge_ospf_hello_interval | default(10) | int }}
+ ip ospf dead-interval {{ openwrt_edge_ospf_dead_interval | default(40) | int }}
+{%   if openwrt_edge_ospf_mtu_ignore | default(false) | bool %}
+ ip ospf mtu-ignore
+{%   endif %}
+{%   if (uplink.ospf_cost | default(0) | int) > 0 %}
+ ip ospf cost {{ uplink.ospf_cost | int }}
+{%   endif %}
+!
+{% endfor %}
+router ospf
+ ospf router-id {{ openwrt_edge_ospf_router_id | default(edge_router_id) }}
+ passive-interface default
+{% for uplink in openwrt_edge_uplinks_effective | default([]) %}
+ no passive-interface {{ uplink.interface_name }}
+ neighbor {{ uplink.ospf_neighbor_ip | default(uplink.remote_bgp_ip | default(uplink.remote_tunnel_ip)) }}
+{% endfor %}
+{% if openwrt_edge_ospf_advertise_loopback | default(true) | bool %}
+ network {{ edge_router_id }}/32 area {{ openwrt_edge_ospf_area | default('0.0.0.0') }}
+{% endif %}
+{% for prefix in openwrt_edge_ospf_extra_networks | default([]) %}
+{%   if (prefix | string | trim | length) > 0 %}
+ network {{ prefix | string | trim }} area {{ openwrt_edge_ospf_area | default('0.0.0.0') }}
+{%   endif %}
+{% endfor %}
+!
+{% endif %}
+line vty

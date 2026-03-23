@@ -1,0 +1,57 @@
+log syslog all;
+
+router id {{ edge_router_id }};
+
+protocol device {}
+
+protocol direct direct4 {
+  ipv4;
+  interface "*";
+}
+
+protocol kernel kernel4 {
+  ipv4 {
+    import none;
+    export all;
+  };
+}
+
+protocol static edge_local {
+  ipv4;
+{% for route in openwrt_edge_advertised_routes_effective | default([]) %}
+{%   if route.interface | default('') | string | trim | length > 0 %}
+  route {{ route.prefix }} via "{{ route.interface }}";
+{%   endif %}
+{% endfor %}
+}
+
+filter fabric_in {
+  if net = 0.0.0.0/0 then reject;
+  accept;
+}
+
+filter fabric_out {
+{% for route in openwrt_edge_advertised_routes_effective | default([]) %}
+{%   if route.export | default(true) | bool %}
+  if net = {{ route.prefix }} then accept;
+{%   endif %}
+{% endfor %}
+  reject;
+}
+
+{% for uplink in openwrt_edge_uplinks_effective | default([]) %}
+protocol bgp rr_{{ uplink.name }} {
+  local as {{ edge_asn }};
+  neighbor {{ uplink.remote_bgp_ip }} as {{ uplink.remote_asn }};
+  source address {{ uplink.local_bgp_ip }};
+  multihop {{ openwrt_edge_bgp_multihop }};
+  keepalive time {{ openwrt_edge_bgp_keepalive_time }};
+  hold time {{ openwrt_edge_bgp_hold_time }};
+  ipv4 {
+    import filter fabric_in;
+    export filter fabric_out;
+    next hop self;
+  };
+}
+
+{% endfor %}

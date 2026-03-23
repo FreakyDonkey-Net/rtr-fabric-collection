@@ -1,0 +1,24 @@
+---
+k8s_bgp_evpn_enabled: "{{ bgp_evpn_enabled | default(true) }}"
+k8s_bgp_evpn_namespace: "{{ bgp_evpn_namespace | default('fabric-net') }}"
+k8s_bgp_evpn_kubectl_bin: kubectl
+k8s_bgp_evpn_external_peers: "{{ bgp_evpn_external_peers | default([]) }}"
+k8s_bgp_evpn_external_gateway_proxy_prefixes: "{{ external_edges_egress_gateway_loopbacks | default([]) }}"
+k8s_bgp_evpn_neighbor_password_required: "{{ bgp_evpn_neighbor_password_required | default(false) }}"
+k8s_bgp_evpn_neighbor_password: "{{ bgp_evpn_neighbor_password | default('') }}"
+k8s_bgp_evpn_internal_peer_extra_prefixes: {}
+k8s_bgp_evpn_restart_nodes: []
+k8s_bgp_evpn_wait_nodes: []
+k8s_bgp_evpn_verify_pods: true
+k8s_bgp_evpn_autoheal_enabled: true
+k8s_bgp_evpn_verify_bgp: true
+
+# Optional OSPF for external edge peers over WireGuard.
+# Keep disabled unless explicitly enabled in inventory.
+k8s_bgp_evpn_ospf_external_enabled: false
+k8s_bgp_evpn_ospf_area: "0.0.0.0"
+# WireGuard carries unicast only; prefer explicit unicast OSPF neighbors.
+k8s_bgp_evpn_ospf_network_type: non-broadcast
+k8s_bgp_evpn_ospf_hello_interval: 10
+k8s_bgp_evpn_ospf_dead_interval: 40
+k8s_bgp_evpn_ospf_mtu_ignore: true

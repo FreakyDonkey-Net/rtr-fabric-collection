@@ -1,0 +1,21 @@
+---
+observability_agent_action: ""
+observability_agent_kubectl_bin: kubectl
+observability_agent_kubeconfig: "{{ k8s_observability_kubeconfig | default('/etc/rancher/k3s/k3s.yaml') }}"
+
+# check_bgp_sessions: vérifier les sessions FRR BGP dans le namespace fabric-net
+# check_wireguard_peers: vérifier les handshakes WireGuard sur tous les nœuds fabric
+# check_vlan_connectivity: vérifier la connectivité inter-VLAN underlay
+# check_radius_health: vérifier que les pods RADIUS répondent
+# check_cluster_health: rapport complet cluster (namespaces critiques, pods, nœuds)
+observability_agent_supported_actions:
+  - check_bgp_sessions
+  - check_wireguard_peers
+  - check_vlan_connectivity
+  - check_radius_health
+  - check_cluster_health
+
+observability_agent_bgp_namespace: "{{ bgp_evpn_namespace | default('fabric-net') }}"
+observability_agent_radius_namespace: "{{ k8s_network_services_namespace | default('net-services') }}"
+observability_agent_report_dir: "{{ k8s_observability_report_dir | default('/var/log/rtr-fabric') }}"
+observability_agent_fail_on_anomaly: "{{ k8s_observability_fail_on_anomaly | default(false) | bool }}"

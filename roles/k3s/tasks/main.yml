@@ -1,0 +1,269 @@
+---
+- name: Assert k3s role input is valid
+  ansible.builtin.assert:
+    that:
+      - k3s_role in ['server', 'agent']
+      - (k3s_token | default('') | length) > 0
+    fail_msg: >-
+      Invalid k3s role configuration on {{ inventory_hostname }}.
+      Expected k3s_role in [server, agent] and a non-empty k3s_token.
+
+- name: Build K3s extra argument lists
+  ansible.builtin.set_fact:
+    k3s_effective_service_name: "{{ k3s_server_service_name if k3s_role == 'server' else k3s_agent_service_name }}"
+    k3s_effective_extra_args: "{{ (k3s_server_extra_args if k3s_role == 'server' else k3s_agent_extra_args) | default([]) }}"
+    k3s_effective_node_ip: "{{ k3s_node_ip }}"
+    k3s_effective_advertise_address: "{{ k3s_server_advertise_address if k3s_role == 'server' else '' }}"
+  changed_when: false
+
+- name: Build K3s labels and taints from extra args
+  ansible.builtin.set_fact:
+    k3s_effective_node_labels: >-
+      {{
+        k3s_effective_extra_args
+        | select('match', '^--node-label=')
+        | map('regex_replace', '^--node-label=', '')
+        | list
+      }}
+    k3s_effective_node_taints: >-
+      {{
+        k3s_effective_extra_args
+        | select('match', '^--node-taint=')
+        | map('regex_replace', '^--node-taint=', '')
+        | list
+      }}
+    k3s_effective_tls_sans: >-
+      {{
+        (
+          [
+            inventory_hostname ~ '.' ~ (k8s_network_services_dns_internal_domain | default('freakydonkey.net')),
+            (k3s_server_advertise_address if k3s_role == 'server' else ''),
+            k3s_effective_node_ip
+          ]
+          +
+          (
+            (k3s_server_tls_sans_extra | default([]))
+            if (k3s_role == 'server')
+            else []
+          )
+        )
+        | reject('equalto', '')
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+  changed_when: false
+
+- name: Ensure K3s config directory exists
+  ansible.builtin.file:
+    path: "{{ k3s_config_path | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure K3s audit log directory exists
+  ansible.builtin.file:
+    path: "{{ k3s_audit_log_dir }}"
+    state: directory
+    mode: "0750"
+  when:
+    - k3s_role == 'server'
+    - k3s_audit_policy_enabled | bool
+
+- name: Render Kubernetes API audit policy for K3s servers
+  ansible.builtin.template:
+    src: k8s-audit-policy.yaml.j2
+    dest: "{{ k3s_audit_policy_path }}"
+    mode: "0600"
+  register: k3s_audit_policy_result
+  when:
+    - k3s_role == 'server'
+    - k3s_audit_policy_enabled | bool
+
+- name: Render K3s config file
+  ansible.builtin.template:
+    src: k3s-config.yaml.j2
+    dest: "{{ k3s_config_path }}"
+    mode: "0600"
+  register: k3s_config_result
+
+- name: Read primary K3s secrets-encryption files for secondary servers
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: "{{ k3s_secrets_encryption_sync_files }}"
+  register: k3s_primary_encryption_files
+  no_log: true
+  delegate_to: "{{ k3s_server_host }}"
+  when:
+    - k3s_role == 'server'
+    - inventory_hostname != k3s_server_host
+    - k3s_secrets_encryption_enabled | bool
+
+- name: Ensure K3s server credential directory exists on secondary servers
+  ansible.builtin.file:
+    path: /var/lib/rancher/k3s/server/cred
+    state: directory
+    mode: "0700"
+  when:
+    - k3s_role == 'server'
+    - inventory_hostname != k3s_server_host
+    - k3s_secrets_encryption_enabled | bool
+
+- name: Synchronize K3s secrets-encryption files from the primary server
+  ansible.builtin.copy:
+    dest: "{{ item.source }}"
+    content: "{{ item.content | b64decode }}"
+    mode: "0600"
+  loop: "{{ k3s_primary_encryption_files.results | default([]) }}"
+  register: k3s_encryption_files_sync_result
+  no_log: true
+  when:
+    - k3s_role == 'server'
+    - inventory_hostname != k3s_server_host
+    - k3s_secrets_encryption_enabled | bool
+
+- name: Gather K3s service facts
+  ansible.builtin.service_facts:
+
+- name: Resolve installed K3s binary path
+  ansible.builtin.command:
+    cmd: which k3s
+  register: k3s_binary_path_initial_cmd
+  changed_when: false
+  failed_when: false
+
+- name: Bootstrap missing K3s agent installation when enabled
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if command -v curl >/dev/null 2>&1; then
+      curl -sfL {{ k3s_install_bootstrap_url | quote }} | INSTALL_K3S_VERSION={{ k3s_version | quote }} sh -s - agent
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO- {{ k3s_install_bootstrap_url | quote }} | INSTALL_K3S_VERSION={{ k3s_version | quote }} sh -s - agent
+    else
+      echo "Neither curl nor wget is available for K3s bootstrap" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  when:
+    - k3s_role == 'agent'
+    - k3s_install_bootstrap_enabled | bool
+    - (k3s_binary_path_initial_cmd.stdout | default('') | string | trim | length) == 0
+  register: k3s_bootstrap_install_result
+
+- name: Refresh K3s service facts after bootstrap install
+  ansible.builtin.service_facts:
+  when:
+    - (k3s_bootstrap_install_result is defined)
+    - (k3s_bootstrap_install_result is changed)
+
+- name: Resolve installed K3s binary path after bootstrap install
+  ansible.builtin.command:
+    cmd: which k3s
+  register: k3s_binary_path_post_bootstrap_cmd
+  changed_when: false
+  failed_when: false
+  when:
+    - (k3s_bootstrap_install_result is defined)
+    - (k3s_bootstrap_install_result is changed)
+
+- name: Compute effective K3s binary path
+  ansible.builtin.set_fact:
+    k3s_binary_path_effective: >-
+      {{
+        (
+          k3s_binary_path_post_bootstrap_cmd.stdout
+          if (
+            (k3s_binary_path_post_bootstrap_cmd is defined)
+            and not (k3s_binary_path_post_bootstrap_cmd.skipped | default(false))
+            and ((k3s_binary_path_post_bootstrap_cmd.stdout | default('') | string | trim | length) > 0)
+          )
+          else k3s_binary_path_initial_cmd.stdout
+        )
+        | default('')
+        | string
+        | trim
+      }}
+  changed_when: false
+
+- name: Assert K3s binary is available on target host
+  ansible.builtin.assert:
+    that:
+      - (k3s_binary_path_effective | default('') | string | trim | length) > 0
+    fail_msg: >-
+      k3s binary was not found on {{ inventory_hostname }}.
+      The role can only converge hosts where K3s is already installed unless
+      k3s_install_bootstrap_enabled=true is set for agent bootstrap.
+
+- name: Promote existing K3s agent service to a server unit when required
+  when:
+    - k3s_role == 'server'
+    - k3s_manage_promoted_server_unit | bool
+    - ansible_facts.services[k3s_effective_service_name ~ '.service'] is not defined
+    - ansible_facts.services[k3s_agent_service_name ~ '.service'] is defined
+  block:
+    - name: Stop and disable K3s agent service before promotion
+      ansible.builtin.service:
+        name: "{{ k3s_agent_service_name }}"
+        state: stopped
+        enabled: false
+
+    - name: Render managed K3s server systemd unit
+      ansible.builtin.template:
+        src: k3s-server.service.j2
+        dest: "{{ k3s_server_unit_path }}"
+        mode: "0644"
+      vars:
+        k3s_binary_path: "{{ k3s_binary_path_effective }}"
+      register: k3s_server_unit_result
+
+    - name: Reload systemd after K3s server unit promotion
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: k3s_server_unit_result is changed
+
+    - name: Refresh K3s service facts after promotion
+      ansible.builtin.service_facts:
+
+- name: Assert K3s service unit exists on target host
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.services[k3s_effective_service_name ~ '.service'] is defined
+    fail_msg: >-
+      {{ k3s_effective_service_name }}.service is absent on {{ inventory_hostname }}.
+      The role only manages existing K3s installations and optional
+      agent-to-server promotions on hosts where k3s-agent already exists.
+
+- name: Ensure K3s service is enabled and started
+  ansible.builtin.service:
+    name: "{{ k3s_effective_service_name }}"
+    state: >-
+      {{
+        'restarted'
+        if (
+          (k3s_config_result is changed)
+          or (
+            (k3s_server_unit_result is defined)
+            and (k3s_server_unit_result is changed)
+          )
+          or (
+            (k3s_encryption_files_sync_result is defined)
+            and (k3s_encryption_files_sync_result is changed)
+          )
+          or (
+            (k3s_audit_policy_result is defined)
+            and (k3s_audit_policy_result is changed)
+          )
+        )
+        else 'started'
+      }}
+    enabled: true
+
+- name: Wait for K3s API on server nodes
+  ansible.builtin.wait_for:
+    host: "{{ k3s_effective_advertise_address | default(k3s_effective_node_ip, true) }}"
+    port: 6443
+    timeout: 120
+    delay: 3
+  when: k3s_role == 'server'

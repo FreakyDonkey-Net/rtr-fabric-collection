@@ -1,0 +1,270 @@
+---
+- name: Validate enterprise security inputs
+  ansible.builtin.assert:
+    that:
+      - k8s_enterprise_security_namespace | string | trim | length > 0
+      - k8s_enterprise_security_kubeconfig | string | trim | length > 0
+      - >-
+        not (k8s_enterprise_security_kyverno_enabled | bool)
+        or (k8s_enterprise_security_kyverno_chart_name | string | trim | length) > 0
+      - >-
+        not (k8s_enterprise_security_kyverno_enabled | bool)
+        or (k8s_enterprise_security_kyverno_chart_repo | string | trim | length) > 0
+      - >-
+        not (k8s_enterprise_security_kyverno_enabled | bool)
+        or (k8s_enterprise_security_kyverno_chart_version | string | trim | length) > 0
+      - (k8s_enterprise_security_rbac_groups.platform_admin | default('') | string | trim | length) > 0
+      - (k8s_enterprise_security_rbac_groups.security_admin | default('') | string | trim | length) > 0
+      - (k8s_enterprise_security_rbac_groups.ops_readonly | default('') | string | trim | length) > 0
+      - (k8s_enterprise_security_rbac_groups.tenant_operator | default('') | string | trim | length) > 0
+      - (k8s_enterprise_security_rbac_groups.break_glass | default('') | string | trim | length) > 0
+      - (k8s_enterprise_security_allowed_image_registries | default([]) | length) > 0
+      - (k8s_enterprise_security_policies | default([]) | length) > 0
+      - >-
+        not (k8s_enterprise_security_break_glass_enabled | bool)
+        or (k8s_enterprise_security_break_glass_namespace | string | trim | length) > 0
+      - >-
+        not (k8s_enterprise_security_break_glass_enabled | bool)
+        or (k8s_enterprise_security_break_glass_serviceaccount_name | string | trim | length) > 0
+      - >-
+        not (k8s_enterprise_security_break_glass_enabled | bool)
+        or (k8s_enterprise_security_break_glass_token_ttl | string | trim | length) > 0
+      - >-
+        not (k8s_enterprise_security_verify_image_signatures_enabled | bool)
+        or (k8s_enterprise_security_signed_image_references | default([]) | length) > 0
+      - >-
+        not (k8s_enterprise_security_verify_image_signatures_enabled | bool)
+        or (k8s_enterprise_security_cosign_public_keys | default([]) | length) > 0
+      - >-
+        not (k8s_enterprise_security_falco_enabled | bool)
+        or (k8s_enterprise_security_falco_chart_name | string | trim | length) > 0
+      - >-
+        not (k8s_enterprise_security_falco_enabled | bool)
+        or (k8s_enterprise_security_falco_chart_repo | string | trim | length) > 0
+      - >-
+        not (k8s_enterprise_security_falco_enabled | bool)
+        or (k8s_enterprise_security_falco_chart_version | string | trim | length) > 0
+      - >-
+        not (k8s_enterprise_security_falco_enabled | bool)
+        or not (k8s_enterprise_security_falco_custom_driver_loader_enabled | bool)
+        or (k8s_enterprise_security_falco_custom_driver_loader_image | string | trim | length) > 0
+      - >-
+        (k8s_enterprise_security_tenant_namespaces | default([]) | map(attribute='name') | list | unique | length)
+        ==
+        (k8s_enterprise_security_tenant_namespaces | default([]) | map(attribute='name') | list | length)
+    fail_msg: >-
+      Enterprise security requires namespace, kubeconfig, RBAC group names,
+      policy identifiers and a pinned Kyverno chart source.
+
+- name: Ensure Kubernetes Python client package is installed
+  ansible.builtin.apt:
+    name: python3-kubernetes
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Check whether helm is available on the control-plane host
+  ansible.builtin.stat:
+    path: "{{ k8s_enterprise_security_kyverno_helm_bin }}"
+  register: k8s_enterprise_security_remote_helm
+  when:
+    - k8s_enterprise_security_kyverno_enabled | bool
+      or k8s_enterprise_security_falco_enabled | bool
+
+- name: Copy local helm binary to control-plane host when missing
+  ansible.builtin.copy:
+    src: "{{ k8s_enterprise_security_kyverno_local_helm_binary }}"
+    dest: "{{ k8s_enterprise_security_kyverno_helm_bin }}"
+    mode: "0755"
+  when:
+    - k8s_enterprise_security_kyverno_enabled | bool
+      or k8s_enterprise_security_falco_enabled | bool
+    - k8s_enterprise_security_kyverno_copy_local_helm_binary | bool
+    - not k8s_enterprise_security_remote_helm.stat.exists
+
+- name: Validate helm is available on the control-plane host
+  ansible.builtin.command:
+    argv:
+      - "{{ k8s_enterprise_security_kyverno_helm_bin }}"
+      - version
+      - --short
+  changed_when: false
+  environment: "{{ k8s_enterprise_security_kyverno_helm_environment }}"
+  when:
+    - k8s_enterprise_security_kyverno_enabled | bool
+      or k8s_enterprise_security_falco_enabled | bool
+
+- name: Ensure enterprise security namespace exists
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_enterprise_security_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ k8s_enterprise_security_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ k8s_enterprise_security_namespace_pod_security_enforce }}"
+          pod-security.kubernetes.io/warn: "{{ k8s_enterprise_security_namespace_pod_security_warn }}"
+          pod-security.kubernetes.io/audit: "{{ k8s_enterprise_security_namespace_pod_security_audit }}"
+  when: k8s_enterprise_security_kyverno_enabled | bool
+
+- name: Render Kyverno Helm values
+  ansible.builtin.template:
+    src: kyverno-values.yaml.j2
+    dest: /tmp/kyverno-values.yaml
+    mode: "0600"
+  changed_when: false
+  when: k8s_enterprise_security_kyverno_enabled | bool
+
+- name: Install or upgrade Kyverno
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_enterprise_security_kyverno_helm_bin }}
+      upgrade --install
+      {{ k8s_enterprise_security_kyverno_release_name }}
+      {{ k8s_enterprise_security_kyverno_chart_name }}
+      --repo {{ k8s_enterprise_security_kyverno_chart_repo }}
+      --namespace {{ k8s_enterprise_security_namespace }}
+      --create-namespace
+      --wait
+      --timeout {{ k8s_enterprise_security_kyverno_helm_wait_timeout }}
+      --version {{ k8s_enterprise_security_kyverno_chart_version }}
+      --set crds.migration.enabled={{ k8s_enterprise_security_kyverno_crds_migration_enabled | bool | lower }}
+      -f /tmp/kyverno-values.yaml
+      --kubeconfig {{ k8s_enterprise_security_kubeconfig }}
+  register: k8s_enterprise_security_kyverno_install
+  environment: "{{ k8s_enterprise_security_kyverno_helm_environment }}"
+  changed_when: >-
+    {{
+      'STATUS: deployed' in (k8s_enterprise_security_kyverno_install.stdout | default(''))
+      or 'STATUS: pending-upgrade' in (k8s_enterprise_security_kyverno_install.stdout | default(''))
+      or 'STATUS: pending-install' in (k8s_enterprise_security_kyverno_install.stdout | default(''))
+    }}
+  when: k8s_enterprise_security_kyverno_enabled | bool
+
+- name: Render enterprise RBAC manifest
+  ansible.builtin.template:
+    src: enterprise-rbac.yaml.j2
+    dest: /tmp/rtr-fabric-enterprise-rbac.yaml
+    mode: "0600"
+  changed_when: false
+  when: k8s_enterprise_security_rbac_enabled | bool
+
+- name: Apply enterprise RBAC manifest
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - --kubeconfig
+      - "{{ k8s_enterprise_security_kubeconfig }}"
+      - apply
+      - -f
+      - /tmp/rtr-fabric-enterprise-rbac.yaml
+  register: k8s_enterprise_security_rbac_apply
+  changed_when: >-
+    (
+      (k8s_enterprise_security_rbac_apply.stdout | default(''))
+      is search('created|configured')
+    )
+  when: k8s_enterprise_security_rbac_enabled | bool
+
+- name: Render tenant guardrails manifest
+  ansible.builtin.template:
+    src: tenant-guardrails.yaml.j2
+    dest: /tmp/rtr-fabric-enterprise-tenant-guardrails.yaml
+    mode: "0600"
+  changed_when: false
+  when: (k8s_enterprise_security_tenant_namespaces | default([]) | length) > 0
+
+- name: Apply tenant guardrails manifest
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - --kubeconfig
+      - "{{ k8s_enterprise_security_kubeconfig }}"
+      - apply
+      - -f
+      - /tmp/rtr-fabric-enterprise-tenant-guardrails.yaml
+  register: k8s_enterprise_security_tenant_guardrails_apply
+  changed_when: >-
+    (
+      (k8s_enterprise_security_tenant_guardrails_apply.stdout | default(''))
+      is search('created|configured')
+    )
+  when: (k8s_enterprise_security_tenant_namespaces | default([]) | length) > 0
+
+- name: Render Kyverno policy manifest
+  ansible.builtin.template:
+    src: kyverno-policies.yaml.j2
+    dest: /tmp/rtr-fabric-enterprise-kyverno-policies.yaml
+    mode: "0600"
+  changed_when: false
+  when: k8s_enterprise_security_kyverno_enabled | bool
+
+- name: Apply Kyverno policy manifest
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - --kubeconfig
+      - "{{ k8s_enterprise_security_kubeconfig }}"
+      - apply
+      - -f
+      - /tmp/rtr-fabric-enterprise-kyverno-policies.yaml
+  register: k8s_enterprise_security_kyverno_policy_apply
+  changed_when: >-
+    (
+      (k8s_enterprise_security_kyverno_policy_apply.stdout | default(''))
+      is search('created|configured')
+    )
+  when: k8s_enterprise_security_kyverno_enabled | bool
+
+- name: Ensure Falco namespace exists
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_enterprise_security_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ k8s_enterprise_security_falco_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "{{ k8s_enterprise_security_falco_namespace_pod_security_enforce }}"
+          pod-security.kubernetes.io/warn: "{{ k8s_enterprise_security_falco_namespace_pod_security_warn }}"
+          pod-security.kubernetes.io/audit: "{{ k8s_enterprise_security_falco_namespace_pod_security_audit }}"
+  when: k8s_enterprise_security_falco_enabled | bool
+
+- name: Render Falco Helm values
+  ansible.builtin.template:
+    src: falco-values.yaml.j2
+    dest: /tmp/falco-values.yaml
+    mode: "0600"
+  changed_when: false
+  when: k8s_enterprise_security_falco_enabled | bool
+
+- name: Install or upgrade Falco
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_enterprise_security_kyverno_helm_bin }}
+      upgrade --install
+      {{ k8s_enterprise_security_falco_release_name }}
+      {{ k8s_enterprise_security_falco_chart_name }}
+      --repo {{ k8s_enterprise_security_falco_chart_repo }}
+      --namespace {{ k8s_enterprise_security_falco_namespace }}
+      --create-namespace
+      --wait
+      --timeout {{ k8s_enterprise_security_falco_helm_wait_timeout }}
+      --version {{ k8s_enterprise_security_falco_chart_version }}
+      -f /tmp/falco-values.yaml
+      --kubeconfig {{ k8s_enterprise_security_kubeconfig }}
+  register: k8s_enterprise_security_falco_install
+  environment: "{{ k8s_enterprise_security_kyverno_helm_environment }}"
+  changed_when: >-
+    {{
+      'STATUS: deployed' in (k8s_enterprise_security_falco_install.stdout | default(''))
+      or 'STATUS: pending-upgrade' in (k8s_enterprise_security_falco_install.stdout | default(''))
+      or 'STATUS: pending-install' in (k8s_enterprise_security_falco_install.stdout | default(''))
+    }}
+  when: k8s_enterprise_security_falco_enabled | bool

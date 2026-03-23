@@ -1,0 +1,47 @@
+apiVersion: kubeovn.io/v1
+kind: ProviderNetwork
+metadata:
+  name: {{ kube_ovn_underlay_provider_network_name }}
+spec:
+  defaultInterface: {{ kube_ovn_underlay_provider_default_interface }}
+{% if kube_ovn_underlay_excluded_nodes | default([]) | length > 0 %}
+  excludeNodes:
+{% for node in kube_ovn_underlay_excluded_nodes %}
+    - {{ node }}
+{% endfor %}
+{% endif %}
+{% for subnet in kube_ovn_underlay_expected_subnets %}
+---
+apiVersion: kubeovn.io/v1
+kind: Vlan
+metadata:
+  name: {{ kube_ovn_underlay_vlan_name_prefix }}{{ subnet.id }}
+spec:
+  id: {{ subnet.id }}
+  provider: {{ kube_ovn_underlay_provider_network_name }}
+---
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: {{ subnet.name }}
+spec:
+  cidrBlock: {{ subnet.cidr }}
+  protocol: IPv4
+  gateway: {{ subnet.gateway }}
+  gatewayNode: ""
+  gatewayType: distributed
+  natOutgoing: false
+  private: false
+  default: false
+  enableLb: true
+  vpc: ovn-cluster
+  provider: {{ 'ovn' if (kube_ovn_underlay_subnet_provider_mode | default('ovn')) == 'ovn' else kube_ovn_underlay_provider_network_name }}
+  vlan: {{ kube_ovn_underlay_vlan_name_prefix }}{{ subnet.id }}
+  disableGatewayCheck: {{ kube_ovn_underlay_subnet_disable_gateway_check | ternary('true', 'false') }}
+{% if subnet.excludeIps | default([]) | length > 0 %}
+  excludeIps:
+{% for exclude_ip in subnet.excludeIps %}
+    - {{ exclude_ip }}
+{% endfor %}
+{% endif %}
+{% endfor %}

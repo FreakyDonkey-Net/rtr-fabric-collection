@@ -1,0 +1,495 @@
+---
+- name: Assert OpenWrt site context is available
+  ansible.builtin.assert:
+    that:
+      - (fabric_site | default('') | string | trim | length) > 0
+      - fabric_site_vlans is defined
+      - fabric_site in fabric_site_vlans
+    fail_msg: >-
+      openwrt_site_vlans requires fabric_site and fabric_site_vlans[{{ fabric_site | default('?') }}].
+
+- name: Assert trunk device is defined when apply mode is enabled
+  ansible.builtin.assert:
+    that:
+      - (openwrt_site_vlans_trunk_device | default('') | string | trim | length) > 0
+    fail_msg: openwrt_site_vlans_trunk_device is required when applying VLAN changes.
+  when:
+    - not (openwrt_site_vlans_dry_run | default(true) | bool)
+      or (openwrt_site_vlans_force_apply | default(false) | bool)
+
+- name: Build OpenWrt site VLAN base plan
+  ansible.builtin.set_fact:
+    openwrt_site_vlans_base_plan: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for vlan in (fabric_site_vlans[fabric_site] | default([])) -%}
+      {%-   set section = fabric_site ~ '_v' ~ (vlan.id | string) -%}
+      {%-   set dev_section = 'dev_' ~ fabric_site ~ '_v' ~ (vlan.id | string) -%}
+      {%-   set dev_name = openwrt_site_vlans_trunk_device ~ '.' ~ (vlan.id | string) -%}
+      {%-   set prefix = (vlan.cidr | string).split('/')[-1] | string -%}
+      {%-   set _ = ns.items.append(vlan | combine({
+              'section_name': section,
+              'device_section_name': dev_section,
+              'device_name': dev_name,
+              'vid': (vlan.id | string),
+              'netmask': {
+                '8': '255.0.0.0',
+                '16': '255.255.0.0',
+                '24': '255.255.255.0',
+                '25': '255.255.255.128',
+                '26': '255.255.255.192',
+                '27': '255.255.255.224',
+                '28': '255.255.255.240',
+                '29': '255.255.255.248',
+                '30': '255.255.255.252',
+                '31': '255.255.255.254',
+                '32': '255.255.255.255'
+              }[prefix] | default('255.255.255.0')
+            })) -%}
+      {%- endfor -%}
+      {{ ns.items }}
+
+- name: Read current OpenWrt interface device bindings
+  community.openwrt.command:
+    cmd: "uci -q get network.{{ item.section_name }}.device"
+  loop: "{{ openwrt_site_vlans_base_plan | default([]) }}"
+  loop_control:
+    label: "{{ item.section_name }}"
+  register: openwrt_site_vlans_current_device_bindings
+  changed_when: false
+  failed_when: false
+  when: openwrt_site_vlans_preserve_interface_device_overrides | default(true) | bool
+
+- name: Build preserved interface device overrides from current runtime
+  ansible.builtin.set_fact:
+    openwrt_site_vlans_preserved_interface_device_overrides: >-
+      {%- set ns = namespace(data={}) -%}
+      {%- for result in (openwrt_site_vlans_current_device_bindings.results | default([])) -%}
+      {%-   set current = result.stdout | default('') | string | trim -%}
+      {%-   if (current | length) > 0 and (current is match(openwrt_site_vlans_preserve_interface_device_pattern | default('^brw[a-z0-9]+'))) -%}
+      {%-     set _ = ns.data.update({result.item.section_name: current}) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.data }}
+  when: openwrt_site_vlans_preserve_interface_device_overrides | default(true) | bool
+
+- name: Build effective interface device overrides
+  ansible.builtin.set_fact:
+    openwrt_site_vlans_effective_interface_device_overrides: >-
+      {{
+        (openwrt_site_vlans_preserved_interface_device_overrides | default({}))
+        | combine(openwrt_site_vlans_interface_device_overrides | default({}), recursive=True)
+      }}
+
+- name: Build effective OpenWrt site VLAN plan
+  ansible.builtin.set_fact:
+    openwrt_site_vlans_effective_plan: >-
+      {%- set overrides = openwrt_site_vlans_effective_interface_device_overrides | default({}) -%}
+      {%- set ns = namespace(items=[]) -%}
+      {%- for vlan in (openwrt_site_vlans_base_plan | default([])) -%}
+      {%-   set iface_device = overrides[vlan.section_name] | default(vlan.device_name) -%}
+      {%-   set _ = ns.items.append(vlan | combine({'interface_device': iface_device})) -%}
+      {%- endfor -%}
+      {{ ns.items }}
+
+- name: Build effective bridge-vlan trunk port list
+  ansible.builtin.set_fact:
+    openwrt_site_vlans_bridge_vlan_trunk_ports_effective: >-
+      {{
+        ([openwrt_site_vlans_bridge_vlan_trunk_port] + (openwrt_site_vlans_bridge_vlan_additional_trunk_ports | default([])))
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    openwrt_site_vlans_bridge_vlan_native_untagged_ports_effective: >-
+      {{
+        ((openwrt_site_vlans_bridge_vlan_native_extra_untagged_ports | default([])))
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+
+- name: Show OpenWrt site VLAN dry-run plan
+  ansible.builtin.debug:
+    msg:
+      site: "{{ fabric_site }}"
+      trunk_device: "{{ openwrt_site_vlans_trunk_device }}"
+      vlans: "{{ openwrt_site_vlans_effective_plan | default([]) }}"
+      bridge_vlan_enabled: "{{ openwrt_site_vlans_bridge_vlan_enabled | default(false) | bool }}"
+      trunk_ports: "{{ openwrt_site_vlans_bridge_vlan_trunk_ports_effective | default([]) }}"
+      native_vlan_id: "{{ openwrt_site_vlans_bridge_vlan_native_vlan_id }}"
+      native_extra_untagged_ports: "{{ openwrt_site_vlans_bridge_vlan_native_untagged_ports_effective | default([]) }}"
+  changed_when: false
+  when:
+    - openwrt_site_vlans_dry_run | default(true) | bool
+    - not (openwrt_site_vlans_force_apply | default(false) | bool)
+
+- name: Apply OpenWrt site VLAN network objects
+  when:
+    - not (openwrt_site_vlans_dry_run | default(true) | bool)
+      or (openwrt_site_vlans_force_apply | default(false) | bool)
+  block:
+    - name: Ensure bridge-vlan filtering is enabled on trunk bridge device
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          section="$({
+            uci -q show network \
+            | sed -n "s/^network\.\([^.=]*\)=device$/\1/p" \
+            | while read -r s; do
+                name="$(uci -q get network.${s}.name 2>/dev/null || true)"
+                [ "$name" = "{{ openwrt_site_vlans_bridge_vlan_bridge_device | default(openwrt_site_vlans_trunk_device) }}" ] && { echo "$s"; break; }
+              done
+          } | head -n1)"
+          [ -n "$section" ] || exit 0
+          current="$(uci -q get network.${section}.vlan_filtering 2>/dev/null || true)"
+          if [ "$current" != "1" ]; then
+            uci set "network.${section}.vlan_filtering=1"
+            echo CHANGED
+          fi
+      register: openwrt_site_vlans_bridge_device_result
+      changed_when: "'CHANGED' in (openwrt_site_vlans_bridge_device_result.stdout | default(''))"
+      when: openwrt_site_vlans_bridge_vlan_enabled | default(false) | bool
+
+    - name: Ensure VLAN 8021q device sections exist
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          changed=0
+          section="{{ item.device_section_name }}"
+          [ "$(uci -q show "network.${section}" 2>/dev/null | sed -n '1s/^network\.[^.]*=//p')" = "device" ] || {
+            uci set "network.${section}=device"
+            changed=1
+          }
+          current="$(uci -q get "network.${section}.name" 2>/dev/null || true)"
+          [ "$current" = "{{ item.device_name }}" ] || {
+            uci set "network.${section}.name={{ item.device_name }}"
+            changed=1
+          }
+          current="$(uci -q get "network.${section}.type" 2>/dev/null || true)"
+          [ "$current" = "8021q" ] || {
+            uci set "network.${section}.type=8021q"
+            changed=1
+          }
+          current="$(uci -q get "network.${section}.ifname" 2>/dev/null || true)"
+          [ "$current" = "{{ openwrt_site_vlans_trunk_device }}" ] || {
+            uci set "network.${section}.ifname={{ openwrt_site_vlans_trunk_device }}"
+            changed=1
+          }
+          current="$(uci -q get "network.${section}.vid" 2>/dev/null || true)"
+          [ "$current" = "{{ item.id }}" ] || {
+            uci set "network.${section}.vid={{ item.id }}"
+            changed=1
+          }
+          [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_site_vlans_device_section_result
+      changed_when: "'CHANGED' in (openwrt_site_vlans_device_section_result.stdout | default(''))"
+      loop: "{{ openwrt_site_vlans_effective_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.device_section_name }}"
+
+    - name: Ensure VLAN interface sections exist
+      community.openwrt.uci:
+        command: section
+        config: network
+        type: interface
+        name: "{{ item.section_name }}"
+        find:
+          name: "{{ item.section_name }}"
+        set_find: true
+        replace: true
+        value:
+          device: "{{ item.interface_device }}"
+          proto: static
+          ipaddr: "{{ item.gateway }}"
+          netmask: "{{ item.netmask }}"
+      loop: "{{ openwrt_site_vlans_effective_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.section_name }}"
+
+    - name: Ensure native bridge-vlan section exists
+      community.openwrt.uci:
+        command: section
+        config: network
+        type: bridge-vlan
+        name: rtr_fabric_brvlan1
+        find:
+          name: rtr_fabric_brvlan1
+        set_find: true
+        replace: true
+        value:
+          device: "{{ openwrt_site_vlans_bridge_vlan_bridge_device | default(openwrt_site_vlans_trunk_device) }}"
+          vlan: "{{ openwrt_site_vlans_bridge_vlan_native_vlan_id }}"
+          ports: >-
+            {{
+              (
+                (openwrt_site_vlans_bridge_vlan_trunk_ports_effective | default([]))
+                | map('regex_replace', '$', ':u*')
+                | list
+              )
+              + (
+                (openwrt_site_vlans_bridge_vlan_native_untagged_ports_effective | default([]))
+                | map('regex_replace', '$', ':u')
+                | list
+              )
+            }}
+      when: openwrt_site_vlans_bridge_vlan_enabled | default(false) | bool
+
+    - name: Ensure tagged bridge-vlan sections exist for site VLANs
+      community.openwrt.uci:
+        command: section
+        config: network
+        type: bridge-vlan
+        name: "rtr_fabric_brvlan{{ item.id }}"
+        find:
+          name: "rtr_fabric_brvlan{{ item.id }}"
+        set_find: true
+        replace: true
+        value:
+          device: "{{ openwrt_site_vlans_bridge_vlan_bridge_device | default(openwrt_site_vlans_trunk_device) }}"
+          vlan: "{{ item.id }}"
+          ports: >-
+            {{
+              (openwrt_site_vlans_bridge_vlan_trunk_ports_effective | default([]))
+              | map('regex_replace', '$', ':t')
+              | list
+            }}
+      loop: "{{ openwrt_site_vlans_effective_plan | default([]) }}"
+      loop_control:
+        label: "rtr_fabric_brvlan{{ item.id }}"
+      when: openwrt_site_vlans_bridge_vlan_enabled | default(false) | bool
+
+    - name: Check pending OpenWrt network UCI changes
+      community.openwrt.uci:
+        command: changes
+        config: network
+      register: openwrt_site_vlans_network_changes
+      changed_when: false
+
+    - name: Commit OpenWrt network UCI changes
+      community.openwrt.uci:
+        command: commit
+        config: network
+      when: (openwrt_site_vlans_network_changes.result | default('') | trim | length) > 0
+
+    - name: Reload OpenWrt network service when VLAN config changed
+      community.openwrt.command:
+        cmd: /etc/init.d/network reload
+      changed_when: true
+      when: (openwrt_site_vlans_network_changes.result | default('') | trim | length) > 0
+
+- name: Build effective firewall VLAN zone plan
+  ansible.builtin.set_fact:
+    openwrt_site_vlans_firewall_zone_plan: >-
+      {{
+        (openwrt_site_vlans_effective_plan | default([]))
+        | rejectattr('name', 'in', openwrt_site_vlans_firewall_zone_skip_vlan_names | default([]))
+        | list
+      }}
+  when: openwrt_site_vlans_firewall_enabled | default(false) | bool
+
+- name: Build OpenWrt local firewall service rule plan
+  ansible.builtin.set_fact:
+    openwrt_site_vlans_firewall_local_rules: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for vlan in (openwrt_site_vlans_firewall_zone_plan | default([])) -%}
+      {%-   if openwrt_site_vlans_firewall_allow_dns_to_router | default(true) | bool -%}
+      {%-     set _ = ns.items.append({
+              'section_name': 'rtr_fabric_' ~ vlan.name ~ '_local_dns',
+              'name': 'rtr-fabric ' ~ vlan.name ~ ' local dns',
+              'src': vlan.name,
+              'proto': 'tcp udp',
+              'dest_port': '53',
+              'target': 'ACCEPT'
+            }) -%}
+      {%-   endif -%}
+      {%-   if openwrt_site_vlans_firewall_allow_dhcp_to_router | default(true) | bool -%}
+      {%-     set _ = ns.items.append({
+              'section_name': 'rtr_fabric_' ~ vlan.name ~ '_local_dhcp',
+              'name': 'rtr-fabric ' ~ vlan.name ~ ' local dhcp',
+              'src': vlan.name,
+              'proto': 'udp',
+              'dest_port': '67-68',
+              'family': 'ipv4',
+              'target': 'ACCEPT'
+            }) -%}
+      {%-   endif -%}
+      {%-   if openwrt_site_vlans_firewall_allow_ntp_to_router | default(true) | bool -%}
+      {%-     set _ = ns.items.append({
+              'section_name': 'rtr_fabric_' ~ vlan.name ~ '_local_ntp',
+              'name': 'rtr-fabric ' ~ vlan.name ~ ' local ntp',
+              'src': vlan.name,
+              'proto': 'udp',
+              'dest_port': '123',
+              'target': 'ACCEPT'
+            }) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+  when: openwrt_site_vlans_firewall_enabled | default(false) | bool
+
+- name: Show OpenWrt VLAN firewall dry-run plan
+  ansible.builtin.debug:
+    msg:
+      zones: "{{ openwrt_site_vlans_firewall_zone_plan | default([]) | map(attribute='name') | list }}"
+      local_rules: "{{ openwrt_site_vlans_firewall_local_rules | default([]) }}"
+      forwardings: "{{ openwrt_site_vlans_firewall_forwardings | default([]) }}"
+      custom_rules: "{{ openwrt_site_vlans_firewall_custom_rules | default([]) }}"
+  changed_when: false
+  when:
+    - openwrt_site_vlans_firewall_enabled | default(false) | bool
+    - openwrt_site_vlans_dry_run | default(true) | bool
+    - not (openwrt_site_vlans_force_apply | default(false) | bool)
+
+- name: Apply OpenWrt VLAN firewall objects
+  when:
+    - openwrt_site_vlans_firewall_enabled | default(false) | bool
+    - not (openwrt_site_vlans_dry_run | default(true) | bool)
+      or (openwrt_site_vlans_force_apply | default(false) | bool)
+  block:
+    - name: Ensure VLAN firewall zones exist
+      community.openwrt.uci:
+        command: section
+        config: firewall
+        type: zone
+        name: "rtr_fabric_{{ item.name }}_zone"
+        find:
+          name: "{{ item.name }}"
+        set_find: true
+        replace: true
+        value:
+          name: "{{ item.name }}"
+          input: REJECT
+          output: ACCEPT
+          forward: REJECT
+          network:
+            - "{{ item.section_name }}"
+      loop: "{{ openwrt_site_vlans_firewall_zone_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Ensure VLAN firewall local service rules exist
+      community.openwrt.uci:
+        command: section
+        config: firewall
+        type: rule
+        name: "{{ item.section_name }}"
+        find:
+          name: "{{ item.name }}"
+        set_find: true
+        replace: true
+        value: >-
+          {{
+            {
+              'name': item.name,
+              'src': item.src,
+              'proto': item.proto,
+              'dest_port': item.dest_port,
+              'target': item.target
+            }
+            | combine({'family': item.family}, recursive=True)
+            if (item.family | default('') | string | trim | length) > 0
+            else {
+              'name': item.name,
+              'src': item.src,
+              'proto': item.proto,
+              'dest_port': item.dest_port,
+              'target': item.target
+            }
+          }}
+      loop: "{{ openwrt_site_vlans_firewall_local_rules | default([]) }}"
+      loop_control:
+        label: "{{ item.section_name }}"
+
+    - name: Ensure VLAN firewall forwardings exist
+      community.openwrt.uci:
+        command: section
+        config: firewall
+        type: forwarding
+        name: "rtr_fabric_{{ item.src }}_to_{{ item.dest }}"
+        find:
+          src: "{{ item.src }}"
+          dest: "{{ item.dest }}"
+        set_find: true
+        replace: true
+        value:
+          src: "{{ item.src }}"
+          dest: "{{ item.dest }}"
+      loop: "{{ openwrt_site_vlans_firewall_forwardings | default([]) if (openwrt_site_vlans_firewall_forwardings_enabled | default(false) | bool) else [] }}"
+      loop_control:
+        label: "{{ item.src }}->{{ item.dest }}"
+
+    - name: Ensure VLAN firewall custom rules exist
+      community.openwrt.uci:
+        command: section
+        config: firewall
+        type: rule
+        name: "{{ item.section_name }}"
+        find:
+          name: "{{ item.name }}"
+        set_find: true
+        replace: true
+        value: >-
+          {{
+            {
+              'name': item.name,
+              'src': item.src,
+              'proto': item.proto,
+              'dest_port': (item.dest_port | string),
+              'target': item.target
+            }
+            | combine({'dest': item.dest}, recursive=True)
+            if (item.dest | default('') | string | trim | length) > 0
+            else {
+              'name': item.name,
+              'src': item.src,
+              'proto': item.proto,
+              'dest_port': (item.dest_port | string),
+              'target': item.target
+            }
+            | combine({'family': item.family}, recursive=True)
+            if (item.family | default('') | string | trim | length) > 0
+            else (
+              {
+                'name': item.name,
+                'src': item.src,
+                'proto': item.proto,
+                'dest_port': (item.dest_port | string),
+                'target': item.target
+              }
+              | combine({'dest': item.dest}, recursive=True)
+              if (item.dest | default('') | string | trim | length) > 0
+              else {
+                'name': item.name,
+                'src': item.src,
+                'proto': item.proto,
+                'dest_port': (item.dest_port | string),
+                'target': item.target
+              }
+            )
+          }}
+      loop: "{{ openwrt_site_vlans_firewall_custom_rules | default([]) if (openwrt_site_vlans_firewall_custom_rules_enabled | default(false) | bool) else [] }}"
+      loop_control:
+        label: "{{ item.section_name }}"
+
+    - name: Check pending OpenWrt firewall UCI changes
+      community.openwrt.uci:
+        command: changes
+        config: firewall
+      register: openwrt_site_vlans_firewall_changes
+      changed_when: false
+
+    - name: Commit OpenWrt firewall UCI changes
+      community.openwrt.uci:
+        command: commit
+        config: firewall
+      when: (openwrt_site_vlans_firewall_changes.result | default('') | trim | length) > 0
+
+    - name: Reload OpenWrt firewall service when VLAN firewall changed
+      community.openwrt.service:
+        name: firewall
+        state: restarted
+      when: (openwrt_site_vlans_firewall_changes.result | default('') | trim | length) > 0

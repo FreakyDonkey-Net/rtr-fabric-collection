@@ -1,0 +1,11 @@
+---
+wireguard_agent_interface: "{{ wireguard_interface | default('wg0') }}"
+wireguard_agent_supported_actions:
+  - create_interface
+  - configure_interface
+  - update_config
+  - list_interfaces
+  - list_peers
+  - show_status
+  - debug_tunnel
+  - test_connection

@@ -1,0 +1,11 @@
+---
+bgp_agent_supported_actions:
+  - show_bgp_status
+  - verify_bgp_peers
+  - verify_evpn
+  - debug_bgp
+  - test_bgp_connectivity
+
+bgp_agent_default_ping_count: 2
+bgp_agent_kubectl_bin: kubectl
+bgp_agent_kubectl_namespace: "{{ bgp_evpn_namespace | default('fabric-net') }}"
