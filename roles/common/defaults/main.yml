@@ -1,2 +1,16 @@
 ---
 common_dhcpcd_override_path: /etc/dhcpcd.conf.d/60-rtr-fabric.conf
+common_bootstrap_dhcp_enabled: false
+common_bootstrap_dhcp_package: dnsmasq
+common_bootstrap_dhcp_service_name: dnsmasq
+common_bootstrap_dhcp_config_path: /etc/dnsmasq.d/60-rtr-fabric-bootstrap-dhcp.conf
+common_bootstrap_dhcp_interface: ""
+common_bootstrap_dhcp_range_start: ""
+common_bootstrap_dhcp_range_end: ""
+common_bootstrap_dhcp_netmask: 255.255.255.0
+common_bootstrap_dhcp_lease_time: 12h
+common_bootstrap_dhcp_router: ""
+common_bootstrap_dhcp_dns_servers: []
+common_bootstrap_dhcp_authoritative: true
+common_bootstrap_dhcp_disable_dns: true
+common_bootstrap_dhcp_reservations: []

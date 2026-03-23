@@ -5,20 +5,6 @@
       - k8s_network_services_namespace | string | length > 0
       - k8s_network_services_kubectl_bin | string | length > 0
 
-- name: Refuse implicit environment fallback for network services
-  ansible.builtin.assert:
-    that:
-      - rtr_fabric_target_environment_is_explicit | default(false) | bool
-    fail_msg: >-
-      k8s_network_services requires an explicit target environment before evaluating secret-backed settings.
-      Set RTR_FABRIC_TARGET_ENVIRONMENT or create inventory/.secrets/target-environment.
-  when:
-    - >-
-      (k8s_network_services_dns_enabled | default(false) | bool)
-      or (k8s_network_services_radius_enabled | default(false) | bool)
-      or (k8s_network_services_ca_enabled | default(false) | bool)
-      or (k8s_network_services_ldap_enabled | default(false) | bool)
-
 - name: Validate DNS settings
   ansible.builtin.assert:
     that:
@@ -427,13 +413,38 @@
     - not k8s_network_services_dry_run | bool
     - k8s_network_services_ca_enabled | bool
 
+- name: Detect LDAP deployment availability when bootstrap tasks are needed
+  ansible.builtin.command:
+    cmd: "{{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} get deployment/infra-ldap"
+  register: k8s_network_services_ldap_deployment_present
+  changed_when: false
+  failed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+
+- name: Compute LDAP bootstrap task eligibility
+  ansible.builtin.set_fact:
+    k8s_network_services_ldap_bootstrap_enabled: >-
+      {{
+        (not (k8s_network_services_dry_run | bool))
+        and (k8s_network_services_ldap_enabled | bool)
+        and (
+          (not (k8s_network_services_ldap_gitops_managed | bool))
+          or ((k8s_network_services_ldap_deployment_present.rc | default(1) | int) == 0)
+        )
+      }}
+  changed_when: false
+  when:
+    - not k8s_network_services_dry_run | bool
+    - k8s_network_services_ldap_enabled | bool
+
 - name: Wait for LDAP deployment
   ansible.builtin.command:
     cmd: "{{ k8s_network_services_kubectl_bin }} -n {{ k8s_network_services_namespace }} rollout status deployment/infra-ldap --timeout=180s"
   changed_when: false
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
 
 - name: Resolve LDAP pod name
   ansible.builtin.command:
@@ -449,8 +460,7 @@
   failed_when: (k8s_network_services_ldap_pod_name.stdout | string | trim | length) == 0
   changed_when: false
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (
         (k8s_network_services_ldap_seed_users | default([]) | length) > 0
         or (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
@@ -474,8 +484,7 @@
       }}
   changed_when: false
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (
         (k8s_network_services_ldap_seed_users | default([]) | length) > 0
         or (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
@@ -521,8 +530,7 @@
       }}
   changed_when: false
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (
         (k8s_network_services_ldap_seed_users | default([]) | length) > 0
         or (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
@@ -547,8 +555,7 @@
   register: k8s_network_services_ldap_seed_users_parent_ou_apply
   changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_users_parent_ou_apply.stdout | lower)"
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (k8s_network_services_ldap_seed_users | default([]) | length) > 0
     - (k8s_network_services_ldap_seed_users_parent_dn | string) != 'dc=freakydonkey,dc=net'
 
@@ -571,8 +578,7 @@
   register: k8s_network_services_ldap_seed_users_ou_apply
   changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_users_ou_apply.stdout | lower)"
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (k8s_network_services_ldap_seed_users | default([]) | length) > 0
 
 - name: Ensure LDAP seed groups parent OU exists
@@ -594,8 +600,7 @@
   register: k8s_network_services_ldap_seed_groups_parent_ou_apply
   changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_groups_parent_ou_apply.stdout | lower)"
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
     - (k8s_network_services_ldap_seed_groups_parent_dn | string) != 'dc=freakydonkey,dc=net'
 
@@ -618,8 +623,7 @@
   register: k8s_network_services_ldap_seed_groups_ou_apply
   changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_groups_ou_apply.stdout | lower)"
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
 
 - name: Ensure LDAP seed users exist
@@ -652,8 +656,7 @@
   changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_users_apply.stdout | lower)"
   no_log: true
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (k8s_network_services_ldap_seed_users | default([]) | length) > 0
 
 - name: Ensure LDAP seed groups exist
@@ -683,8 +686,7 @@
   changed_when: "'adding new entry' in (k8s_network_services_ldap_seed_groups_apply.stdout | lower)"
   no_log: true
   when:
-    - not k8s_network_services_dry_run | bool
-    - k8s_network_services_ldap_enabled | bool
+    - k8s_network_services_ldap_bootstrap_enabled | default(false) | bool
     - (k8s_network_services_ldap_seed_groups | default([]) | length) > 0
 
 - name: Remove rendered manifest

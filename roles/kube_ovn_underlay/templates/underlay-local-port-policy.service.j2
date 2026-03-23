@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply rtr-fabric local underlay port policy
+After=network-online.target ovs-vswitchd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{ kube_ovn_underlay_local_port_policy_script_path }}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

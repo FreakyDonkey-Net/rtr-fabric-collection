@@ -51,6 +51,44 @@
       {%- endfor -%}
       {{ ns.items }}
 
+- name: Build OpenWrt edge advertised static route section names
+  ansible.builtin.set_fact:
+    openwrt_edge_advertised_static_route_sections: >-
+      {%- set ns = namespace(items=[]) -%}
+      {%- for route in (openwrt_edge_advertised_routes_effective | default([])) -%}
+      {%-   if (route.interface | default('') | string | trim | length) > 0 -%}
+      {%-     set section_name = (
+              'adv_route_'
+              ~ (
+                  route.prefix
+                  | string
+                  | trim
+                  | regex_replace('[^0-9A-Za-z]+', '_')
+                  | regex_replace('_+', '_')
+                  | regex_replace('^_|_$', '')
+                )
+            ) -%}
+      {%-     set _ = ns.items.append(
+              route | combine({
+                'section_name': section_name,
+                'target': (
+                  route.prefix
+                  | string
+                  | trim
+                  | regex_replace('/.*$', '')
+                ),
+                'netmask': (
+                  route.netmask
+                  | default('255.255.255.255', true)
+                  | string
+                  | trim
+                )
+              }, recursive=True)
+            ) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.items }}
+
 - name: Build effective OpenWrt edge uplink plan
   ansible.builtin.set_fact:
     openwrt_edge_uplinks_effective: >-
@@ -265,6 +303,24 @@
   changed_when: false
   when: openwrt_edge_egress_policies_enabled | default(false) | bool
 
+- name: Build effective OpenWrt edge egress trigger interface list
+  ansible.builtin.set_fact:
+    openwrt_edge_egress_trigger_interfaces_effective: >-
+      {{
+        (
+          (openwrt_edge_egress_policies_effective | default([]) | map(attribute='primary_transport_interface') | list)
+          + (openwrt_edge_egress_policies_effective | default([]) | map(attribute='secondary_transport_interface') | list)
+          + [openwrt_edge_egress_wan_interface_name | default('wan')]
+        )
+        | map('string')
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+  changed_when: false
+  when: openwrt_edge_egress_policies_enabled | default(false) | bool
+
 - name: Assert OpenWrt edge uplinks are complete
   ansible.builtin.assert:
     that:
@@ -467,6 +523,58 @@
       register: openwrt_edge_uplink_converge_result
       changed_when: "'CHANGED' in (stdout | default(''))"
       no_log: true
+
+    - name: Ensure OpenWrt edge advertised static routes exist
+      ansible.builtin.raw: |
+        changed=0
+
+        section_type() {
+          uci -q show "network.$1" 2>/dev/null | sed -n '1s/^network\.[^.]*=//p'
+        }
+
+        ensure_section() {
+          name="$1"
+          typ="$2"
+          [ "$(section_type "$name")" = "$typ" ] || {
+            uci set "network.${name}=${typ}"
+            changed=1
+          }
+        }
+
+        ensure_opt() {
+          section="$1"
+          key="$2"
+          val="$3"
+          current="$(uci -q get "network.${section}.${key}" 2>/dev/null || true)"
+          [ "${current}" = "${val}" ] || {
+            uci set "network.${section}.${key}=${val}"
+            changed=1
+          }
+        }
+
+        desired="{{ openwrt_edge_advertised_static_route_sections | default([]) | map(attribute='section_name') | join(' ') }}"
+        for existing in $(uci -q show network | sed -n "s/^network\\.\\([^.=]*\\)=route$/\\1/p" | grep '^adv_route_' || true); do
+          keep=0
+          for wanted in ${desired}; do
+            [ "${existing}" = "${wanted}" ] && keep=1 && break
+          done
+          if [ "${keep}" -eq 0 ]; then
+            uci -q delete "network.${existing}"
+            changed=1
+          fi
+        done
+
+        {% for route in openwrt_edge_advertised_static_route_sections | default([]) %}
+        ensure_section "{{ route.section_name }}" route
+        ensure_opt "{{ route.section_name }}" interface "{{ route.interface }}"
+        ensure_opt "{{ route.section_name }}" target "{{ route.target }}"
+        ensure_opt "{{ route.section_name }}" netmask "{{ route.netmask }}"
+        {% endfor %}
+
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_edge_advertised_static_routes_result
+      changed_when: "'CHANGED' in (openwrt_edge_advertised_static_routes_result.stdout | default(''))"
+      when: (openwrt_edge_advertised_static_route_sections | default([]) | length) > 0
 
     - name: Check pending OpenWrt edge network changes
       ansible.builtin.raw: "uci changes network || true"
@@ -680,8 +788,23 @@
       ansible.builtin.set_fact:
         openwrt_edge_egress_apply_script_rendered: "{{ lookup('ansible.builtin.template', 'rtr-fabric-egress-policy.sh.j2') }}"
         openwrt_edge_egress_init_service_rendered: "{{ lookup('ansible.builtin.template', 'rtr-fabric-egress-policy.init.j2') }}"
+        openwrt_edge_egress_hotplug_rendered: "{{ lookup('ansible.builtin.template', 'rtr-fabric-egress-policy.hotplug.j2') }}"
       when:
         - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Ensure OpenWrt hotplug iface directory exists for egress helper
+      ansible.builtin.raw: "mkdir -p $(dirname '{{ openwrt_edge_egress_hotplug_path }}')"
+      changed_when: false
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - openwrt_edge_egress_hotplug_enabled | default(true) | bool
         - >-
           (
             openwrt_edge_egress_policies_effective | default([])
@@ -693,16 +816,7 @@
     - name: Ensure OpenWrt root crontab exists for egress policy helper
       ansible.builtin.raw: "touch /etc/crontabs/root"
       changed_when: false
-      when:
-        - openwrt_edge_egress_policies_enabled | default(false) | bool
-        - openwrt_edge_egress_cron_enabled | default(false) | bool
-        - >-
-          (
-            openwrt_edge_egress_policies_effective | default([])
-            | selectattr('apply_mode', 'equalto', 'script')
-            | list
-            | length
-          ) > 0
+      when: openwrt_edge_egress_policies_enabled | default(false) | bool
 
     - name: Re-check pending OpenWrt edge network changes
       ansible.builtin.raw: "uci changes network || true"
@@ -855,6 +969,52 @@
             | length
           ) > 0
 
+    - name: Write OpenWrt edge egress hotplug helper when it changes
+      ansible.builtin.raw: |
+        tmp="$(mktemp)"
+        cat >"${tmp}" <<'EOF'
+        {{ openwrt_edge_egress_hotplug_rendered }}
+        EOF
+        chmod 0755 "${tmp}"
+        if [ ! -f "{{ openwrt_edge_egress_hotplug_path }}" ] || ! cmp -s "${tmp}" "{{ openwrt_edge_egress_hotplug_path }}"; then
+          mv "${tmp}" "{{ openwrt_edge_egress_hotplug_path }}"
+          echo CHANGED
+        else
+          rm -f "${tmp}"
+        fi
+      register: openwrt_edge_egress_hotplug_write
+      changed_when: "'CHANGED' in (openwrt_edge_egress_hotplug_write.stdout | default(''))"
+      when:
+        - openwrt_edge_egress_policies_enabled | default(false) | bool
+        - openwrt_edge_egress_hotplug_enabled | default(true) | bool
+        - >-
+          (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+
+    - name: Remove OpenWrt edge egress hotplug helper when disabled
+      ansible.builtin.raw: |
+        if [ -f "{{ openwrt_edge_egress_hotplug_path }}" ]; then
+          rm -f "{{ openwrt_edge_egress_hotplug_path }}"
+          echo CHANGED
+        fi
+      register: openwrt_edge_egress_hotplug_remove
+      changed_when: "'CHANGED' in (openwrt_edge_egress_hotplug_remove.stdout | default(''))"
+      when: >-
+        not (openwrt_edge_egress_hotplug_enabled | default(true) | bool)
+        or not (
+          openwrt_edge_egress_policies_enabled | default(false) | bool
+          and (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+        )
+
     - name: Enable OpenWrt edge egress init service
       ansible.builtin.raw: "/etc/init.d/{{ openwrt_edge_egress_init_service_name }} enable"
       changed_when: false
@@ -887,13 +1047,38 @@
             | length
           ) > 0
 
+    - name: Remove OpenWrt edge egress cron entry when disabled
+      ansible.builtin.raw: |
+        touch /etc/crontabs/root
+        tmp="$(mktemp)"
+        grep -Fvx "{{ openwrt_edge_egress_cron_line }}" /etc/crontabs/root > "${tmp}" || true
+        if ! cmp -s "${tmp}" /etc/crontabs/root; then
+          cat "${tmp}" > /etc/crontabs/root
+          echo CHANGED
+        fi
+        rm -f "${tmp}"
+      register: openwrt_edge_egress_cron_line_remove_result
+      changed_when: "'CHANGED' in (openwrt_edge_egress_cron_line_remove_result.stdout | default(''))"
+      when: >-
+        not (openwrt_edge_egress_cron_enabled | default(false) | bool)
+        or not (
+          openwrt_edge_egress_policies_enabled | default(false) | bool
+          and (
+            openwrt_edge_egress_policies_effective | default([])
+            | selectattr('apply_mode', 'equalto', 'script')
+            | list
+            | length
+          ) > 0
+        )
+
     - name: Restart OpenWrt cron service when egress cron changes
       ansible.builtin.raw: "/etc/init.d/cron restart"
       changed_when: false
       when:
-        - openwrt_edge_egress_policies_enabled | default(false) | bool
-        - openwrt_edge_egress_cron_enabled | default(false) | bool
-        - openwrt_edge_egress_cron_line_result is changed
+        - >
+            (openwrt_edge_egress_cron_line_result is defined and openwrt_edge_egress_cron_line_result is changed)
+            or
+            (openwrt_edge_egress_cron_line_remove_result is defined and openwrt_edge_egress_cron_line_remove_result is changed)
 
     - name: Apply OpenWrt edge selective egress routes via helper
       ansible.builtin.raw: "{{ openwrt_edge_egress_apply_script_path }}"

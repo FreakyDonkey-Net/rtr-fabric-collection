@@ -18,6 +18,7 @@ Static interface / dhcpcd guardrail workflow:
 
 - `edge_worker_prep_dhcpcd_deny_interfaces`
 - `edge_worker_prep_dhcpcd_config_path`
+- `edge_worker_prep_ifupdown_takeover_unmanaged` (allow first takeover of non-managed `/etc/network/interfaces`)
 
 Automation sudo workflow:
 

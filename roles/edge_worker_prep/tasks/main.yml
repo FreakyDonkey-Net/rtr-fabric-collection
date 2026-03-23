@@ -2,11 +2,37 @@
 - name: Validate edge worker prep inputs
   ansible.builtin.assert:
     that:
+      - not (
+          (edge_worker_prep_nm_trunk_enabled | default(false) | bool)
+          and (edge_worker_prep_ifupdown_enabled | default(false) | bool)
+        )
       - not (edge_worker_prep_nm_trunk_enabled | default(false) | bool) or (edge_worker_prep_nm_vlan_ip4 | default([]) | length) > 0
       - not (edge_worker_prep_nm_trunk_enabled | default(false) | bool) or (edge_worker_prep_nm_vlan_gw4 | default('') | length) > 0
+      - not (edge_worker_prep_ifupdown_enabled | default(false) | bool) or (edge_worker_prep_ifupdown_address | default('') | length) > 0
+      - not (edge_worker_prep_ifupdown_enabled | default(false) | bool) or (edge_worker_prep_ifupdown_gateway | default('') | length) > 0
+      - >-
+        not (
+          (edge_worker_prep_ifupdown_enabled | default(false) | bool)
+          and (edge_worker_prep_ifupdown_vlan_enabled | default(false) | bool)
+        )
+        or (edge_worker_prep_ifupdown_parent_iface | default('') | length) > 0
+      - >-
+        not (
+          (edge_worker_prep_ifupdown_enabled | default(false) | bool)
+          and (edge_worker_prep_ifupdown_vlan_enabled | default(false) | bool)
+        )
+        or (edge_worker_prep_ifupdown_vlan_iface | default('') | length) > 0
+      - >-
+        not (
+          (edge_worker_prep_ifupdown_enabled | default(false) | bool)
+          and (edge_worker_prep_ifupdown_vlan_enabled | default(false) | bool)
+        )
+        or (edge_worker_prep_ifupdown_vlan_id | default(0) | int) > 0
     fail_msg: >-
-      edge_worker_prep requires VLAN management IP and gateway when
-      edge_worker_prep_nm_trunk_enabled=true.
+      edge_worker_prep requires exactly one network management mode. Provide
+      VLAN management IP/gateway for NetworkManager trunk mode, or
+      address/gateway for ifupdown mode. When ifupdown VLAN mode is enabled,
+      declare parent iface, VLAN iface and VLAN ID too.
 
 - name: Check whether nmcli is available
   ansible.builtin.shell: command -v nmcli
@@ -67,6 +93,97 @@
     mode: "0440"
     validate: /usr/sbin/visudo -cf %s
   when: edge_worker_prep_sudo_nopasswd_enabled | default(false) | bool
+
+- name: Stat ifupdown interfaces file
+  ansible.builtin.stat:
+    path: "{{ edge_worker_prep_ifupdown_interfaces_path }}"
+  register: edge_worker_prep_ifupdown_interfaces_stat
+  when: edge_worker_prep_ifupdown_enabled | default(false) | bool
+
+- name: Read existing ifupdown interfaces file
+  ansible.builtin.slurp:
+    path: "{{ edge_worker_prep_ifupdown_interfaces_path }}"
+  register: edge_worker_prep_ifupdown_interfaces_slurp
+  when:
+    - edge_worker_prep_ifupdown_enabled | default(false) | bool
+    - edge_worker_prep_ifupdown_interfaces_stat.stat.exists | default(false)
+
+- name: Assert ifupdown interfaces file is already rtr-fabric managed
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (edge_worker_prep_ifupdown_interfaces_stat.stat.exists | default(false))
+        or (
+          '# rtr-fabric managed management uplink'
+          in (edge_worker_prep_ifupdown_interfaces_slurp.content | b64decode)
+        )
+    fail_msg: >-
+      Refusing to overwrite {{ edge_worker_prep_ifupdown_interfaces_path }} on
+      {{ inventory_hostname }} because it is not marked as rtr-fabric managed.
+  when:
+    - edge_worker_prep_ifupdown_enabled | default(false) | bool
+    - not (edge_worker_prep_ifupdown_takeover_unmanaged | default(false) | bool)
+
+- name: Converge ifupdown management uplink configuration
+  ansible.builtin.copy:
+    dest: "{{ edge_worker_prep_ifupdown_interfaces_path }}"
+    mode: "0644"
+    content: |-
+      # rtr-fabric managed management uplink
+      source /etc/network/interfaces.d/*
+
+      auto lo
+      iface lo inet loopback
+
+      {% if edge_worker_prep_ifupdown_vlan_enabled | default(false) | bool %}
+      allow-hotplug {{ edge_worker_prep_ifupdown_parent_iface }}
+      iface {{ edge_worker_prep_ifupdown_parent_iface }} inet manual
+
+      auto {{ edge_worker_prep_ifupdown_vlan_iface }}
+      iface {{ edge_worker_prep_ifupdown_vlan_iface }} inet static
+        vlan-raw-device {{ edge_worker_prep_ifupdown_parent_iface }}
+      {% else %}
+      allow-hotplug {{ edge_worker_prep_ifupdown_iface }}
+      iface {{ edge_worker_prep_ifupdown_iface }} inet static
+      {% endif %}
+        address {{ edge_worker_prep_ifupdown_address }}
+        gateway {{ edge_worker_prep_ifupdown_gateway }}
+      {% if (edge_worker_prep_ifupdown_dns4 | default([]) | length) > 0 %}
+        dns-nameservers {{ edge_worker_prep_ifupdown_dns4 | join(' ') }}
+      {% endif %}
+  when: edge_worker_prep_ifupdown_enabled | default(false) | bool
+
+- name: Synchronize runtime ifupdown uplink state
+  ansible.builtin.shell: |
+    set -eu
+    desired_ip="{{ edge_worker_prep_ifupdown_address }}"
+    desired_src="{{ edge_worker_prep_ifupdown_address | regex_replace('/.*$', '') }}"
+    {% if edge_worker_prep_ifupdown_vlan_enabled | default(false) | bool %}
+    ip link set dev "{{ edge_worker_prep_ifupdown_parent_iface }}" up
+    ip link add link "{{ edge_worker_prep_ifupdown_parent_iface }}" name "{{ edge_worker_prep_ifupdown_vlan_iface }}" type vlan id "{{ edge_worker_prep_ifupdown_vlan_id | string }}" 2>/dev/null || true
+    ip link set dev "{{ edge_worker_prep_ifupdown_vlan_iface }}" up
+    ip address flush dev "{{ edge_worker_prep_ifupdown_parent_iface }}"
+    target_dev="{{ edge_worker_prep_ifupdown_vlan_iface }}"
+    {% else %}
+    ip link set dev "{{ edge_worker_prep_ifupdown_iface }}" up
+    target_dev="{{ edge_worker_prep_ifupdown_iface }}"
+    {% endif %}
+    for addr in $(ip -4 -o addr show dev "$target_dev" scope global | awk '{ print $4 }'); do
+      if [ "$addr" != "$desired_ip" ]; then
+        ip address del "$addr" dev "$target_dev" 2>/dev/null || true
+      fi
+    done
+    {% for route in (edge_worker_prep_ifupdown_drop_routes | default([])) %}
+    ip route del {{ route }} 2>/dev/null || true
+    {% endfor %}
+    ip address replace "$desired_ip" dev "$target_dev"
+    ip route replace default via "{{ edge_worker_prep_ifupdown_gateway }}" dev "$target_dev" src "$desired_src"
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when:
+    - edge_worker_prep_ifupdown_enabled | default(false) | bool
+    - edge_worker_prep_ifupdown_runtime_sync_enabled | default(true) | bool
 
 - name: Converge NetworkManager trunk management
   when: edge_worker_prep_nm_trunk_enabled | default(false) | bool

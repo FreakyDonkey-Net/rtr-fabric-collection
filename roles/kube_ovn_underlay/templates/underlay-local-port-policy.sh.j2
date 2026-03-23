@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+{% for port in (kube_ovn_underlay_local_internal_ports_effective | default([])) %}
+ip link set dev "{{ port.interface }}" up
+{% if port.purge_ipv4_addresses | default(false) | bool %}
+for current in $(ip -4 -o addr show dev "{{ port.interface }}" | awk '{print $4}'); do
+  keep=0
+{% for addr in (port.ipv4_addresses | default([])) %}
+  if [ "$current" = "{{ addr }}" ]; then
+    keep=1
+  fi
+{% endfor %}
+  if [ "$keep" -eq 0 ]; then
+    ip address del "$current" dev "{{ port.interface }}" || true
+  fi
+done
+{% endif %}
+{% for addr in (port.ipv4_addresses | default([])) %}
+ip address replace "{{ addr }}" dev "{{ port.interface }}"
+{% endfor %}
+sysctl -qw net.ipv4.conf.{{ port.interface }}.proxy_arp={{ 1 if (port.enable_proxy_arp | default(false) | bool) else 0 }}
+{% for route in (port.ipv4_routes | default([])) %}
+ip route replace "{{ route }}" dev "{{ port.interface }}" scope link
+{% endfor %}
+{% for proxy in (port.proxy_arp_addresses | default([])) %}
+ip neigh replace proxy "{{ proxy }}" dev "{{ port.interface }}"
+{% endfor %}
+
+{% endfor %}

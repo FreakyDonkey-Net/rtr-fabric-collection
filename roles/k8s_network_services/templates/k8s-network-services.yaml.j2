@@ -589,7 +589,7 @@ spec:
         - name: ca-db
           emptyDir: {}
 {% endif %}
-{% if k8s_network_services_ldap_enabled | bool %}
+{% if (k8s_network_services_ldap_enabled | bool) and not (k8s_network_services_ldap_gitops_managed | bool) %}
 ---
 apiVersion: v1
 kind: Secret

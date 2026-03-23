@@ -7,6 +7,7 @@ restarting the appropriate service only when the rendered configuration changes.
 - existing `k3s` and `k3s-agent` systemd units
 - server and agent nodes
 - optional promotion of an existing `k3s-agent` host into a `k3s` server unit
+- optional reconciliation of the `k3s-agent` unit file to `ExecStart=<k3s binary> agent`
 - no fresh bootstrap logic
 
 ## Inputs

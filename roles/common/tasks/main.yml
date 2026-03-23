@@ -2,6 +2,92 @@
 - name: Gather service facts
   ansible.builtin.service_facts:
 
+- name: Validate bootstrap DHCP configuration
+  ansible.builtin.assert:
+    that:
+      - (common_bootstrap_dhcp_interface | default('') | string | trim | length) > 0
+      - (common_bootstrap_dhcp_range_start | default('') | string | trim | length) > 0
+      - (common_bootstrap_dhcp_range_end | default('') | string | trim | length) > 0
+      - (common_bootstrap_dhcp_router | default('') | string | trim | length) > 0
+    fail_msg: >-
+      Bootstrap DHCP is enabled but required settings are missing.
+      Set common_bootstrap_dhcp_interface, common_bootstrap_dhcp_range_start,
+      common_bootstrap_dhcp_range_end, and common_bootstrap_dhcp_router.
+  when: common_bootstrap_dhcp_enabled | default(false) | bool
+
+- name: Ensure bootstrap DHCP package is installed
+  ansible.builtin.apt:
+    name: "{{ common_bootstrap_dhcp_package }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: common_bootstrap_dhcp_enabled | default(false) | bool
+
+- name: Ensure bootstrap DHCP config directory exists
+  ansible.builtin.file:
+    path: "{{ common_bootstrap_dhcp_config_path | dirname }}"
+    state: directory
+    mode: "0755"
+  when: common_bootstrap_dhcp_enabled | default(false) | bool
+
+- name: Render bootstrap DHCP config
+  ansible.builtin.copy:
+    dest: "{{ common_bootstrap_dhcp_config_path }}"
+    mode: "0644"
+    content: |
+      # Managed by Ansible (role: common)
+      interface={{ common_bootstrap_dhcp_interface }}
+      bind-interfaces
+      dhcp-range={{ common_bootstrap_dhcp_range_start }},{{ common_bootstrap_dhcp_range_end }},{{ common_bootstrap_dhcp_netmask }},{{ common_bootstrap_dhcp_lease_time }}
+      dhcp-option=option:router,{{ common_bootstrap_dhcp_router }}
+      {% if (common_bootstrap_dhcp_dns_servers | default([]) | length) > 0 %}
+      dhcp-option=option:dns-server,{{ common_bootstrap_dhcp_dns_servers | join(',') }}
+      {% endif %}
+      {% if common_bootstrap_dhcp_authoritative | default(true) | bool %}
+      dhcp-authoritative
+      {% endif %}
+      {% if common_bootstrap_dhcp_disable_dns | default(true) | bool %}
+      port=0
+      {% endif %}
+      {% for reservation in (common_bootstrap_dhcp_reservations | default([])) %}
+      dhcp-host={{ reservation.mac | string | trim }},{{ reservation.ip | string | trim }}{% if (reservation.name | default('') | string | trim | length) > 0 %},{{ reservation.name | string | trim }}{% endif %}
+      {% endfor %}
+  register: common_bootstrap_dhcp_config_result
+  when: common_bootstrap_dhcp_enabled | default(false) | bool
+
+- name: Ensure bootstrap DHCP service is enabled and restarted
+  ansible.builtin.service:
+    name: "{{ common_bootstrap_dhcp_service_name }}"
+    enabled: true
+    state: started
+  when: common_bootstrap_dhcp_enabled | default(false) | bool
+
+- name: Restart bootstrap DHCP service when config changed
+  ansible.builtin.service:
+    name: "{{ common_bootstrap_dhcp_service_name }}"
+    state: restarted
+  when:
+    - common_bootstrap_dhcp_enabled | default(false) | bool
+    - common_bootstrap_dhcp_config_result is defined
+    - common_bootstrap_dhcp_config_result is changed
+
+- name: Remove bootstrap DHCP config when disabled
+  ansible.builtin.file:
+    path: "{{ common_bootstrap_dhcp_config_path }}"
+    state: absent
+  register: common_bootstrap_dhcp_config_removed
+  when: not (common_bootstrap_dhcp_enabled | default(false) | bool)
+
+- name: Restart bootstrap DHCP service when config removed
+  ansible.builtin.service:
+    name: "{{ common_bootstrap_dhcp_service_name }}"
+    state: restarted
+  failed_when: false
+  when:
+    - not (common_bootstrap_dhcp_enabled | default(false) | bool)
+    - common_bootstrap_dhcp_config_removed is defined
+    - common_bootstrap_dhcp_config_removed is changed
+
 - name: Ensure dhcpcd config directory exists when DNS override is requested
   ansible.builtin.file:
     path: "{{ common_dhcpcd_override_path | dirname }}"

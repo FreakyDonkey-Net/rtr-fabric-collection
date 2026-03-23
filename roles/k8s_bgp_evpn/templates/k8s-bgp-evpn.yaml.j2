@@ -75,7 +75,7 @@ data:
     log stdout informational
 {% set external_peer_prefixes = [] %}
 {% for peer in (k8s_bgp_evpn_external_peers_effective | default([])) if peer.node == node %}
-{%   for prefix in (peer.peer_allowed_ips | default([])) %}
+{%   for prefix in (peer.peer_export_prefixes | default([])) %}
 {%     if prefix != '0.0.0.0/0' and prefix not in external_peer_prefixes %}
 {%       set _ = external_peer_prefixes.append(prefix) %}
 {%     endif %}

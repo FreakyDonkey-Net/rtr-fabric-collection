@@ -12,7 +12,13 @@ kube_ovn_underlay_cleanup_legacy: true
 kube_ovn_underlay_trunk_interface_map: {}
 kube_ovn_underlay_trunk_interface_default_bondy: ""
 kube_ovn_underlay_trunk_interface_default_noisy: ""
+kube_ovn_underlay_trunk_ports: []
 kube_ovn_underlay_access_ports: []
 kube_ovn_underlay_internal_ports: []
+kube_ovn_underlay_legacy_internal_ports:
+  - diag-admin11
+  - diag-mgmt10
+kube_ovn_underlay_local_port_policy_script_path: /usr/local/sbin/rtr-fabric-underlay-local-port-policy.sh
+kube_ovn_underlay_local_port_policy_service_name: rtr-fabric-underlay-local-port-policy
 kube_ovn_underlay_artifact_dir: >-
   {{ playbook_dir | default('.') }}/.ansible-generated/kube-ovn-underlay

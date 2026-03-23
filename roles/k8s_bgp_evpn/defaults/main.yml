@@ -7,6 +7,7 @@ k8s_bgp_evpn_external_gateway_proxy_prefixes: "{{ external_edges_egress_gateway_
 k8s_bgp_evpn_neighbor_password_required: "{{ bgp_evpn_neighbor_password_required | default(false) }}"
 k8s_bgp_evpn_neighbor_password: "{{ bgp_evpn_neighbor_password | default('') }}"
 k8s_bgp_evpn_internal_peer_extra_prefixes: {}
+k8s_bgp_evpn_internal_peer_export_excluded_prefixes: {}
 k8s_bgp_evpn_restart_nodes: []
 k8s_bgp_evpn_wait_nodes: []
 k8s_bgp_evpn_verify_pods: true

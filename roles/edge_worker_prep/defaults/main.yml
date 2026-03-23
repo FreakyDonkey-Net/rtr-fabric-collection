@@ -12,6 +12,20 @@ edge_worker_prep_nm_vlan_dns4: []
 edge_worker_prep_nm_vlan_route_metric4: 100
 edge_worker_prep_nm_breakglass_wifi_connection_names: []
 
+edge_worker_prep_ifupdown_enabled: false
+edge_worker_prep_ifupdown_interfaces_path: /etc/network/interfaces
+edge_worker_prep_ifupdown_iface: enp2s0
+edge_worker_prep_ifupdown_parent_iface: enp2s0
+edge_worker_prep_ifupdown_vlan_enabled: false
+edge_worker_prep_ifupdown_vlan_iface: enp2s0.11
+edge_worker_prep_ifupdown_vlan_id: 11
+edge_worker_prep_ifupdown_address: ""
+edge_worker_prep_ifupdown_gateway: ""
+edge_worker_prep_ifupdown_dns4: []
+edge_worker_prep_ifupdown_drop_routes: []
+edge_worker_prep_ifupdown_runtime_sync_enabled: true
+edge_worker_prep_ifupdown_takeover_unmanaged: false
+
 edge_worker_prep_dhcpcd_config_path: /etc/dhcpcd.conf
 edge_worker_prep_dhcpcd_deny_interfaces: []
 edge_worker_prep_dhcpcd_restart_on_change: true

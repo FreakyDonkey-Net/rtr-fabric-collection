@@ -12,6 +12,7 @@ Apply and verify K8s-side BGP EVPN configuration used by the network fabric.
 - `k8s_bgp_evpn_external_peers`
 - `k8s_bgp_evpn_external_gateway_proxy_prefixes`
 - `k8s_bgp_evpn_internal_peer_extra_prefixes`
+- `k8s_bgp_evpn_internal_peer_export_excluded_prefixes`
 - `k8s_bgp_evpn_verify_pods`, `k8s_bgp_evpn_verify_bgp`
 
 Full defaults: `defaults/main.yml`.

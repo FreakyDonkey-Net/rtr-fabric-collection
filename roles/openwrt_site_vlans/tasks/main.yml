@@ -281,6 +281,107 @@
       changed_when: true
       when: (openwrt_site_vlans_network_changes.result | default('') | trim | length) > 0
 
+- name: Build effective OpenWrt VLAN DHCP plan
+  ansible.builtin.set_fact:
+    openwrt_site_vlans_dhcp_plan: >-
+      {{
+        (openwrt_site_vlans_effective_plan | default([]))
+        | selectattr('name', 'in', openwrt_site_vlans_dhcp_vlan_names | default([]))
+        | list
+      }}
+  when: openwrt_site_vlans_dhcp_enabled | default(false) | bool
+
+- name: Show OpenWrt VLAN DHCP dry-run plan
+  ansible.builtin.debug:
+    msg:
+      dhcp_vlans: "{{ openwrt_site_vlans_dhcp_plan | default([]) | map(attribute='name') | list }}"
+      start: "{{ openwrt_site_vlans_dhcp_start }}"
+      limit: "{{ openwrt_site_vlans_dhcp_limit }}"
+      leasetime: "{{ openwrt_site_vlans_dhcp_leasetime }}"
+  changed_when: false
+  when:
+    - openwrt_site_vlans_dhcp_enabled | default(false) | bool
+    - openwrt_site_vlans_dry_run | default(true) | bool
+    - not (openwrt_site_vlans_force_apply | default(false) | bool)
+
+- name: Apply OpenWrt VLAN DHCP pools
+  when:
+    - openwrt_site_vlans_dhcp_enabled | default(false) | bool
+    - not (openwrt_site_vlans_dry_run | default(true) | bool)
+      or (openwrt_site_vlans_force_apply | default(false) | bool)
+  block:
+    - name: Ensure VLAN DHCP pools exist
+      community.openwrt.uci:
+        command: section
+        config: dhcp
+        type: dhcp
+        name: "{{ item.section_name }}"
+        find:
+          interface: "{{ item.section_name }}"
+        set_find: true
+        replace: true
+        value:
+          interface: "{{ item.section_name }}"
+          start: "{{ openwrt_site_vlans_dhcp_start | string }}"
+          limit: "{{ openwrt_site_vlans_dhcp_limit | string }}"
+          leasetime: "{{ openwrt_site_vlans_dhcp_leasetime | string }}"
+          ignore: "{{ '0' if (openwrt_site_vlans_dhcp_force | default(true) | bool) else '1' }}"
+          dhcpv6: "{{ openwrt_site_vlans_dhcp_ipv6_mode | string }}"
+          ra: disabled
+          ndp: disabled
+      loop: "{{ openwrt_site_vlans_dhcp_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.section_name }}"
+
+    - name: Ensure explicit router and DNS DHCP options on managed VLAN pools
+      community.openwrt.command:
+        uses_shell: true
+        cmd: |
+          changed=0
+          section="{{ item.section_name }}"
+          wanted_3="3,{{ item.gateway }}"
+          wanted_6="6,{{ item.gateway }}"
+          current="$(
+            uci -q get dhcp.${section}.dhcp_option 2>/dev/null \
+            | tr ' ' '\n' \
+            | sed '/^$/d' \
+            || true
+          )"
+          printf '%s\n' "$current" | grep -Fx "$wanted_3" >/dev/null 2>&1 || {
+            uci -q add_list "dhcp.${section}.dhcp_option=${wanted_3}"
+            changed=1
+          }
+          printf '%s\n' "$current" | grep -Fx "$wanted_6" >/dev/null 2>&1 || {
+            uci -q add_list "dhcp.${section}.dhcp_option=${wanted_6}"
+            changed=1
+          }
+          [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_site_vlans_dhcp_options_changes
+      changed_when: "'CHANGED' in (openwrt_site_vlans_dhcp_options_changes.stdout | default(''))"
+      loop: "{{ openwrt_site_vlans_dhcp_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.section_name }}"
+      when: openwrt_site_vlans_dhcp_explicit_router_dns | default(false) | bool
+
+    - name: Check pending OpenWrt DHCP UCI changes
+      community.openwrt.uci:
+        command: changes
+        config: dhcp
+      register: openwrt_site_vlans_dhcp_changes
+      changed_when: false
+
+    - name: Commit OpenWrt DHCP UCI changes
+      community.openwrt.uci:
+        command: commit
+        config: dhcp
+      when: (openwrt_site_vlans_dhcp_changes.result | default('') | trim | length) > 0
+
+    - name: Restart dnsmasq when DHCP pools changed
+      community.openwrt.service:
+        name: dnsmasq
+        state: restarted
+      when: (openwrt_site_vlans_dhcp_changes.result | default('') | trim | length) > 0
+
 - name: Build effective firewall VLAN zone plan
   ansible.builtin.set_fact:
     openwrt_site_vlans_firewall_zone_plan: >-
@@ -474,6 +575,20 @@
       loop: "{{ openwrt_site_vlans_firewall_custom_rules | default([]) if (openwrt_site_vlans_firewall_custom_rules_enabled | default(false) | bool) else [] }}"
       loop_control:
         label: "{{ item.section_name }}"
+
+    - name: Remove VLAN firewall custom rules declared absent
+      ansible.builtin.raw: |
+        changed=0
+        for section in {{ (openwrt_site_vlans_firewall_absent_custom_rules | default([]) | unique) | join(' ') }}; do
+          if uci -q show "firewall.${section}" >/dev/null 2>&1; then
+            uci -q delete "firewall.${section}"
+            changed=1
+          fi
+        done
+        [ "$changed" -eq 1 ] && echo CHANGED || true
+      register: openwrt_site_vlans_firewall_absent_custom_rules_result
+      changed_when: "'CHANGED' in (openwrt_site_vlans_firewall_absent_custom_rules_result.stdout | default(''))"
+      when: (openwrt_site_vlans_firewall_absent_custom_rules | default([]) | length) > 0
 
     - name: Check pending OpenWrt firewall UCI changes
       community.openwrt.uci:

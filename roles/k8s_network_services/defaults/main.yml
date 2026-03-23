@@ -6,6 +6,8 @@ k8s_network_services_namespace_pod_security_audit: restricted
 k8s_network_services_kubectl_bin: /usr/local/bin/kubectl
 k8s_network_services_dry_run: false
 k8s_network_services_prod_hostnetwork_exceptions: {}
+k8s_network_services_ldap_gitops_managed: false
+k8s_network_services_kube_dns_stub_gitops_managed: false
 
 k8s_network_services_dns_enabled: false
 k8s_network_services_dns_image: docker.io/coredns/coredns:1.11.3

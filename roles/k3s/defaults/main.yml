@@ -19,6 +19,8 @@ k3s_install_bootstrap_enabled: false
 k3s_install_bootstrap_url: https://get.k3s.io
 k3s_manage_promoted_server_unit: true
 k3s_server_unit_path: /etc/systemd/system/k3s.service
+k3s_manage_agent_unit: true
+k3s_agent_unit_path: /etc/systemd/system/k3s-agent.service
 k3s_secrets_encryption_sync_files:
   - /var/lib/rancher/k3s/server/cred/encryption-config.json
   - /var/lib/rancher/k3s/server/cred/encryption-state.json

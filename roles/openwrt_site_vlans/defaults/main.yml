@@ -24,3 +24,13 @@ openwrt_site_vlans_firewall_forwardings_enabled: false
 openwrt_site_vlans_firewall_forwardings: []
 openwrt_site_vlans_firewall_custom_rules_enabled: false
 openwrt_site_vlans_firewall_custom_rules: []
+openwrt_site_vlans_firewall_absent_custom_rules: []
+
+openwrt_site_vlans_dhcp_enabled: false
+openwrt_site_vlans_dhcp_vlan_names: []
+openwrt_site_vlans_dhcp_start: 51
+openwrt_site_vlans_dhcp_limit: 180
+openwrt_site_vlans_dhcp_leasetime: 12h
+openwrt_site_vlans_dhcp_force: true
+openwrt_site_vlans_dhcp_ipv6_mode: disabled
+openwrt_site_vlans_dhcp_explicit_router_dns: false

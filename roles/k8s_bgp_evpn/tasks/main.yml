@@ -44,6 +44,15 @@
               'peer_asn': peer.peer_asn,
               'peer_public_key': peer.peer_public_key,
               'peer_allowed_ips': (peer.peer_allowed_ips | default([]) | unique | list),
+              'peer_export_prefixes': (
+                (
+                  peer.peer_export_prefixes
+                  if ('peer_export_prefixes' in peer)
+                  else (peer.peer_allowed_ips | default([]))
+                )
+                | unique
+                | list
+              ),
               'endpoint_host': (peer.endpoint_host | default('')),
               'endpoint_port': (peer.endpoint_port | default(bgp_evpn_wireguard_listen_port)),
               'persistent_keepalive': (peer.persistent_keepalive | default(bgp_evpn_wireguard_persistent_keepalive)),
@@ -94,20 +103,32 @@
       {%-     set peer_extra = (
                 hostvars[node].k8s_bgp_evpn_internal_peer_extra_prefixes | default({})
               ).get(peer_node, []) -%}
+      {%-     set excluded_exported_prefixes = (
+                hostvars[node].k8s_bgp_evpn_internal_peer_export_excluded_prefixes
+                | default({})
+              ).get(peer_node, []) -%}
+      {%-     set exported_transport_prefixes = (
+                k8s_bgp_evpn_external_peers_effective
+                | default([])
+                | selectattr('node', 'equalto', peer_node)
+                | map(attribute='peer_export_prefixes')
+                | reject('undefined')
+                | flatten
+                | map('string')
+                | reject('equalto', '0.0.0.0/0')
+                | difference(excluded_exported_prefixes)
+                | list
+              ) -%}
       {%-     set allowed = [
                 (hostvars[peer_node].wireguard_address | regex_replace('/.*$', '') ~ '/32'),
                 (hostvars[peer_node].bgp_evpn_loopback_ip ~ '/32')
               ] -%}
       {%-     set allowed = (allowed + (hostvars[peer_node].fabric_advertise_ipv4_networks | default([]))) | unique -%}
+      {%-     set allowed = (allowed + exported_transport_prefixes) | unique -%}
       {%-     set allowed = (allowed + peer_extra) | unique -%}
       {%-     if (hostvars[node].fabric_egress_transit_gateway_node | default('')) == peer_node -%}
       {%-       set allowed = (allowed + ['0.0.0.0/0']) | unique -%}
       {%-     endif -%}
-      {%-     for ext in (k8s_bgp_evpn_external_peers_effective | default([])) -%}
-      {%-       if ext.node == peer_node -%}
-      {%-         set allowed = (allowed + (ext.peer_allowed_ips | default([]))) | unique -%}
-      {%-       endif -%}
-      {%-     endfor -%}
       {%-     set _ = peer_map.update({peer_node: allowed}) -%}
       {%-   endfor -%}
       {%-   set _ = ns.items.update({node: peer_map}) -%}
@@ -246,12 +267,10 @@
     - (k8s_bgp_evpn_verify_pods | default(true) | bool) or (k8s_bgp_evpn_diff.rc == 1)
 
 - name: Probe critical FRR daemons on EVPN pods
-  kubernetes.core.k8s_exec:
-    kubeconfig: /etc/rancher/k3s/k3s.yaml
-    namespace: "{{ k8s_bgp_evpn_namespace }}"
-    pod: "{{ item.stdout | default('') | trim }}"
-    container: frr
-    command: >-
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_bgp_evpn_kubectl_bin }} -n {{ k8s_bgp_evpn_namespace }}
+      exec {{ item.stdout | default('') | trim }} -c frr --
       sh -lc "ps -ef | grep -q '/usr/lib/frr/[z]ebra' && ps -ef | grep -q '/usr/lib/frr/[b]gpd'"
   register: k8s_bgp_evpn_daemon_probe
   changed_when: false
@@ -346,16 +365,16 @@
     - (k8s_bgp_evpn_autoheal_restart_nodes | default([]) | length) > 0
 
 - name: Assert FRR daemons are healthy after auto-heal restart
-  kubernetes.core.k8s_exec:
-    kubeconfig: /etc/rancher/k3s/k3s.yaml
-    namespace: "{{ k8s_bgp_evpn_namespace }}"
-    pod: "{{ item.stdout | default('') | trim }}"
-    container: frr
-    command: >-
+  ansible.builtin.command:
+    cmd: >-
+      {{ k8s_bgp_evpn_kubectl_bin }} -n {{ k8s_bgp_evpn_namespace }}
+      exec {{ item.stdout | default('') | trim }} -c frr --
       sh -lc "ps -ef | grep -q '/usr/lib/frr/[z]ebra' && ps -ef | grep -q '/usr/lib/frr/[b]gpd'"
   register: k8s_bgp_evpn_autoheal_probe
   changed_when: false
-  failed_when: (k8s_bgp_evpn_autoheal_probe.rc | default(1) | int) != 0
+  retries: 12
+  delay: 5
+  until: (k8s_bgp_evpn_autoheal_probe.rc | default(1) | int) == 0
   loop: "{{ k8s_bgp_evpn_autoheal_pods.results | default([]) }}"
   loop_control:
     label: "{{ item.item | default('unknown') }}"
